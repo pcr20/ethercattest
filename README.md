@@ -28,6 +28,29 @@ The aging sweep runs in the errqueue thread (the model-B allocator), preserving
 the lock-free tracker's single-writer invariant; it uses a bounded scan behind
 the highest transmitted sequence so its cost is independent of run length.
 
+### Two-cap TX backpressure
+
+TX is bounded by two independent caps, both of which must be satisfied to send —
+this keeps TX robust to link outages without either wedging or exploding:
+
+- **In-flight cap** (`transmitted − received − aged ≥ 4000`): bounds frames
+  confirmed on the wire but not yet returned. It uses *transmitted*, not
+  *enqueued*, so frames stuck in the enqueue→transmit gap (never confirmed,
+  never returned, never aged) don't pin it. Aged-out link-outage collateral is
+  subtracted, so the cap releases and TX resumes after recovery. Fixes the
+  post-outage wedge.
+- **Backlog cap** (`enqueued − transmitted ≥ 8000`): bounds the
+  pre-transmission socket/qdisc backlog. During a link outage *transmitted*
+  freezes, so this cap engages and stops TX from spewing frames into a dead link
+  (the kernel silently drops them; `send()` doesn't reliably `EAGAIN` on a raw
+  `AF_PACKET` socket with no carrier). Once the link returns, the backlog drains
+  and the cap releases. Prevents the enqueue explosion.
+
+In normal operation the primary pacing is the TX ring's own `EAGAIN`
+backpressure at line rate; the two caps are the secondary bounds that only bite
+under link pathologies. Neither depends on the tool's view of carrier state, so
+both are robust during a fast flap storm.
+
 ## Receiving corrupt frames (rx-all + rx-fcs)
 
 

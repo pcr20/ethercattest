@@ -1100,6 +1100,11 @@ static void try_realtime(int prio) {
  * cap is essentially never hit; it only clamps pathological buffering.
  * ~4000 frames ≈ 0.5s of wire time at 8100 fps — ample in-flight headroom. */
 #define MAX_INFLIGHT 4000
+/* Backlog cap: bounds enqueued − transmitted (frames accepted by send() but not
+ * yet confirmed on the wire). Larger than MAX_INFLIGHT because in normal
+ * operation this gap is just completion latency (~4000); the cap only bites
+ * during a link outage, where it stops runaway enqueueing into a dead link. */
+#define BACKLOG_LIMIT 8000
 /* A frame outstanding longer than this while the link is up is presumed lost
  * and aged out mid-run. Real wire RTT is microseconds; 100ms is far beyond any
  * legitimate return, but short enough that TX resumes promptly after a link
@@ -1125,26 +1130,41 @@ static void *tx_thread(void *arg) {
             }
         }
 
-        /* Bound total in-flight frames = enqueued − received − aged-out.
+        /* Two independent caps, both must be satisfied to send. This is what
+         * makes TX robust to link outages without either wedging or exploding.
          *
-         * This single bound handles both failure modes:
-         *  - Prevents runaway ENQUEUE during a link outage. When carrier is
-         *    down the kernel silently accepts and drops frames (no EAGAIN), so
-         *    without a bound on enqueued, TX spews hundreds of thousands of
-         *    frames into the void. Capping enqueued−received−aged holds it.
-         *  - Prevents the post-outage WEDGE. Frames destroyed mid-flight never
-         *    return, so without excluding them "received" can never catch up
-         *    and the cap stays pinned forever. The aging sweep retires them
-         *    into g_aged_out, which is subtracted here, so the cap releases and
-         *    TX resumes within ~100ms of link recovery.
-         * No link-state dependency — this is robust even when the tool's view
-         * of carrier state is stale during a fast flap storm. Guarded against
-         * transient underflow (double-deliver on lo). */
+         * (1) IN-FLIGHT cap: transmitted − received − aged ≥ MAX_INFLIGHT.
+         *     Bounds frames confirmed on the wire but not yet returned. Uses
+         *     TRANSMITTED (not enqueued) so that frames stuck in the enqueue→
+         *     transmit gap — never confirmed, never returned, never aged — do
+         *     NOT pin this cap. Aged-out (link-outage collateral) is subtracted
+         *     so the cap releases and TX resumes promptly after recovery. This
+         *     fixes the post-outage wedge.
+         *
+         * (2) BACKLOG cap: enqueued − transmitted ≥ BACKLOG_LIMIT.
+         *     Bounds the pre-transmission backlog (socket/qdisc). During a link
+         *     outage TRANSMITTED freezes (no completions), so this cap engages
+         *     and stops TX from spewing hundreds of thousands of frames into the
+         *     dead link (the kernel silently drops them; send() does not reliably
+         *     EAGAIN on a raw AF_PACKET socket with no carrier). Once the link
+         *     returns, transmitted advances, the backlog drains, and this cap
+         *     releases. This prevents the enqueue explosion.
+         *
+         * Normal operation: cap (1) dominates (backlog is small, ~completion
+         * latency). Outage: cap (2) dominates (in-flight is near zero as nothing
+         * is confirmed). Neither depends on the tool's view of carrier state, so
+         * both are robust during a fast flap storm. Guarded against transient
+         * underflow (double-deliver on lo). */
         uint64_t enq_now  = atomic_load_explicit(&g_stats.frames_enqueued, memory_order_relaxed);
+        uint64_t txd_now  = atomic_load_explicit(&g_stats.frames_transmitted, memory_order_relaxed);
         uint64_t rcvd_now = atomic_load_explicit(&g_stats.frames_received, memory_order_relaxed);
         uint64_t aged_now = atomic_load_explicit(&g_aged_out, memory_order_relaxed);
-        uint64_t accounted = rcvd_now + aged_now;   /* returned OR written off */
-        if (enq_now > accounted && (enq_now - accounted) >= MAX_INFLIGHT) {
+        uint64_t inflight_accounted = rcvd_now + aged_now;
+        int inflight_capped = (txd_now > inflight_accounted) &&
+                              ((txd_now - inflight_accounted) >= MAX_INFLIGHT);
+        int backlog_capped  = (enq_now > txd_now) &&
+                              ((enq_now - txd_now) >= BACKLOG_LIMIT);
+        if (inflight_capped || backlog_capped) {
             atomic_fetch_add_explicit(&g_stats.tx_backpressure, 1, memory_order_relaxed);
             sleep_ns(10000);   /* 10us; loop re-checks g_tx_running */
             continue;
