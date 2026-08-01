@@ -770,10 +770,16 @@ static void print_stats(FILE *csv, uint64_t elapsed_ns, uint64_t new_nic_crc) {
     printf("  NIC CRC errors: %lu (cumulative)\n", g_stats.nic_crc_errors);
     printf("  Total wire bits:%.3e\n", (double)total_bits);
     if (total_bits > 0) {
-        printf("  Est. BER (CRC): %.2e\n",
-               (double)g_stats.nic_crc_errors / (double)total_bits);
-        printf("  Payload BER:    %.2e\n",
-               (double)plcrc / (double)total_bits);
+        /* BER upper-bound estimator: (errors + 0.5) / N. The +0.5 gives a
+         * conservative upper bound even when zero errors have been observed
+         * (BER <= 0.5/N), and adds a consistent half-count margin once errors
+         * appear. Applied identically to both the FCS-based (NIC CRC) and the
+         * independent payload (CRC32C) error counts. */
+        printf("  BER (CRC) <=:   %.2e   ((%lu + 0.5) / N)\n",
+               ((double)g_stats.nic_crc_errors + 0.5) / (double)total_bits,
+               g_stats.nic_crc_errors);
+        printf("  BER (payload)<=:%.2e   ((%lu + 0.5) / N)\n",
+               ((double)plcrc + 0.5) / (double)total_bits, plcrc);
         printf("  Frame loss rate:%.2e  (lost / transmitted)\n",
                txd ? (double)lost / (double)txd : 0.0);
     }

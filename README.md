@@ -4,7 +4,32 @@ Tests EtherCAT physical layer bit error rate by saturating a slave chain
 with NOP frames and logging CRC errors from both the host NIC PHY and
 ESC slave registers.
 
+## BER reporting
+
+BER is reported as an **upper-bound estimator**:
+
+```
+BER ≤ (errors + 0.5) / N
+```
+
+where N is the total number of **wire bits** (frames confirmed transmitted ×
+~12000 bits/frame). The `+0.5` gives a conservative bound even when zero errors
+have been observed — with no errors it reports `BER ≤ 0.5/N`, the smallest
+bound the data can support — and adds the same half-count margin once errors
+appear. It is applied identically to both BER lines:
+
+- **BER (CRC)** — from the NIC's FCS error count (link-layer).
+- **BER (payload)** — from the independent CRC32C payload check
+  (FCS-independent; catches corruption a hop-by-hop FCS would mask).
+
+Note this is the "add-half" rule of thumb, not a specific confidence level. For
+reference, a 95%-confidence zero-error bound would use `2.996/N` and 90% would
+use `2.303/N`; `0.5/N` corresponds to roughly 39% confidence. Quote it as an
+order-of-magnitude bound, and run long enough that N pushes the bound below
+your target (e.g. N ≥ 5×10¹² bits to claim BER ≲ 10⁻¹³).
+
 ## Wire-exact loss accounting (model B)
+
 
 A frame is marked "outstanding" (eligible to be counted lost) only when its
 **software TX timestamp completion** confirms it left the driver — not when
