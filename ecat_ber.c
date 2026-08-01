@@ -350,26 +350,34 @@ static Stats g_stats;
 #define SEQ_MASK   (SEQ_WINDOW - 1)
 
 typedef struct {
-    /* Per-slot record of which seqs have already been counted as returned, for
-     * DEDUPLICATION only (e.g. the lo interface double-delivers). A slot is a
-     * genuine new return iff not already seen. Owned by RX. */
+    /* Per-slot record of which seqs have already been counted as GOOD returns,
+     * for DEDUPLICATION only (e.g. the lo interface double-delivers). A slot is
+     * a genuine new good return iff not already seen. Owned by RX. */
     uint64_t ret_seq[SEQ_WINDOW];
-    uint8_t  ret_seen[SEQ_WINDOW];   /* 1 once this seq has been counted */
+    uint8_t  ret_seen[SEQ_WINDOW];   /* 1 once this seq has been counted good */
+    uint64_t max_good_seq;           /* highest GOOD-return seq seen           */
+    int      max_good_valid;         /* 0 until the first good frame           */
 } RxAccount;
 static RxAccount g_rx;
 
 static inline uint64_t now_ns(void);   /* defined below */
 
-/* Record a returned frame, deduplicated. Returns 1 if this is the FIRST time we
- * have seen this seq (caller should count it), 0 if it's a duplicate delivery.
- * RX-thread only. */
-static inline int rx_new_return(uint64_t seq) {
+/* Record a GOOD returned frame (FCS-valid AND payload-CRC-valid, so its seq is
+ * trustworthy), deduplicated. Returns 1 if this is the FIRST good sighting of
+ * this seq (caller should count it toward distinct good returns), 0 if it's a
+ * duplicate delivery. Also advances max_good_seq (used only for the good-frame-
+ * gated termination). RX-thread only. */
+static inline int rx_new_good_return(uint64_t seq) {
+    if (!g_rx.max_good_valid || seq > g_rx.max_good_seq) {
+        g_rx.max_good_seq  = seq;
+        g_rx.max_good_valid = 1;
+    }
     uint32_t slot = seq & SEQ_MASK;
     if (g_rx.ret_seq[slot] == seq && g_rx.ret_seen[slot])
         return 0;                    /* duplicate */
     g_rx.ret_seq[slot]  = seq;
     g_rx.ret_seen[slot] = 1;
-    return 1;                        /* first sighting */
+    return 1;                        /* first good sighting */
 }
 /* ── Wire-truth boundary (hardware tally counters) ──────────────────────────
  * TxOk = frames the r8169 MAC actually clocked onto the wire (hardware DTC
@@ -854,12 +862,16 @@ static void print_stats(FILE *csv, uint64_t elapsed_ns, uint64_t new_nic_crc) {
     g_stats.nic_crc_errors += nic_crc_delta;
     g_stats.nic_crc_errors_prev = new_nic_crc;
 
-    /* Effective throughput since last call. */
-    static uint64_t prev_sent = 0, prev_ns = 0;
+    /* Effective WIRE throughput since last call. Computed from TxOk (frames
+     * actually clocked onto the wire), NOT from enqueued — during an outage TX
+     * offers frames far faster than the wire rate (they are kernel-dropped), so
+     * an enqueued-based rate reads well above the 100BASE-TX line rate. TxOk is
+     * the true on-wire rate. */
+    static uint64_t prev_txok = 0, prev_ns = 0;
     double fps = 0.0;
     if (prev_ns && elapsed_ns > prev_ns)
-        fps = (double)(sent - prev_sent) / ((elapsed_ns - prev_ns) / 1e9);
-    prev_sent = sent; prev_ns = elapsed_ns;
+        fps = (double)(txok - prev_txok) / ((elapsed_ns - prev_ns) / 1e9);
+    prev_txok = txok; prev_ns = elapsed_ns;
 
     printf("\n── EtherCAT BER Test ─────────────────────────────────────\n");
     printf("  Elapsed:        %.1f s\n", elapsed_s);
@@ -878,10 +890,10 @@ static void print_stats(FILE *csv, uint64_t elapsed_ns, uint64_t new_nic_crc) {
     printf("  qdisc drop (kernel, above r8169): %lu  (excluded — never on wire)\n", qdrop);
     printf("  ── Accounting (wire-side) ──────────────────────────────\n");
     printf("  Frames rcvd (raw):      %lu\n", rcvd);
-    printf("  Distinct returns:       %lu\n", distinct);
-    printf("  Throughput:     %.0f fps  (%.1f Mbit/s)\n",
+    printf("  Good distinct returns:  %lu  (FCS+payload valid, deduped)\n", distinct);
+    printf("  Wire throughput:%.0f fps  (%.1f Mbit/s)  [from TxOk]\n",
            fps, fps * 12000.0 / 1e6);
-    printf("  Lost frames:    %lu  (reached wire, never returned — PHY loss)\n", lost);
+    printf("  Lost frames:    %lu  (TxOk − good returns; includes corrupt)\n", lost);
     printf("  Payload CRC err:%lu  %s\n", plcrc,
            plcrc ? "*** PAYLOAD CORRUPTION (FCS-independent) ***" : "(clean)");
     { uint64_t bfc = atomic_load_explicit(&g_stats.rx_bad_fcs_computed, memory_order_relaxed);
@@ -892,7 +904,7 @@ static void print_stats(FILE *csv, uint64_t elapsed_ns, uint64_t new_nic_crc) {
       if (trunc)
           printf("  Truncated frames: %lu  (too short to parse)\n", trunc);
     }
-    printf("  TX backpressure:%lu  (backlog cap, normal)\n", backp);
+    printf("  TX backpressure:%lu  (EAGAIN ring-full, normal)\n", backp);
     printf("  Kernel RX drops:%lu  %s\n", kdrops,
            kdrops ? "*** DRAIN SATURATED — BER INVALID ***" : "(none, drain healthy)");
     /* ── Link (host NIC) — three independent sources ───────────── */
@@ -1078,33 +1090,15 @@ static void *tx_thread(void *arg) {
             }
         }
 
-        /* TX throughput bound (Issue 2): cap the offered-but-not-yet-on-wire
-         * backlog = enqueued − TxOk, at BACKLOG_CAP.
-         *
-         * TxOk (hardware, frames actually clocked onto the wire) is the pacing
-         * anchor. This is deadlock-free by construction:
-         *  - Normal: TxOk keeps pace with enqueued (backlog ≈ ring depth), well
-         *    under the cap; the TX ring's own EAGAIN paces at line rate.
-         *  - Outage: TxOk freezes (frames don't reach the wire), so the backlog
-         *    grows to BACKLOG_CAP and TX pauses — bounded, no explosion.
-         *  - Recovery: TxOk advances the instant the wire works again (it does
-         *    NOT depend on any frame RETURNING), so the backlog drains and TX
-         *    resumes immediately. Because the anchor is "reached the wire", not
-         *    "came back", the deadlock that a returns-based credit suffered
-         *    cannot occur: frames dropped during the outage are simply never
-         *    counted in TxOk, and TX paces to the live TxOk rate after recovery.
-         * The backlog offset (enqueued − TxOk) settling at ≈ BACKLOG_CAP after
-         * an outage is harmless — it is just buffering headroom; enqueued is a
-         * diagnostic counter and plays no part in loss accounting. */
-        #define BACKLOG_CAP 8000
-        uint64_t sent_now = atomic_load_explicit(&g_stats.frames_enqueued, memory_order_relaxed);
-        uint64_t txok_now = atomic_load_explicit(&g_txok, memory_order_relaxed);
-        if (sent_now > txok_now && (sent_now - txok_now) >= BACKLOG_CAP) {
-            atomic_fetch_add_explicit(&g_stats.tx_backpressure, 1, memory_order_relaxed);
-            sleep_ns(10000);   /* 10us; loop re-checks g_tx_running */
-            continue;
-        }
-        #undef BACKLOG_CAP
+        /* Issue 2: TX never halts. There is no backlog cap and no credit
+         * window. The kernel/PHY discards frames when there is no link (those
+         * frames are simply not counted in TxOk, correctly excluded from BER),
+         * so there is nothing to protect against by pausing — and any pause
+         * risks a deadlock. TX just keeps offering frames: on success, count and
+         * advance; on EAGAIN/ENOBUFS (ring full = line-rate backpressure, or no
+         * carrier), a short 10µs sleep and retry the SAME frame. This guarantees
+         * low-latency resumption: the instant the link returns, the next send()
+         * succeeds and frames flow, because TX never stopped trying. */
 
         int frame_len = build_frame(tx_buf, sizeof(tx_buf), ctx->src_mac,
                                     ctx->loopback ? 0 : ctx->num_slaves,
@@ -1278,16 +1272,19 @@ static void *rx_thread(void *arg) {
         uint64_t rseq = parse_return_frame(bufs[idx], content_len,             \
                                            ctx->num_slaves, ctx->loopback,     \
                                            &payload_ok);                       \
-        /* Count-based accounting (Issue 1). Loss = TxOk − distinct returns, so \
-         * here we only need to count DISTINCT returned seqs (deduplicated —    \
-         * e.g. lo double-delivers). A frame is GOOD iff FCS valid (!comp_bad)  \
-         * AND payload CRC verified; otherwise it is a corruption event (already \
-         * counted by the FCS/payload detectors). Either way, a frame that came \
-         * back at all is a "return" and is NOT loss. Corrupt frames may carry a \
-         * garbage seq; we still dedup on whatever seq we read, which at worst   \
-         * slightly miscounts a corrupt dup — corruption is tracked separately   \
-         * by the detectors, so this does not affect the corruption figures. */ \
-        if (rseq != UINT64_MAX && rx_new_return(rseq)) {                       \
+        /* Count-based accounting (Issue 1). loss = TxOk − good distinct        \
+         * returns. A frame counts as a GOOD return iff its Ethernet FCS is     \
+         * valid (!comp_bad) AND its payload CRC32C verified (payload_ok) — only \
+         * then is its seq trustworthy for the dedup/count. A corrupt frame's    \
+         * seq may be garbage, so it does NOT count as a good return; it is      \
+         * tracked by the corruption detectors instead, AND — by not being a     \
+         * good return — it also falls into loss (loss counts frames that did    \
+         * not come back GOOD). So a corrupt frame is deliberately in BOTH loss  \
+         * and corruption; these are two overlapping measures (see README).      \
+         * rx_new_good_return also advances max_good_seq for the good-frame-     \
+         * gated termination. */                                                \
+        int good = (!comp_bad) && payload_ok;                                  \
+        if (good && rseq != UINT64_MAX && rx_new_good_return(rseq)) {          \
             atomic_fetch_add_explicit(&g_stats.distinct_returns, 1,            \
                                       memory_order_relaxed);                   \
         }                                                                     \
@@ -1980,57 +1977,47 @@ int main(int argc, char *argv[]) {
     }
 
     /* ── Termination barrier (good-frame-gated) ─────────────────────────────
-     * With TxOk-anchored accounting, loss = TxOk − distinct returns is exact
-     * once the system has SETTLED: TX stopped, TxOk stopped advancing (every
-     * frame that will reach the wire has), and distinct returns stopped
-     * advancing (every wire frame that will come back has). We:
-     *   1. Stop TX, join it.
-     *   2. Wait for TxOk and distinct-returns to both go quiet (settle).
-     *   3. The settle can only complete if the link is up long enough to drain
-     *      the last returns. If the link is DOWN and returns can't drain, warn
-     *      once per second up to 10 times ("reestablish link to complete test");
-     *      if the link recovers the returns drain and we conclude; otherwise we
-     *      mark the run INCOMPLETE and exit non-zero rather than report a loss
-     *      figure that includes still-in-flight frames as false loss.
-     */
+     * The session may only conclude when a GOOD frame confirms the final
+     * enqueued frame — reading its seq is the only trustworthy confirmation
+     * that the last frame completed the round trip. We:
+     *   1. Stop TX, join it. Note the final enqueued seq.
+     *   2. Wait until max_good_seq (highest GOOD-return seq) reaches the last
+     *      enqueued seq (enq_final-1) — i.e. a good frame confirms the tail.
+     *   3. If the link is down and no such good frame arrives, warn once per
+     *      second up to 10 times ("reestablish link to complete test (N/10)").
+     *      If a good frame arrives we conclude cleanly; otherwise we exit
+     *      INCOMPLETE (non-zero) rather than conclude on an unconfirmed tail.
+     * loss stays TxOk − good distinct returns throughout; max_good_seq is used
+     * ONLY for this gate. */
     g_tx_running = 0;
     pthread_join(tx_tid, NULL);
 
     uint64_t enq_final = atomic_load_explicit(&g_tx_final_seq, memory_order_acquire);
-    printf("\nTX stopped: %lu frames enqueued. Settling (waiting for TxOk and "
-           "returns to go quiet)...\n", enq_final);
+    printf("\nTX stopped: %lu frames enqueued. Waiting for a good frame to "
+           "confirm the final frame...\n", enq_final);
 
     int incomplete = 0;
     if (enq_final != 0) {
+        uint64_t target = enq_final - 1;   /* last actually-enqueued seq */
         uint64_t warn_deadline = now_ns() + 1000ULL * 1000000ULL;
         int warns = 0;
-        uint64_t prev_txok = 0, prev_ret = 0, quiet = 0;
         for (;;) {
-            sleep_ns(50 * 1000000);   /* 50ms poll */
-            uint64_t txok = atomic_load_explicit(&g_txok, memory_order_relaxed);
-            uint64_t ret  = atomic_load_explicit(&g_stats.distinct_returns, memory_order_relaxed);
-            int settled = (txok == prev_txok) && (ret == prev_ret);
-            /* Consider settled when both have been stable for ~200ms AND all
-             * frames that reached the wire have returned (ret >= txok), i.e. no
-             * outstanding wire frames. If ret < txok but stable, those are
-             * genuine losses (won't return) — still settled. */
-            if (settled) {
-                if (++quiet >= 4) break;   /* 200ms quiet on both */
-            } else {
-                quiet = 0;
-            }
-            prev_txok = txok; prev_ret = ret;
+            uint64_t mg = atomic_load_explicit((_Atomic uint64_t *)&g_rx.max_good_seq,
+                                               memory_order_relaxed);
+            int mgv = g_rx.max_good_valid;
+            if (mgv && mg >= target) break;   /* good frame confirmed the tail */
 
-            /* If not settling because the link is down (returns can't drain),
-             * warn once per second up to 10 times. */
             int link_up = atomic_load_explicit(&g_stats.link_state_up, memory_order_relaxed);
-            if (!settled && !link_up && now_ns() >= warn_deadline) {
+            if (now_ns() >= warn_deadline) {
                 warns++;
-                fprintf(stderr, "reestablish link to complete test (%d/10) "
-                        "[link DOWN] — TxOk=%lu returns=%lu\n", warns, txok, ret);
+                fprintf(stderr, "reestablish link to complete test (%d/10)%s "
+                        "— max_good_seq=%lu target=%lu\n",
+                        warns, link_up ? " [link reports UP]" : " [link DOWN]",
+                        mgv ? mg : 0, target);
                 if (warns >= 10) { incomplete = 1; break; }
                 warn_deadline = now_ns() + 1000ULL * 1000000ULL;
             }
+            sleep_ns(10 * 1000000);   /* 10ms poll */
         }
     }
 

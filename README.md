@@ -16,59 +16,78 @@ The boundary is read directly from the r8169's **hardware tally counters** (the
 Dump Tally Counter block, exposed via `ethtool -S` / `ETHTOOL_GSTATS`):
 
 - **TxOk** (`tx_packets`) — frames the MAC actually clocked onto the wire. This
-  is the wire-truth signal and the BER denominator.
+  is the wire-truth signal and the BER/loss denominator.
 - **TxER** (`tx_errors`) — frames the MAC rejected, *including carrier-lost*.
-  These reached the r8169 but the physical layer refused them: link-down
-  collateral, **not** a bit error. Reported separately, excluded from BER.
+  Reached the r8169 but the physical layer refused them: link-down collateral,
+  **not** a bit error. Reported separately, excluded from BER.
 - **qdisc tx_dropped** (kernel software counter, sysfs) — frames the kernel
   discarded *above* the r8169. Never reached the MAC. Excluded entirely.
 
-A sampler thread reads all three every 20ms (the diagnostic confirmed TxOk
-updates smoothly, ~per-frame under saturation, so the boundary is sharp). The RX
-thread counts **distinct returned frames** (deduplicated by sequence number, so
-a double-delivering interface like `lo` can't inflate the count). Loss is then a
-pure count:
+A sampler thread reads all three every 20ms. The RX thread counts **good
+distinct returns**: a returned frame counts only if its Ethernet FCS is valid
+AND its payload CRC32C verifies — only then is its sequence number trustworthy
+for deduplication (a double-delivering interface like `lo` can't inflate the
+count, and a corrupt frame's garbage seq can't corrupt the tally). Loss is then
+a pure count:
 
-> **loss = TxOk − distinct returns**  (frames that reached the wire but never
-> came back)
+> **loss = TxOk − good distinct returns**  (frames that reached the wire but did
+> not come back *good*)
 
 and **BER denominator = TxOk**. Because qdisc-dropped and TxER frames are never
 in TxOk, they can never be counted as loss — the kernel artifacts you don't care
-about are excluded by construction. Corruption (bad FCS / bad payload CRC) is
-counted separately by the detectors; a corrupt frame *returned*, so it is not
-loss. All sequence values are uint64 (a 32-bit counter would wrap in ~6 days at
-8127 fps).
+about are excluded by construction.
 
-At termination the tool waits for TxOk and the distinct-return count to both go
-quiet (settle), at which point `TxOk − distinct` is exact. If the link is down
-and returns cannot drain, it warns once per second ("reestablish link to
-complete test (N/10)") up to 10 times, then exits non-zero and marks the run
-INCOMPLETE rather than reporting a figure that counts still-in-flight frames as
-false loss.
+### Loss and corruption are two overlapping measures
+
+`loss` and the corruption/CRC counts answer **different questions about the same
+wire**, and they deliberately **overlap**:
+
+- **loss** answers *"did a clean frame complete the round trip?"* — it counts
+  every frame that did not return **good**, which includes both frames that
+  never came back at all AND frames that came back **corrupt**.
+- **corruption** (bad FCS / bad payload CRC) answers *"how many bit errors did
+  we see?"* — counted independently by the detectors.
+
+So **a corrupt frame is counted in BOTH loss and corruption.** This is
+intentional, not double-counting-by-mistake: a corrupted frame did not deliver a
+clean round trip (so it is a loss) *and* it exhibited bit errors (so it is a
+corruption). The two measures are distinct but not mutually exclusive; their
+intersection is exactly the set of corrupt-but-returned frames. Report them as
+what they are — a frame-completion measure and a bit-error measure — and don't
+add them together.
+
+All sequence values are uint64 (a 32-bit counter would wrap in ~6 days at 8127
+fps).
+
+### Good-frame-gated termination
+
+The session may only conclude when a **good frame confirms the final enqueued
+frame** — reading its sequence number is the only trustworthy confirmation that
+the last frame completed the round trip. At shutdown the tool stops TX and waits
+until the highest good-return seq (`max_good_seq`) reaches the last enqueued seq.
+If the link is down and no such good frame arrives, it warns once per second
+("reestablish link to complete test (N/10)") up to 10 times, then exits non-zero
+and marks the run INCOMPLETE rather than concluding on an unconfirmed tail. A
+corrupt frame never advances the gate (its seq is untrusted), so it cannot
+falsely confirm completion.
 
 Note: `lo` (loopback) has no r8169 and therefore no hardware tally counters, so
 TxOk reads 0 there and loss/BER are unavailable — `lo` is a plumbing smoke test
 only. The real measurement requires the physical `enp2s0` interface.
 
-## TX throughput (TxOk-anchored backlog cap)
+## TX throughput (never halts)
 
-TX is bounded by a single cap on the offered-but-not-yet-on-wire backlog:
-
-> **enqueued − TxOk ≥ 8000  →  pause**
-
-This is deadlock-free by construction, which earlier returns-based schemes were
-not:
-
-- **Normal:** TxOk keeps pace with enqueued (backlog ≈ ring depth); the TX
-  ring's own EAGAIN paces at line rate.
-- **Outage:** TxOk freezes (frames don't reach the wire), the backlog grows to
-  the cap, and TX pauses — bounded, no explosion.
-- **Recovery:** TxOk advances the instant the wire works again — crucially, this
-  does **not** depend on any frame *returning*. So the backlog drains and TX
-  resumes immediately. On a NIC that drops during carrier-down (confirmed for
-  the r8169/RTL8125), the dropped frames are simply never counted in TxOk; there
-  is no stuck window to deadlock on, because the pacing anchor is "reached the
-  wire", not "came back". No credit valve or write-off is needed.
+TX has **no cap, no credit window, and never pauses.** The kernel/PHY discards
+frames when there is no link, and those frames are simply not counted in TxOk
+(correctly excluded from BER), so there is nothing to protect against by pausing
+— and any pause risks a deadlock (every capped/credit-gated design tried here
+eventually deadlocked when outage-dropped frames pinned the gate). TX just keeps
+offering frames: on success it counts and advances; on `EAGAIN`/`ENOBUFS` (ring
+full at line rate, or no carrier) it sleeps ~10µs and retries the same frame.
+This guarantees low-latency resumption — the instant the link returns, the next
+`send()` succeeds and frames flow, because TX never stopped trying. The `enqueued
+− TxOk` gap during an outage is harmless: those frames were dropped by the
+kernel/PHY, are excluded from TxOk, and play no part in loss accounting.
 
 ## Receiving corrupt frames (rx-all + rx-fcs)
 
@@ -191,7 +210,7 @@ The tool still shows the transmit-path stages as a **diagnostic** (they no longe
 drive accounting — loss is TxOk-based):
 
 - **TX enqueued (ring)** — `send()` calls the kernel accepted. "Handed to the
-  kernel", not "on the wire". Used only for the backlog cap and display.
+  kernel", not "on the wire". Diagnostic only; plays no part in accounting.
 - **TX driver-xmit (sw ts)** — counted from software TX timestamp completions off
   the socket error queue, if TX timestamping is available. A pipeline
   diagnostic only; the RTL8125 has no PTP hardware clock, so this is software
@@ -381,7 +400,7 @@ The tool reports estimated BER in the periodic status output.
   qdisc drop (kernel, above r8169): 0  (excluded — never on wire)
   ── Accounting (wire-side) ──────────────────────────────
   Frames rcvd (raw):      29,160,000
-  Distinct returns:       29,160,000
+  Good distinct returns:  29,160,000  (FCS+payload valid, deduped)
   Lost frames:    0  (reached wire, never returned — PHY loss)
   Payload CRC err:0  (clean)
   Bad FCS (computed/kernel): 0 / 0  (none)
@@ -399,8 +418,9 @@ The tool reports estimated BER in the periodic status output.
 put on the wire (BER denominator). TxER (carrier-lost) and qdisc drop (kernel,
 above the r8169) are shown but **excluded from BER** — see the accounting model.
 
-**Lost frames**: TxOk − distinct returns = frames that reached the wire but
-never came back. Physical-layer loss only; kernel drops and carrier-lost frames
+**Lost frames**: TxOk − good distinct returns = frames that reached the wire
+but did not come back *good* (includes corrupt returns; see the accounting
+section on the loss/corruption overlap). Kernel drops and carrier-lost frames
 are never included.
 
 **BRD WKC mismatches**: the broadcast Working Counter returned a value
@@ -488,8 +508,8 @@ sudo ./ecat_ber -i enp2s0 -l -d 30
 
 On a passive TX→RX loopback plug the plug's latency lets the NIC's TX ring
 buffer frames ahead of the wire, so `TX enqueued` runs ahead of TxOk (the
-`enqueued − TxOk` backlog grows). This is **not** loss — it is buffering, and
-the backlog cap holds it at ≤ 8000. Because loss is now `TxOk − distinct
+`enqueued − TxOk` gap grows). This is **not** loss — it is buffering, and TX
+never halts on it (there is no cap). Because loss is `TxOk − good distinct
 returns` (both hardware/wire-side quantities), the ring buffering cannot inflate
 the loss figure the way older enqueue-based builds did.
 
