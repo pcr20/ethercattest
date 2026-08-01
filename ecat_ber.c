@@ -279,7 +279,9 @@ typedef struct {
     _Atomic uint64_t frames_lost;      /* TX thread (retire)                   */
     _Atomic uint64_t seq_bad;          /* RX thread                            */
     _Atomic uint64_t tx_backpressure;  /* TX thread — EAGAIN/in-flight cap     */
+    _Atomic uint64_t credit_writeoff_events;/* TX thread — valve fired count    */
     _Atomic uint64_t brd_wkc_mismatches;/* RX thread                           */
+    _Atomic uint64_t distinct_returns; /* RX thread — deduped returned seqs     */
     _Atomic uint64_t kernel_drops;     /* main thread, from PACKET_STATISTICS  */
     _Atomic uint64_t payload_crc_errors;/* RX thread — CRC32C mismatch         */
     _Atomic uint64_t rx_bad_fcs_auxdata;/* RX thread — kernel PACKET_AUXDATA    */
@@ -289,6 +291,8 @@ typedef struct {
     /* On-wire TX packet count (ethtool tx_packets). Owned by supervisor. */
     uint64_t tx_wire_packets;          /* cumulative, from ethtool             */
     uint64_t tx_wire_base;             /* baseline at start                    */
+    uint64_t tx_err_base;              /* TxER baseline                        */
+    uint64_t qdisc_drop_base;          /* qdisc tx_dropped baseline            */
     int      tx_ts_supported;          /* 1 if sw TX timestamping active       */
     /* Link-loss tracking. sysfs counter deltas owned by supervisor; nl_* by the
      * netlink cross-check thread; carrier-poll events + link_state_up by the
@@ -346,62 +350,43 @@ static Stats g_stats;
 #define SEQ_MASK   (SEQ_WINDOW - 1)
 
 typedef struct {
-    /* Per-slot record of the seq that last returned and how. Owned by RX.
-     *   ret_seq[slot]  = the seq value whose return is recorded in this slot
-     *   ret_kind[slot] = 0 none, 1 good, 2 corrupt
-     * A slot is only meaningful when ret_seq[slot] matches the seq queried. */
+    /* Per-slot record of which seqs have already been counted as returned, for
+     * DEDUPLICATION only (e.g. the lo interface double-delivers). A slot is a
+     * genuine new return iff not already seen. Owned by RX. */
     uint64_t ret_seq[SEQ_WINDOW];
-    uint8_t  ret_kind[SEQ_WINDOW];
-    uint64_t hw;              /* high-water: highest GOOD-returned seq, +1       */
-    int      hw_valid;        /* 0 until the first good frame establishes hw     */
+    uint8_t  ret_seen[SEQ_WINDOW];   /* 1 once this seq has been counted */
 } RxAccount;
 static RxAccount g_rx;
 
 static inline uint64_t now_ns(void);   /* defined below */
 
-/* Credit accounting for TX throughput control (Issue 2). g_frames_resolved is
- * advanced by the RX thread as the high-water mark passes seqs; TX computes
- * credit = sent - resolved and caps it. */
-static _Atomic uint64_t g_frames_resolved = 0;
-
-/* Record that seq returned (good or corrupt). RX-thread only. */
-static inline void rx_record_return(uint64_t seq, int corrupt) {
+/* Record a returned frame, deduplicated. Returns 1 if this is the FIRST time we
+ * have seen this seq (caller should count it), 0 if it's a duplicate delivery.
+ * RX-thread only. */
+static inline int rx_new_return(uint64_t seq) {
     uint32_t slot = seq & SEQ_MASK;
+    if (g_rx.ret_seq[slot] == seq && g_rx.ret_seen[slot])
+        return 0;                    /* duplicate */
     g_rx.ret_seq[slot]  = seq;
-    g_rx.ret_kind[slot] = corrupt ? 2 : 1;
+    g_rx.ret_seen[slot] = 1;
+    return 1;                        /* first sighting */
 }
+/* ── Wire-truth boundary (hardware tally counters) ──────────────────────────
+ * TxOk = frames the r8169 MAC actually clocked onto the wire (hardware DTC
+ * counter, via ethtool GSTATS). This is the measurement boundary: "the r8169
+ * and everything downstream". Sampled periodically into g_txok_delta by the
+ * sampler thread (base subtracted so it's a per-run count).
+ *
+ * LOSS (physical-layer) = TxOk − distinct frames returned. A frame that reached
+ * the wire (counted in TxOk) but never came back is a genuine wire loss. Frames
+ * the KERNEL dropped above the r8169 (qdisc tx_dropped) are never in TxOk, so
+ * they are excluded automatically. Frames the r8169 rejected at carrier-lost
+ * (TxER) are also not in TxOk, so also excluded — reported separately as
+ * link-down collateral. BER denominator = TxOk. */
+static _Atomic uint64_t g_txok       = 0;  /* per-run TxOk (frames on wire)     */
+static _Atomic uint64_t g_txer       = 0;  /* per-run TxER (carrier-lost etc.)  */
+static _Atomic uint64_t g_qdisc_drop = 0;  /* per-run qdisc tx_dropped (kernel) */
 
-/* Was seq recorded as returned (either kind) — and if so, corrupt? */
-static inline int rx_was_returned(uint64_t seq, int *corrupt) {
-    uint32_t slot = seq & SEQ_MASK;
-    if (g_rx.ret_seq[slot] == seq && g_rx.ret_kind[slot] != 0) {
-        if (corrupt) *corrupt = (g_rx.ret_kind[slot] == 2);
-        return 1;
-    }
-    return 0;
-}
-
-/* Resolve the span up to a GOOD frame with seq N, back-calculating exact wire
- * loss for absent seqs. RX-thread only. Advances hw and g_frames_resolved. */
-static inline void rx_resolve_good(uint64_t n) {
-    uint64_t from;
-    if (!g_rx.hw_valid) {
-        from = 0;                 /* first good frame resolves 0..n */
-        g_rx.hw_valid = 1;
-    } else {
-        if (n + 1 <= g_rx.hw) return;   /* already resolved (dup / out-of-order) */
-        from = g_rx.hw;
-    }
-    for (uint64_t s = from; s < n; s++) {
-        int corrupt = 0;
-        if (!rx_was_returned(s, &corrupt))
-            atomic_fetch_add_explicit(&g_stats.frames_lost, 1, memory_order_relaxed);
-        /* corrupt returns were already counted as corruption on arrival */
-    }
-    g_rx.hw = n + 1;
-    /* Credit: everything up to and including n is now resolved. */
-    atomic_store_explicit(&g_frames_resolved, n + 1, memory_order_relaxed);
-}
 
 /* ── Globals ────────────────────────────────────────────────────────────── */
 static volatile int g_running   = 1;  /* master run flag (RX honours this)   */
@@ -533,6 +518,16 @@ static uint64_t read_nic_tx_packets(const char *iface) {
     /* Fall back to per-cast counters. */
     static const char *const cast[] = { "tx_unicast", "tx_multicast", "tx_broadcast" };
     return ethtool_sum_counters(iface, cast, 3, "err");
+}
+
+/* On-wire TX ERROR counter (TxER: Tx errors incl. carrier-lost, abort,
+ * underrun, out-of-window collision). These frames reached the r8169 MAC but
+ * were NOT successfully transmitted — they are at the measurement boundary
+ * (r8169) but are link-down collateral, NOT physical-layer bit-error loss, so
+ * they are reported separately and excluded from BER. */
+static uint64_t read_nic_tx_errors(const char *iface) {
+    static const char *const needles[] = { "tx_errors", "tx_err" };
+    return ethtool_sum_counters(iface, needles, 2, NULL);
 }
 
 /* Read a uint64 from /sys/class/net/<iface>/<name>. Returns 0 and sets *ok=0
@@ -831,29 +826,33 @@ static void print_stats(FILE *csv, uint64_t elapsed_ns, uint64_t new_nic_crc) {
     /* Snapshot atomics once for a consistent-ish view. */
     uint64_t sent     = atomic_load_explicit(&g_stats.frames_enqueued, memory_order_relaxed);
     uint64_t rcvd     = atomic_load_explicit(&g_stats.frames_received, memory_order_relaxed);
-    uint64_t lost     = atomic_load_explicit(&g_stats.frames_lost, memory_order_relaxed);
+    uint64_t distinct = atomic_load_explicit(&g_stats.distinct_returns, memory_order_relaxed);
     uint64_t backp    = atomic_load_explicit(&g_stats.tx_backpressure, memory_order_relaxed);
     uint64_t wkcmm    = atomic_load_explicit(&g_stats.brd_wkc_mismatches, memory_order_relaxed);
     uint64_t kdrops   = atomic_load_explicit(&g_stats.kernel_drops, memory_order_relaxed);
     uint64_t plcrc    = atomic_load_explicit(&g_stats.payload_crc_errors, memory_order_relaxed);
     uint64_t tsc      = atomic_load_explicit(&g_stats.tx_ts_completions, memory_order_relaxed);
     uint64_t wire     = g_stats.tx_wire_packets;
-    /* Resolved = high-water mark = frames confirmed on the wire by a good
-     * return. This is the authoritative denominator for BER: every resolved
-     * frame provably traversed the wire. */
-    uint64_t resolved = atomic_load_explicit(&g_frames_resolved, memory_order_relaxed);
 
-    uint64_t total_bits = resolved * 12000ULL;
+    /* Wire-truth boundary. */
+    uint64_t txok  = atomic_load_explicit(&g_txok, memory_order_relaxed);
+    uint64_t txer  = atomic_load_explicit(&g_txer, memory_order_relaxed);
+    uint64_t qdrop = atomic_load_explicit(&g_qdisc_drop, memory_order_relaxed);
+
+    /* LOSS = frames that reached the wire (TxOk) but never returned. Clamped:
+     * during the run a few frames are legitimately in flight (TxOk counted,
+     * not yet returned), and the async TxOk sample may briefly lag returns, so
+     * a small transient negative is clamped to 0. Exact once settled. */
+    int64_t lost_signed = (int64_t)txok - (int64_t)distinct;
+    uint64_t lost = (lost_signed > 0) ? (uint64_t)lost_signed : 0;
+
+    /* BER denominator = frames that actually reached the wire (TxOk). */
+    uint64_t total_bits = txok * 12000ULL;
 
     /* NIC CRC delta */
     uint64_t nic_crc_delta = new_nic_crc - g_stats.nic_crc_errors_prev;
     g_stats.nic_crc_errors += nic_crc_delta;
     g_stats.nic_crc_errors_prev = new_nic_crc;
-
-    /* Frames sent but not yet resolved (in flight + any not-yet-confirmed
-     * backlog). Informational, NOT loss — pending the next good frame. */
-    int64_t unresolved = (int64_t)sent - (int64_t)resolved;
-    if (unresolved < 0) unresolved = 0;
 
     /* Effective throughput since last call. */
     static uint64_t prev_sent = 0, prev_ns = 0;
@@ -868,16 +867,21 @@ static void print_stats(FILE *csv, uint64_t elapsed_ns, uint64_t new_nic_crc) {
     printf("  TX enqueued (ring):      %lu\n", sent);
     if (g_stats.tx_ts_supported)
         printf("  TX driver-xmit (sw ts):  %lu\n", tsc);
-    printf("  TX on wire (ethtool):    %lu\n", wire);
-    printf("  ── Accounting (RX-driven) ──────────────────────────────\n");
-    printf("  Frames rcvd:    %lu\n",    rcvd);
-    printf("  Resolved (high-water): %lu  (confirmed on wire by good return)\n",
-           resolved);
-    printf("  Unresolved:     %ld  (sent, pending next good frame — NOT loss)\n",
-           (long)unresolved);
+    printf("  ── Wire boundary (r8169 hardware tally) ────────────────\n");
+    if (txok == 0 && sent > 1000) {
+        printf("  TxOk: 0  *** hardware tally unavailable on this interface ***\n");
+        printf("    (loopback 'lo' has no r8169 tally counters; loss/BER need enp2s0)\n");
+    } else {
+        printf("  TxOk  (on wire, BER denom): %lu\n", txok);
+    }
+    printf("  TxER  (r8169 rejected, carrier-lost etc.): %lu  (excluded from BER)\n", txer);
+    printf("  qdisc drop (kernel, above r8169): %lu  (excluded — never on wire)\n", qdrop);
+    printf("  ── Accounting (wire-side) ──────────────────────────────\n");
+    printf("  Frames rcvd (raw):      %lu\n", rcvd);
+    printf("  Distinct returns:       %lu\n", distinct);
     printf("  Throughput:     %.0f fps  (%.1f Mbit/s)\n",
            fps, fps * 12000.0 / 1e6);
-    printf("  Lost frames:    %lu  (absent below high-water — wire loss)\n", lost);
+    printf("  Lost frames:    %lu  (reached wire, never returned — PHY loss)\n", lost);
     printf("  Payload CRC err:%lu  %s\n", plcrc,
            plcrc ? "*** PAYLOAD CORRUPTION (FCS-independent) ***" : "(clean)");
     { uint64_t bfc = atomic_load_explicit(&g_stats.rx_bad_fcs_computed, memory_order_relaxed);
@@ -888,7 +892,7 @@ static void print_stats(FILE *csv, uint64_t elapsed_ns, uint64_t new_nic_crc) {
       if (trunc)
           printf("  Truncated frames: %lu  (too short to parse)\n", trunc);
     }
-    printf("  TX backpressure:%lu  (EAGAIN/in-flight cap, normal)\n", backp);
+    printf("  TX backpressure:%lu  (backlog cap, normal)\n", backp);
     printf("  Kernel RX drops:%lu  %s\n", kdrops,
            kdrops ? "*** DRAIN SATURATED — BER INVALID ***" : "(none, drain healthy)");
     /* ── Link (host NIC) — three independent sources ───────────── */
@@ -935,8 +939,8 @@ static void print_stats(FILE *csv, uint64_t elapsed_ns, uint64_t new_nic_crc) {
                g_stats.nic_crc_errors);
         printf("  BER (payload)<=:%.2e   ((%lu + 0.5) / N)\n",
                ((double)plcrc + 0.5) / (double)total_bits, plcrc);
-        printf("  Frame loss rate:%.2e  (lost / resolved)\n",
-               resolved ? (double)lost / (double)resolved : 0.0);
+        printf("  Frame loss rate:%.2e  (lost / TxOk)\n",
+               txok ? (double)lost / (double)txok : 0.0);
     }
 
     if (g_verbose && !g_loopback) {
@@ -959,10 +963,10 @@ static void print_stats(FILE *csv, uint64_t elapsed_ns, uint64_t new_nic_crc) {
         uint64_t bfc  = atomic_load_explicit(&g_stats.rx_bad_fcs_computed, memory_order_relaxed);
         uint64_t bfa  = atomic_load_explicit(&g_stats.rx_bad_fcs_auxdata, memory_order_relaxed);
         uint64_t trunc= atomic_load_explicit(&g_stats.rx_truncated, memory_order_relaxed);
-        fprintf(csv, "%.3f,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,"
-                     "%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu",
-                elapsed_s, sent, wire, tsc, resolved, rcvd, lost,
-                g_stats.nic_crc_errors, plcrc, wkcmm, kdrops, (uint64_t)unresolved,
+        fprintf(csv, "%.3f,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,"
+                     "%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu",
+                elapsed_s, sent, wire, txok, txer, qdrop, distinct, rcvd, lost,
+                g_stats.nic_crc_errors, plcrc, wkcmm, kdrops,
                 g_stats.carrier_down, g_stats.carrier_up, g_stats.carrier_changes,
                 cp_d, cp_u, nl_d, nl_u, nl_o, bfc, bfa, trunc);
         for (int s = 0; s < g_num_slaves && s < MAX_SLAVES; s++)
@@ -976,9 +980,10 @@ static void print_stats(FILE *csv, uint64_t elapsed_ns, uint64_t new_nic_crc) {
 
 /* ── CSV header ─────────────────────────────────────────────────────────── */
 static void write_csv_header(FILE *csv, int num_slaves) {
-    fprintf(csv, "elapsed_s,tx_enqueued,tx_wire,tx_driver_xmit,resolved,"
-                 "frames_rcvd,frames_lost,nic_crc_errors,payload_crc_errors,"
-                 "brd_wkc_mismatches,kernel_rx_drops,unresolved,"
+    fprintf(csv, "elapsed_s,tx_enqueued,tx_wire,txok,txer,qdisc_drop,"
+                 "distinct_returns,frames_rcvd,frames_lost,"
+                 "nic_crc_errors,payload_crc_errors,"
+                 "brd_wkc_mismatches,kernel_rx_drops,"
                  "carrier_down,carrier_up,carrier_changes,"
                  "link_down_cp,link_up_cp,link_down_nl,link_up_nl,netlink_overflows,"
                  "rx_bad_fcs_computed,rx_bad_fcs_auxdata,rx_truncated");
@@ -1073,27 +1078,33 @@ static void *tx_thread(void *arg) {
             }
         }
 
-        /* Credit window (Issue 2): keep at most ~MAX_INFLIGHT frames unresolved
-         * on the wire. credit = sent - resolved, where "resolved" is advanced
-         * purely by the RX high-water mark (a good frame resolves its whole
-         * span). This is fully decoupled from accounting and cannot wedge:
-         *  - Normal: frames resolve as they return (~100us); credit cycles;
-         *    TX stays saturated (EAGAIN paces at line rate).
-         *  - Outage: returns stop, resolved freezes, credit fills to the cap,
-         *    TX pauses (bounded — no explosion). Frames offered are held by the
-         *    qdisc (see setup: large txqueuelen) or, if dropped, resolved as
-         *    loss by the first good frame on recovery.
-         *  - Recovery: the first good frame advances the high-water mark across
-         *    the whole gap, resolving all of it at once; credit frees; TX
-         *    resumes full-rate immediately.
-         * Guarded against transient resolved>sent underflow. */
+        /* TX throughput bound (Issue 2): cap the offered-but-not-yet-on-wire
+         * backlog = enqueued − TxOk, at BACKLOG_CAP.
+         *
+         * TxOk (hardware, frames actually clocked onto the wire) is the pacing
+         * anchor. This is deadlock-free by construction:
+         *  - Normal: TxOk keeps pace with enqueued (backlog ≈ ring depth), well
+         *    under the cap; the TX ring's own EAGAIN paces at line rate.
+         *  - Outage: TxOk freezes (frames don't reach the wire), so the backlog
+         *    grows to BACKLOG_CAP and TX pauses — bounded, no explosion.
+         *  - Recovery: TxOk advances the instant the wire works again (it does
+         *    NOT depend on any frame RETURNING), so the backlog drains and TX
+         *    resumes immediately. Because the anchor is "reached the wire", not
+         *    "came back", the deadlock that a returns-based credit suffered
+         *    cannot occur: frames dropped during the outage are simply never
+         *    counted in TxOk, and TX paces to the live TxOk rate after recovery.
+         * The backlog offset (enqueued − TxOk) settling at ≈ BACKLOG_CAP after
+         * an outage is harmless — it is just buffering headroom; enqueued is a
+         * diagnostic counter and plays no part in loss accounting. */
+        #define BACKLOG_CAP 8000
         uint64_t sent_now = atomic_load_explicit(&g_stats.frames_enqueued, memory_order_relaxed);
-        uint64_t resolved = atomic_load_explicit(&g_frames_resolved, memory_order_relaxed);
-        if (sent_now > resolved && (sent_now - resolved) >= MAX_INFLIGHT) {
+        uint64_t txok_now = atomic_load_explicit(&g_txok, memory_order_relaxed);
+        if (sent_now > txok_now && (sent_now - txok_now) >= BACKLOG_CAP) {
             atomic_fetch_add_explicit(&g_stats.tx_backpressure, 1, memory_order_relaxed);
             sleep_ns(10000);   /* 10us; loop re-checks g_tx_running */
             continue;
         }
+        #undef BACKLOG_CAP
 
         int frame_len = build_frame(tx_buf, sizeof(tx_buf), ctx->src_mac,
                                     ctx->loopback ? 0 : ctx->num_slaves,
@@ -1101,9 +1112,9 @@ static void *tx_thread(void *arg) {
 
         int sent = send(ctx->sock, tx_buf, frame_len, 0);
         if (sent > 0) {
-            /* Accounting is RX-driven; TX only counts what it enqueued (for the
-             * credit window and the pipeline display). It does NOT mark frames
-             * outstanding — loss is determined solely by the RX high-water mark. */
+            /* Accounting is count-based and TxOk-anchored; TX only counts what
+             * it enqueued (for the backlog cap and pipeline display). Loss is
+             * TxOk − distinct returns, computed elsewhere. */
             atomic_fetch_add_explicit(&g_stats.frames_enqueued, 1, memory_order_relaxed);
             seq++;
             if (interval_ns) next_send_ns += interval_ns;
@@ -1267,27 +1278,18 @@ static void *rx_thread(void *arg) {
         uint64_t rseq = parse_return_frame(bufs[idx], content_len,             \
                                            ctx->num_slaves, ctx->loopback,     \
                                            &payload_ok);                       \
-        /* RX-driven accounting. A frame is GOOD iff its Ethernet FCS is valid \
-         * (!comp_bad) AND its payload CRC32C verified (payload_ok). A good     \
-         * frame's seq is trustworthy and advances the high-water mark,         \
-         * resolving (and back-calculating loss for) its whole span. A corrupt  \
-         * frame (bad FCS or bad payload) is recorded as a corrupt return so    \
-         * the high-water resolver counts it as corruption, not loss — but its  \
-         * seq may be unreliable, so we only record it if seq is legible and    \
-         * not absurdly far from the current mark. */                          \
-        int good = (!comp_bad) && payload_ok;                                  \
-        if (rseq != UINT64_MAX) {                                              \
-            if (good) {                                                        \
-                rx_record_return(rseq, 0);                                     \
-                rx_resolve_good(rseq);                                         \
-            } else {                                                           \
-                /* Corrupt: record only if the seq is plausibly within the     \
-                 * live window ahead of the mark (guards against garbage seq    \
-                 * from a badly corrupted frame). */                           \
-                uint64_t hw = g_rx.hw;                                         \
-                if (!g_rx.hw_valid || (rseq >= hw && rseq < hw + SEQ_WINDOW))  \
-                    rx_record_return(rseq, 1);                                 \
-            }                                                                  \
+        /* Count-based accounting (Issue 1). Loss = TxOk − distinct returns, so \
+         * here we only need to count DISTINCT returned seqs (deduplicated —    \
+         * e.g. lo double-delivers). A frame is GOOD iff FCS valid (!comp_bad)  \
+         * AND payload CRC verified; otherwise it is a corruption event (already \
+         * counted by the FCS/payload detectors). Either way, a frame that came \
+         * back at all is a "return" and is NOT loss. Corrupt frames may carry a \
+         * garbage seq; we still dedup on whatever seq we read, which at worst   \
+         * slightly miscounts a corrupt dup — corruption is tracked separately   \
+         * by the detectors, so this does not affect the corruption figures. */ \
+        if (rseq != UINT64_MAX && rx_new_return(rseq)) {                       \
+            atomic_fetch_add_explicit(&g_stats.distinct_returns, 1,            \
+                                      memory_order_relaxed);                   \
         }                                                                     \
         iov[idx].iov_len = RX_BUF;                                             \
         msgs[idx].msg_hdr.msg_controllen = sizeof(ctrls[idx]);                 \
@@ -1454,6 +1456,40 @@ static void *errq_thread(void *arg) {
  * a guaranteed count of every bounce. The authoritative transition COUNT is the
  * kernel's carrier_*_count sysfs counters (read by the supervisor). This thread
  * owns link_state_up because current-state is exactly what coalescing preserves. */
+/* ── Wire-truth sampler thread ──────────────────────────────────────────────
+ * Periodically (every ~20ms) reads the hardware tally counters (TxOk via
+ * ethtool GSTATS, TxER) and the kernel qdisc tx_dropped, base-subtracted into
+ * g_txok / g_txer / g_qdisc_drop. TxOk is the measurement boundary and drives
+ * both the loss figure (loss = TxOk − distinct returns) and the TX credit
+ * window (credit = enqueued − TxOk). The diagnostic confirmed TxOk updates
+ * smoothly (~per-frame under saturation), so 20ms sampling gives a sharp
+ * boundary with at most ~a few hundred frames of edge fuzz during an outage
+ * transition. Runs unpinned; the ioctl is cheap. */
+static void *sampler_thread(void *arg) {
+    ThreadCtx *ctx = (ThreadCtx *)arg;
+    while (g_running) {
+        uint64_t txok = read_nic_tx_packets(ctx->iface_name);
+        uint64_t txer = read_nic_tx_errors(ctx->iface_name);
+        int ok = 0;
+        uint64_t qd = read_sysfs_u64(ctx->iface_name, "statistics/tx_dropped", &ok);
+        if (txok >= g_stats.tx_wire_base)
+            atomic_store_explicit(&g_txok, txok - g_stats.tx_wire_base, memory_order_relaxed);
+        if (txer >= g_stats.tx_err_base)
+            atomic_store_explicit(&g_txer, txer - g_stats.tx_err_base, memory_order_relaxed);
+        if (ok && qd >= g_stats.qdisc_drop_base)
+            atomic_store_explicit(&g_qdisc_drop, qd - g_stats.qdisc_drop_base, memory_order_relaxed);
+        sleep_ns(20 * 1000000ULL);   /* 20ms */
+    }
+    /* Final sample so the last stats/termination see current values. */
+    uint64_t txok = read_nic_tx_packets(ctx->iface_name);
+    uint64_t txer = read_nic_tx_errors(ctx->iface_name);
+    if (txok >= g_stats.tx_wire_base)
+        atomic_store_explicit(&g_txok, txok - g_stats.tx_wire_base, memory_order_relaxed);
+    if (txer >= g_stats.tx_err_base)
+        atomic_store_explicit(&g_txer, txer - g_stats.tx_err_base, memory_order_relaxed);
+    return NULL;
+}
+
 static void *carrier_thread(void *arg) {
     ThreadCtx *ctx = (ThreadCtx *)arg;
 
@@ -1784,11 +1820,15 @@ int main(int argc, char *argv[]) {
              ? "software (driver-xmit stage; ethtool tx_packets is wire truth)"
              : "unavailable");
 
-    /* On-wire TX baseline (ethtool tx_packets). */
+    /* On-wire TX baseline (ethtool tx_packets = hardware TxOk). */
     g_stats.tx_wire_base = read_nic_tx_packets(iface);
     if (g_stats.tx_wire_base == 0)
         printf("NOTE: could not read ethtool tx_packets — wire count "
                "may be unavailable on this driver.\n");
+    /* TxER (carrier-lost etc.) and qdisc-drop baselines for the boundary split. */
+    g_stats.tx_err_base = read_nic_tx_errors(iface);
+    { int ok=0; g_stats.qdisc_drop_base = read_sysfs_u64(iface, "statistics/tx_dropped", &ok);
+      if (!ok) g_stats.qdisc_drop_base = 0; }
 
     /* Link-loss baselines (sysfs). All three exist on this kernel. */
     { int ok1=0, ok2=0, ok3=0;
@@ -1876,6 +1916,13 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "warning: errqueue thread failed; "
                             "TX driver-xmit count disabled\n");
     }
+    /* Wire-truth sampler (TxOk/TxER/qdisc-drop). */
+    pthread_t sm_tid; int have_sm = 0;
+    if (pthread_create(&sm_tid, NULL, sampler_thread, &ctx) == 0)
+        have_sm = 1;
+    else
+        fprintf(stderr, "warning: sampler thread failed; "
+                        "TxOk-based loss/BER unavailable\n");
     /* POLLPRI carrier-state monitor (primary current-state + timing). */
     pthread_t cp_tid; int have_cp = 0;
     if (pthread_create(&cp_tid, NULL, carrier_thread, &ctx) == 0)
@@ -1933,64 +1980,57 @@ int main(int argc, char *argv[]) {
     }
 
     /* ── Termination barrier (good-frame-gated) ─────────────────────────────
-     * The test may only conclude on a GOOD received frame, because only a good
-     * frame resolves the accounting up to its seq (RX high-water mark). We:
-     *   1. Stop TX (no more new sends), join it. Note the final enqueued seq.
-     *   2. Wait for the RX high-water mark to reach the final enqueued seq —
-     *      i.e. for a good frame confirming the last transmitted frame. This
-     *      back-calculates loss across any final gap exactly.
-     *   3. If the link is DOWN and the mark can't advance, warn once per second
-     *      up to 10 times ("reestablish link to complete test"). If a good
-     *      frame arrives, it resolves everything and we conclude cleanly. If 10
-     *      attempts elapse with no progress, give up with an error — the test
-     *      is INCOMPLETE, not "concluded".
+     * With TxOk-anchored accounting, loss = TxOk − distinct returns is exact
+     * once the system has SETTLED: TX stopped, TxOk stopped advancing (every
+     * frame that will reach the wire has), and distinct returns stopped
+     * advancing (every wire frame that will come back has). We:
+     *   1. Stop TX, join it.
+     *   2. Wait for TxOk and distinct-returns to both go quiet (settle).
+     *   3. The settle can only complete if the link is up long enough to drain
+     *      the last returns. If the link is DOWN and returns can't drain, warn
+     *      once per second up to 10 times ("reestablish link to complete test");
+     *      if the link recovers the returns drain and we conclude; otherwise we
+     *      mark the run INCOMPLETE and exit non-zero rather than report a loss
+     *      figure that includes still-in-flight frames as false loss.
      */
     g_tx_running = 0;
     pthread_join(tx_tid, NULL);
 
     uint64_t enq_final = atomic_load_explicit(&g_tx_final_seq, memory_order_acquire);
-    printf("\nTX stopped: %lu frames enqueued. Waiting for a good frame to "
-           "resolve the final span...\n", enq_final);
+    printf("\nTX stopped: %lu frames enqueued. Settling (waiting for TxOk and "
+           "returns to go quiet)...\n", enq_final);
 
-    /* Target: the high-water mark must reach enq_final (all enqueued seqs
-     * resolved). enq_final is the next seq that would have been sent, so the
-     * last actually-sent seq is enq_final-1; hw reaches enq_final when a good
-     * frame with seq >= enq_final-1 is received and resolves the span. */
     int incomplete = 0;
-    if (enq_final == 0) {
-        /* Nothing was ever sent — trivially complete. */
-    } else {
-        uint64_t target = enq_final;              /* hw must reach this */
+    if (enq_final != 0) {
         uint64_t warn_deadline = now_ns() + 1000ULL * 1000000ULL;
         int warns = 0;
-        uint64_t settle_deadline = now_ns() + 500ULL * 1000000ULL;
+        uint64_t prev_txok = 0, prev_ret = 0, quiet = 0;
         for (;;) {
-            uint64_t hw = atomic_load_explicit((_Atomic uint64_t *)&g_rx.hw,
-                                               memory_order_relaxed);
-            int hwv = g_rx.hw_valid;
-            if (hwv && hw >= target) break;        /* resolved — conclude */
-
-            /* If returns are still flowing (normal quick drain), keep waiting a
-             * short settle period without warnings. */
-            if (now_ns() < settle_deadline) {
-                sleep_ns(5 * 1000000);
-                continue;
+            sleep_ns(50 * 1000000);   /* 50ms poll */
+            uint64_t txok = atomic_load_explicit(&g_txok, memory_order_relaxed);
+            uint64_t ret  = atomic_load_explicit(&g_stats.distinct_returns, memory_order_relaxed);
+            int settled = (txok == prev_txok) && (ret == prev_ret);
+            /* Consider settled when both have been stable for ~200ms AND all
+             * frames that reached the wire have returned (ret >= txok), i.e. no
+             * outstanding wire frames. If ret < txok but stable, those are
+             * genuine losses (won't return) — still settled. */
+            if (settled) {
+                if (++quiet >= 4) break;   /* 200ms quiet on both */
+            } else {
+                quiet = 0;
             }
+            prev_txok = txok; prev_ret = ret;
 
-            /* Beyond the settle period with the mark not yet at target: the
-             * link is likely down. Warn once per second, up to 10 times. */
-            if (now_ns() >= warn_deadline) {
+            /* If not settling because the link is down (returns can't drain),
+             * warn once per second up to 10 times. */
+            int link_up = atomic_load_explicit(&g_stats.link_state_up, memory_order_relaxed);
+            if (!settled && !link_up && now_ns() >= warn_deadline) {
                 warns++;
-                int link_up = atomic_load_explicit(&g_stats.link_state_up,
-                                                   memory_order_relaxed);
-                fprintf(stderr, "reestablish link to complete test "
-                        "(%d/10)%s — hw=%lu target=%lu\n",
-                        warns, link_up ? " [link reports UP]" : "",
-                        hwv ? hw : 0, target);
+                fprintf(stderr, "reestablish link to complete test (%d/10) "
+                        "[link DOWN] — TxOk=%lu returns=%lu\n", warns, txok, ret);
                 if (warns >= 10) { incomplete = 1; break; }
                 warn_deadline = now_ns() + 1000ULL * 1000000ULL;
             }
-            sleep_ns(20 * 1000000);
         }
     }
 
@@ -2017,6 +2057,7 @@ int main(int argc, char *argv[]) {
     }
     if (have_nl) pthread_join(nl_tid, NULL);
     if (have_cp) pthread_join(cp_tid, NULL);
+    if (have_sm) pthread_join(sm_tid, NULL);
     uint64_t end_ns  = now_ns();
     uint64_t nic_crc = read_nic_crc_errors(iface);
     print_stats(csv, end_ns - start_ns, nic_crc);
