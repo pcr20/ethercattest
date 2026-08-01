@@ -1,6 +1,6 @@
 CC      = gcc
 CFLAGS  = -O2 -Wall -Wextra -std=c11
-LDFLAGS = -lm
+LDFLAGS = -lm -lpthread
 TARGET  = ecat_ber
 
 .PHONY: all clean install

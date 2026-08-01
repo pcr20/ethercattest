@@ -34,8 +34,35 @@ ethtool -s "$IFACE" speed 100 duplex full autoneg off 2>/dev/null || {
 
 # 4. Disable NIC offloads that can interfere with raw frame handling
 echo "[4] Disabling NIC offloads..."
-for feature in rx tx gso gro tso ufo; do
+for feature in rx tx gso gro tso ufo lro; do
     ethtool -K "$IFACE" "$feature" off 2>/dev/null || true
+done
+
+# 4b. Raise kernel socket buffer ceilings so the tool's 64MB RX buffer request
+#     is honoured (the drain thread relies on this headroom to never overflow).
+echo "[4b] Raising kernel socket buffer limits..."
+sysctl -w net.core.rmem_max=134217728 >/dev/null    # 128 MB
+sysctl -w net.core.wmem_max=33554432  >/dev/null    # 32 MB
+sysctl -w net.core.netdev_max_backlog=250000 >/dev/null
+
+# 4c. Maximise the NIC RX ring so bursts are absorbed in hardware before the
+#     kernel queue is even involved. Ask for the hardware maximum.
+echo "[4c] Maximising NIC RX/TX ring sizes..."
+MAXRX=$(ethtool -g "$IFACE" 2>/dev/null | awk '/^RX:/{print $2; exit}')
+MAXTX=$(ethtool -g "$IFACE" 2>/dev/null | awk '/^TX:/{print $2; exit}')
+if [[ -n "${MAXRX:-}" && -n "${MAXTX:-}" ]]; then
+    ethtool -G "$IFACE" rx "$MAXRX" tx "$MAXTX" 2>/dev/null && \
+        echo "    RX ring -> $MAXRX, TX ring -> $MAXTX" || \
+        echo "    (ring resize not supported by driver — OK)"
+else
+    echo "    (driver does not report ring sizes — skipping)"
+fi
+
+# 4d. Steer this NIC's IRQs to core 3 (0x8), away from the pinned TX (core 1)
+#     and RX (core 2) worker threads, so IRQ handling doesn't contend.
+echo "[4d] Steering NIC IRQs to core 3 (best effort)..."
+for irq in $(grep "$IFACE" /proc/interrupts | awk -F: '{print $1}' | tr -d ' '); do
+    echo 8 > "/proc/irq/$irq/smp_affinity" 2>/dev/null || true
 done
 
 # 5. Show current ethtool stats baseline
