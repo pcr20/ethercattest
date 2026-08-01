@@ -188,8 +188,12 @@ BER is reported as an **upper-bound estimator**:
 BER ≤ (errors + 0.5) / N
 ```
 
-where N is the total number of **wire bits** (TxOk × ~12000 bits/frame — frames
-the r8169 actually clocked onto the wire). The `+0.5` gives a conservative bound even when zero errors
+where N is the total number of **wire bits**: TxOk × the actual bits per frame,
+measured at runtime as (frame length + 4-byte FCS) × 8 — for a full-size frame
+that is (1514+4)×8 = **12144 bits**. These are exactly the CRC-protected bits
+(the bits whose corruption the detectors can observe); preamble/SFD/IFG line
+symbols are excluded since an error there cannot produce a CRC count. The
+measured value is shown in the panel ("12144 bits/frame, frame+FCS, measured"). The `+0.5` gives a conservative bound even when zero errors
 have been observed — with no errors it reports `BER ≤ 0.5/N`, the smallest
 bound the data can support — and adds the same half-count margin once errors
 appear. Both numerators come from the tool's own **software** detectors (not the
@@ -460,6 +464,35 @@ Observe which counter increments first:
 - Host FCS/payload errors only → problem on return path (last slave back to PC)
 - Slave 0 P0 CRC only → problem between PC and slave 0
 - Slave N P0 CRC = Slave N-1 P1 CRC → problem between slave N-1 and N
+- Slave N port-X **lost-link** count → that port's link went down (segment
+  outage), even when the host carrier never changed
+
+## Per-slave ESC registers (CRC + lost-link)
+
+Each frame carries two APRD datagrams per slave:
+
+- **Registers 0x0300–0x030F** (16 bytes): per-port invalid-frame and RX-error
+  counters — where in the chain frames are being corrupted.
+- **Registers 0x0310–0x0313** (4 bytes): per-port **lost-link counters** — each
+  port increments its counter every time its link drops. This is the
+  per-segment outage detector the host NIC cannot provide: a downstream segment
+  can flap (e.g. a disturbed cable between two slaves) without the host carrier
+  ever changing. A validation run demonstrated exactly this: shorting the
+  segment behind slave 1 produced 16 corrupt frames and a matching
+  slave-1-port-1 invalid-frame count, while every host-side link monitor read
+  zero throughout.
+
+**Data trust gating:** ESC counter values (and the BRD working counter) are
+read **only from FCS-valid frames**. A corrupt frame carries garbage in those
+byte positions, and a single garbage value would poison the 8-bit
+delta-accumulation permanently. The registers are cumulative in the slave, so
+skipping corrupt frames loses nothing — the next good frame reports the same
+accumulated value.
+
+**8-bit saturation caveat:** ESC error counters are 8-bit and saturate at 255,
+so under heavy disturbance they are *locators*, not precise tallies — read a
+large value as "at least this many". Precise counting would require periodic
+write-to-clear, which this tool deliberately avoids (read-only polling).
 
 ## Troubleshooting
 
@@ -575,7 +608,7 @@ import pandas as pd
 df = pd.read_csv('results.csv')
 # BER against the wire-truth denominator (TxOk), not enqueued frames:
 df['loss_rate'] = df['frames_lost'] / df['txok']
-df['ber_fcs']     = (df['rx_bad_fcs_computed'] + 0.5) / (df['txok'] * 12000)
-df['ber_payload'] = (df['payload_crc_errors'] + 0.5) / (df['txok'] * 12000)
+df['ber_fcs']     = (df['rx_bad_fcs_computed'] + 0.5) / (df['txok'] * 12144)
+df['ber_payload'] = (df['payload_crc_errors'] + 0.5) / (df['txok'] * 12144)
 print(df[['elapsed_s','txok','frames_lost','txer','qdisc_drop','ber_fcs']].tail())
 ```
