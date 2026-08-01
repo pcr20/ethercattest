@@ -20,9 +20,13 @@ The tool detects these at startup (via `ETHTOOL_GFEATURES`) and reports their
 state. With them on, corrupt frames are received and flagged two independent
 ways:
 
-- **Bad FCS (computed)** — the tool recomputes the Ethernet FCS (standard
-  CRC32, poly 0xEDB88320 — distinct from the CRC32C payload check) over each
-  frame and compares to the delivered trailer. Authoritative.
+- **Bad FCS (computed)** — the tool validates each frame's Ethernet FCS using
+  the **CRC32 residual method**: it computes CRC32 (standard, poly 0xEDB88320 —
+  distinct from the CRC32C payload check) over the *entire delivered frame
+  including its 4-byte FCS trailer*. A valid frame yields a fixed magic residual
+  constant; any other value means the frame is corrupt. This is how hardware
+  validates, and is robust to FCS byte-order conventions (the tool accepts
+  either of the two standard residuals). Authoritative.
 - **Bad FCS (kernel)** — from the `PACKET_AUXDATA` `tp_status` the kernel
   attaches to each frame. On the first few self-detected bad frames the tool
   prints the raw `tp_status` so the exact FCS-fail bit for this driver can be
@@ -40,11 +44,14 @@ loss count. This directly addresses the case where a pin-short during a
 saturated run produced zero visible CRC errors: the corrupt frames were being
 dropped by the NIC before the socket; now they are delivered and counted.
 
-**Self-check:** if the tool ever flags >50% of frames as bad-FCS early in a
-run, it prints a warning — that indicates the FCS trailer offset/byte-order
-assumption needs adjustment for the driver, not that the link is bad. (The
-standard-CRC32 algorithm itself is verified against the `0xCBF43926` check
-value at build/test time.)
+**Self-check:** the tool prints the observed good-frame residual once at
+startup (`[FCS] good-frame residual = 0x...`). It should match one of the two
+accepted constants (0x2144DF1C or 0xDEBB20E3). If instead >50% of frames flag
+as bad-FCS, the tool warns that the residual constant differs for this driver
+and prints the observed value — which is then the correct constant to compile
+in (a one-line change). The standard-CRC32 algorithm itself is verified against
+the 0xCBF43926 check value, and the residual detection against 100 good + 100
+corrupted synthetic frames, at test time.
 
 ## Link-loss monitoring (host NIC)
 

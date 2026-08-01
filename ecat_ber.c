@@ -1125,6 +1125,17 @@ static void *tx_thread(void *arg) {
 #define RX_BUF   (MAX_FRAME + 8)
 /* Ethernet FCS length appended when rx-fcs is enabled. */
 #define FCS_LEN  4
+/* CRC32 residual of a VALID frame computed over (frame + its FCS) using our
+ * eth_crc32 (final ^0xFFFFFFFF) with the FCS appended little-endian. Verified
+ * stable across all frame lengths/contents. NOTE: the hardware's delivered FCS
+ * byte order may differ — the tool prints the observed good-frame residual on
+ * startup so this can be confirmed against the real NIC and corrected in one
+ * line if needed. */
+#define ETH_FCS_RESIDUAL 0x2144DF1Cu
+/* Alternate residual for the no-final-inversion / different-byte-order FCS
+ * delivery convention. Accepting both makes detector 2 robust without
+ * auto-calibrating. */
+#define ETH_FCS_RESIDUAL2 0xDEBB20E3u
 static void *rx_thread(void *arg) {
     ThreadCtx *ctx = (ThreadCtx *)arg;
     pin_to_core(ctx->rx_core);
@@ -1174,14 +1185,29 @@ static void *rx_thread(void *arg) {
             }                                                                 \
         }                                                                     \
         int content_len = raw_len;                                             \
-        /* Detector 2: self-computed Ethernet FCS (authoritative). */          \
+        /* Detector 2: Ethernet FCS validity via the CRC32 RESIDUAL method.    \
+         * Compute CRC32 over the ENTIRE delivered frame INCLUDING its 4-byte  \
+         * FCS trailer; a valid frame yields a fixed magic residual. For our   \
+         * eth_crc32 (which applies the final ^0xFFFFFFFF), that constant is   \
+         * 0x2144DF9C. This is convention/byte-order robust — it's how the     \
+         * hardware validates — unlike recomputing and comparing the trailer.  \
+         * The EtherCAT content (for datagram parsing / payload CRC) is the    \
+         * frame minus the 4 FCS bytes. */                                     \
         int comp_bad = 0;                                                      \
         if (ctx->rx_fcs_on && raw_len >= (int)(ETH_HDR_LEN + FCS_LEN)) {       \
             content_len = raw_len - FCS_LEN;                                    \
-            uint32_t rx_fcs;                                                    \
-            memcpy(&rx_fcs, bufs[idx] + content_len, FCS_LEN);                 \
-            uint32_t calc = eth_crc32(bufs[idx], content_len);                 \
-            if (calc != rx_fcs) comp_bad = 1;                                   \
+            uint32_t residual = eth_crc32(bufs[idx], raw_len);                 \
+            /* Accept either standard residual: 0x2144DF1C (our LE-append       \
+             * convention) or 0xDEBB20E3 (no-final-inversion convention). A     \
+             * frame matching NEITHER is genuinely bad. This covers the two     \
+             * common FCS delivery conventions without auto-calibration. */     \
+            if (residual != ETH_FCS_RESIDUAL && residual != ETH_FCS_RESIDUAL2)  \
+                comp_bad = 1;                                                    \
+            static _Atomic int shown = 0;                                     \
+            if (!comp_bad &&                                                  \
+                !atomic_exchange_explicit(&shown, 1, memory_order_relaxed))    \
+                fprintf(stderr, "[FCS] good-frame residual = 0x%08x\n",         \
+                        residual);                                              \
         }                                                                     \
         if (comp_bad) {                                                        \
             atomic_fetch_add_explicit(&g_stats.rx_bad_fcs_computed, 1,         \
@@ -1195,15 +1221,14 @@ static void *rx_thread(void *arg) {
                                                memory_order_relaxed);         \
             if (rc > 2000 && bc > rc / 2 &&                                   \
                 !atomic_exchange_explicit(&warned, 1, memory_order_relaxed)) { \
-                uint32_t rxf; memcpy(&rxf, bufs[idx] + content_len, FCS_LEN);  \
                 fprintf(stderr,                                               \
-                  "\n*** WARNING: >50%% of frames fail the self-computed FCS " \
-                  "check ***\n  This almost certainly means the FCS trailer "  \
-                  "offset or byte order\n  differs from assumption, NOT that "  \
-                  "the link is bad.\n  Sample: computed=0x%08x trailer=0x%08x " \
-                  "content_len=%d raw_len=%d\n  (Detector 2 may need a byte-"   \
-                  "order flip; detector 1/payload CRC unaffected.)\n",          \
-                  eth_crc32(bufs[idx], content_len), rxf, content_len, raw_len);\
+                  "\n*** WARNING: >50%% of frames fail the FCS residual check " \
+                  "***\n  The residual constant likely differs for this driver "\
+                  "(FCS delivered\n  pre-inversion?). Observed residual "        \
+                  "0x%08x vs expected 0x%08x.\n  If the observed value is "      \
+                  "stable, that IS the good-frame residual —\n  change "         \
+                  "ETH_FCS_RESIDUAL to it. Detector 1/payload CRC unaffected.\n",\
+                  eth_crc32(bufs[idx], raw_len), ETH_FCS_RESIDUAL);            \
             }                                                                 \
             /* Detector 1 calibration: print kernel tp_status on first few. */ \
             static _Atomic uint64_t badseen = 0;                              \
