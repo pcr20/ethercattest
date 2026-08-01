@@ -4,7 +4,32 @@ Tests EtherCAT physical layer bit error rate by saturating a slave chain
 with NOP frames and logging CRC errors from both the host NIC PHY and
 ESC slave registers.
 
+## Link-outage recovery (automatic TX resumption)
+
+A link outage during a saturated run strands frames that are in flight at the
+moment carrier drops — they are transmitted but can never return. Two mechanisms
+ensure TX resumes immediately once the link recovers, rather than wedging on
+those dead frames:
+
+- **Link-aware in-flight cap:** the TX rate cap is suspended while the carrier
+  is down (per the netlink `link_state_up` state). Outstanding frames during an
+  outage are stranded, not in transit, so blocking on them is pointless; the
+  moment carrier returns, TX flows again. During the outage the TX ring's own
+  EAGAIN/ENOBUFS backpressure prevents runaway enqueueing.
+- **Mid-run aging retirement:** a frame outstanding longer than 100ms while the
+  link is up is presumed lost, retired, and counted (`aged out`). Real wire RTT
+  is microseconds, so this only ever fires on genuinely dead frames. This frees
+  the frames destroyed by an outage from the in-flight accounting, so the cap
+  releases and TX resumes within ~100ms of link recovery instead of stalling
+  permanently. Aged-out frames are reported as a subset of lost frames
+  (`of which aged out (link-outage collateral)`).
+
+The aging sweep runs in the errqueue thread (the model-B allocator), preserving
+the lock-free tracker's single-writer invariant; it uses a bounded scan behind
+the highest transmitted sequence so its cost is independent of run length.
+
 ## Receiving corrupt frames (rx-all + rx-fcs)
+
 
 By default the NIC checks the Ethernet FCS in hardware and **drops** any frame
 that fails — so a frame corrupted mid-flight (e.g. by a cable fault) never

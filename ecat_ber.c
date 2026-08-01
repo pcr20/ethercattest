@@ -324,8 +324,17 @@ static Stats g_stats;
 typedef struct {
     uint8_t  state[SEQ_WINDOW];       /* 0=free 1=outstanding 2=returned */
     uint64_t seq_at_slot[SEQ_WINDOW];
+    uint64_t sent_ns[SEQ_WINDOW];     /* when slot marked outstanding (allocator) */
 } SeqTrack;
 static SeqTrack g_seq;
+
+/* Frames confirmed dead by the mid-run aging sweep (outstanding longer than the
+ * stale timeout while the link was up). These are genuine losses, counted as
+ * they age out rather than only at shutdown. Kept separate so the in-flight cap
+ * can exclude them and TX can resume promptly after a link recovery. */
+static _Atomic uint64_t g_aged_out = 0;
+
+static inline uint64_t now_ns(void);   /* defined below */
 
 /* TX thread: before reusing a slot, retire its previous occupant.
  * The slot that seq will occupy was last used by (seq - SEQ_WINDOW). If that
@@ -347,8 +356,10 @@ static inline void seq_mark_sent(uint64_t seq) {
         (void)prev;
     }
 
-    /* Publish new occupant: write seq_at_slot, then release-store state=1. */
+    /* Publish new occupant: write seq_at_slot + timestamp, then release-store
+     * state=1 so a reader that sees state==1 also sees a consistent timestamp. */
     g_seq.seq_at_slot[slot] = seq;
+    g_seq.sent_ns[slot]     = now_ns();
     __atomic_store_n(&g_seq.state[slot], 1, __ATOMIC_RELEASE);
 }
 
@@ -379,6 +390,38 @@ static inline void seq_retire_final(uint64_t next_seq) {
                 atomic_fetch_add_explicit(&g_stats.frames_lost, 1,
                                           memory_order_relaxed);
                 __atomic_store_n(&g_seq.state[slot], 0, __ATOMIC_RELEASE);
+            }
+        }
+    }
+}
+
+/* Mid-run aging retirement. Called ONLY by the allocator (errqueue thread under
+ * model B, or TX in the no-timestamp fallback) to preserve the single-writer
+ * invariant on state 1->0. Scans the currently-outstanding seq range and
+ * retires any slot outstanding longer than timeout_ns while treating it as
+ * lost (aged out). This frees frames stranded by a link outage so the in-flight
+ * cap releases and TX resumes promptly once the link recovers.
+ *
+ * The real wire RTT is microseconds, so a timeout of ~100ms can only ever fire
+ * on genuinely dead frames — never on a frame that would still legitimately
+ * return. Bounds the scan to [lo, hi) where hi is the highest transmitted seq
+ * and lo tracks the last swept point, so cost is proportional to new frames,
+ * not the whole window. */
+static inline void seq_age_out(uint64_t lo, uint64_t hi, uint64_t timeout_ns,
+                               uint64_t now) {
+    for (uint64_t s = lo; s < hi; s++) {
+        uint32_t slot = s & SEQ_MASK;
+        if (g_seq.seq_at_slot[slot] != s) continue;
+        uint8_t st = __atomic_load_n(&g_seq.state[slot], __ATOMIC_ACQUIRE);
+        if (st != 1) continue;
+        uint64_t sent = g_seq.sent_ns[slot];
+        if (sent && (now - sent) >= timeout_ns) {
+            /* Retire as aged-out loss. */
+            uint8_t expected = 1;
+            if (__atomic_compare_exchange_n(&g_seq.state[slot], &expected, 0,
+                                            0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+                atomic_fetch_add_explicit(&g_stats.frames_lost, 1, memory_order_relaxed);
+                atomic_fetch_add_explicit(&g_aged_out, 1, memory_order_relaxed);
             }
         }
     }
@@ -873,6 +916,10 @@ static void print_stats(FILE *csv, uint64_t elapsed_ns, uint64_t new_nic_crc) {
            fps, fps * 12000.0 / 1e6);
     printf("  In flight:      %ld  (queue lag, not loss)\n", (long)in_flight);
     printf("  Lost frames:    %lu  (transmitted, never returned)\n", lost);
+    { uint64_t aged = atomic_load_explicit(&g_aged_out, memory_order_relaxed);
+      if (aged)
+          printf("    of which aged out (link-outage collateral): %lu\n", aged);
+    }
     printf("  Unknown/dup seq:%lu\n",    bad);
     printf("  Payload CRC err:%lu  %s\n", plcrc,
            plcrc ? "*** PAYLOAD CORRUPTION (FCS-independent) ***" : "(clean)");
@@ -1029,6 +1076,11 @@ static void try_realtime(int prio) {
  * cap is essentially never hit; it only clamps pathological buffering.
  * ~4000 frames ≈ 0.5s of wire time at 8100 fps — ample in-flight headroom. */
 #define MAX_INFLIGHT 4000
+/* A frame outstanding longer than this while the link is up is presumed lost
+ * and aged out mid-run. Real wire RTT is microseconds; 100ms is far beyond any
+ * legitimate return, but short enough that TX resumes promptly after a link
+ * recovery once stranded frames age out. */
+#define STALE_TIMEOUT_NS (100ULL * 1000000ULL)
 
 static void *tx_thread(void *arg) {
     ThreadCtx *ctx = (ThreadCtx *)arg;
@@ -1050,12 +1102,26 @@ static void *tx_thread(void *arg) {
         }
 
         /* Bound outstanding frames. If RX hasn't caught up to within
-         * MAX_INFLIGHT, pause briefly — this is genuine wire backpressure,
-         * not a buffering artifact. Guarded so a transient rcvd>sent (possible
-         * on interfaces that double-deliver, e.g. lo) can't underflow. */
+         * MAX_INFLIGHT, pause briefly — this is genuine wire backpressure.
+         *
+         * Two corrections make this robust to link outages:
+         *  1. Link-aware: if the carrier is currently DOWN (netlink state),
+         *     don't throttle — outstanding frames are stranded, not in transit,
+         *     and blocking on them is pointless. TX keeps trying so that the
+         *     instant the link returns, frames flow again immediately.
+         *  2. Aged-out exclusion: frames the aging sweep has retired as lost
+         *     (g_aged_out) no longer count against the budget, so the cap
+         *     releases and TX resumes promptly after recovery instead of
+         *     wedging forever on frames destroyed by the outage.
+         * Guarded so a transient rcvd>sent (double-deliver on lo) can't
+         * underflow. */
+        int link_up = atomic_load_explicit(&g_stats.link_state_up, memory_order_relaxed);
         uint64_t sent_now = atomic_load_explicit(&g_stats.frames_enqueued, memory_order_relaxed);
         uint64_t rcvd_now = atomic_load_explicit(&g_stats.frames_received, memory_order_relaxed);
-        if (sent_now > rcvd_now && (sent_now - rcvd_now) >= MAX_INFLIGHT) {
+        uint64_t aged_now = atomic_load_explicit(&g_aged_out, memory_order_relaxed);
+        uint64_t accounted = rcvd_now + aged_now;   /* returned OR written off */
+        if (link_up && sent_now > accounted &&
+            (sent_now - accounted) >= MAX_INFLIGHT) {
             atomic_fetch_add_explicit(&g_stats.tx_backpressure, 1, memory_order_relaxed);
             sleep_ns(10000);   /* 10us; loop re-checks g_tx_running */
             continue;
@@ -1393,17 +1459,44 @@ static void *errq_thread(void *arg) {
         }                                                                     \
     } while (0)
 
+    uint64_t last_age_ns = now_ns();
+    uint64_t age_lo = 0;   /* low watermark of the aging scan */
+
     while (g_running) {
         int pr = poll(&pfd, 1, 100);
         if (pr < 0) { if (errno == EINTR) continue; break; }
-        if (pr == 0) continue;
-
-        for (;;) {
-            memset(&msg, 0, sizeof(msg));
-            msg.msg_control = ctrl; msg.msg_controllen = sizeof(ctrl);
-            int n = recvmsg(ctx->sock, &msg, MSG_ERRQUEUE | MSG_DONTWAIT);
-            if (n < 0) break;
-            HANDLE_COMPLETION(&msg);
+        if (pr > 0) {
+            for (;;) {
+                memset(&msg, 0, sizeof(msg));
+                msg.msg_control = ctrl; msg.msg_controllen = sizeof(ctrl);
+                int n = recvmsg(ctx->sock, &msg, MSG_ERRQUEUE | MSG_DONTWAIT);
+                if (n < 0) break;
+                HANDLE_COMPLETION(&msg);
+            }
+        }
+        /* Periodic aging sweep (every ~50ms). Retire frames outstanding longer
+         * than STALE_TIMEOUT_NS — these are stranded by a link outage and would
+         * otherwise pin the in-flight cap and stall TX after recovery. The real
+         * RTT is microseconds, so this only ever fires on genuinely dead frames.
+         * As allocator, the errqueue thread is the safe place to do this.
+         *
+         * Only outstanding frames can be aged, and outstanding frames live in a
+         * bounded window just behind the highest transmitted seq (at most a few
+         * thousand — the in-flight depth). Scanning a fixed window behind hi
+         * keeps the sweep O(window), independent of run length. */
+        uint64_t now = now_ns();
+        if (now - last_age_ns >= 50 * 1000000ULL) {
+            uint64_t hi = atomic_load_explicit(&g_tx_transmitted_hi, memory_order_relaxed);
+            /* Scan back far enough to cover any plausible outstanding backlog.
+             * MAX_INFLIGHT bounds normal in-flight; use a generous multiple so
+             * a burst of stranded frames during an outage is fully covered. */
+            uint64_t span = (uint64_t)MAX_INFLIGHT * 4;
+            uint64_t lo = (hi > span) ? (hi - span) : 0;
+            if (lo < age_lo) lo = age_lo;   /* don't rescan retired region */
+            if (hi > lo) seq_age_out(lo, hi, STALE_TIMEOUT_NS, now);
+            /* Frames older than hi-span can't still be outstanding; advance. */
+            if (hi > span) age_lo = hi - span;
+            last_age_ns = now;
         }
     }
 
@@ -1747,6 +1840,9 @@ int main(int argc, char *argv[]) {
     uint64_t start_ns    = now_ns();
     uint64_t last_stat_ns = start_ns;
     g_start_ns = start_ns;   /* for netlink relative timestamps */
+    /* Assume link up until netlink seeds real state, so the in-flight cap is
+     * active from the start rather than disabled by a 0-initialised flag. */
+    atomic_store_explicit(&g_stats.link_state_up, 1, memory_order_relaxed);
 
     printf("Running... (Ctrl-C to stop)\n");
 
