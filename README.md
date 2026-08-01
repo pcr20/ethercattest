@@ -192,11 +192,27 @@ where N is the total number of **wire bits** (TxOk × ~12000 bits/frame — fram
 the r8169 actually clocked onto the wire). The `+0.5` gives a conservative bound even when zero errors
 have been observed — with no errors it reports `BER ≤ 0.5/N`, the smallest
 bound the data can support — and adds the same half-count margin once errors
-appear. It is applied identically to both BER lines:
+appear. Both numerators come from the tool's own **software** detectors (not the
+NIC's hardware CRC counter, which reads 0 under `rx-all` because bad frames are
+delivered to us rather than dropped-and-counted):
 
-- **BER (CRC)** — from the NIC's FCS error count (link-layer).
+- **BER (FCS)** — from the software FCS-residual detector
+  (`rx_bad_fcs_computed`). Covers the whole frame (~100%).
 - **BER (payload)** — from the independent CRC32C payload check
-  (FCS-independent; catches corruption a hop-by-hop FCS would mask).
+  (`payload_crc_errors`). Covers **1482 of 1514 bytes ≈ 97.9%** of the frame —
+  everything except the 32 bytes of Ethernet/EtherCAT/datagram headers, the WKC,
+  and the CRC field itself (which can't be self-covered).
+
+**Reading the FCS/payload ratio as a diagnostic.** For *random* bit errors the
+two counts should track within ~2% (the coverage gap). If the payload count is
+much lower than the FCS count, the errors are concentrated in the frame headers
+— the front of the frame, where a PHY re-synchronising after a carrier flap does
+its damage. A low ratio therefore means **link-disruption artifacts, not clean
+bit errors**; a ratio near 0.98 means genuinely random bit errors spread across
+the frame. (Example: a pins-short run showed 8 payload vs 35 FCS = 0.23, ~4×
+below the 0.98 random expectation — confirming those were front-of-frame link
+disruptions, not the bit-error-rate you ultimately want to measure on a degraded
+cable.)
 
 Note this is the "add-half" rule of thumb, not a specific confidence level. For
 reference, a 95%-confidence zero-error bound would use `2.996/N` and 90% would
@@ -240,7 +256,7 @@ payload and compares to the embedded value. A mismatch increments
 
 This is **independent of the Ethernet FCS**. The link FCS is checked and
 regenerated at every hop, so a slave that corrupts data internally and then
-emits a valid FCS would show **zero** NIC CRC errors but a **non-zero**
+emits a valid FCS would show **zero** FCS errors but a **non-zero**
 payload CRC error. That fault class is invisible to the FCS-based BER and is
 exactly what this check exists to catch. The payload is genuinely
 pseudo-random (not a constant), which also exercises the 100BASE-TX MLT-3
@@ -408,9 +424,9 @@ The tool reports estimated BER in the periodic status output.
   Now: UP
   Transitions (sysfs, authoritative): down 0 / up 0 / changes 0
   BRD WKC mismatches: 0        ← if non-zero, a slave dropped out
-  NIC CRC errors:     0        ← from RTL8125 PHY registers
   Total wire bits:3.50e+11
-  BER (CRC) <=:   ...
+  BER (FCS) <=:   ...   [whole frame]
+  BER (payload)<=:...   [97.9% coverage]
 ──────────────────────────────────────────────────────────
 ```
 
@@ -427,9 +443,6 @@ are never included.
 different from the expected slave count. Indicates a slave temporarily
 dropped from the ring (link loss, power issue).
 
-**NIC CRC errors**: frames received by the host NIC that failed FCS check.
-This is the primary BER measurement for the cable return path.
-
 **Per-slave ESC CRC** (with `-v`): each slave's own invalid-frame counter for
 each port, read via APRD datagrams. Non-zero values localise which segment
 has errors.
@@ -444,7 +457,7 @@ To degrade the link and verify the test detects errors:
 4. **Loose connector**: partially unseated RJ45 plug
 
 Observe which counter increments first:
-- NIC CRC errors only → problem on return path (last slave back to PC)
+- Host FCS/payload errors only → problem on return path (last slave back to PC)
 - Slave 0 P0 CRC only → problem between PC and slave 0
 - Slave N P0 CRC = Slave N-1 P1 CRC → problem between slave N-1 and N
 
@@ -544,8 +557,7 @@ Each row (written every 5 seconds). The columns are:
 
 ```
 elapsed_s, tx_enqueued, tx_wire, txok, txer, qdisc_drop,
-distinct_returns, frames_rcvd, frames_lost, nic_crc_errors,
-payload_crc_errors, brd_wkc_mismatches, kernel_rx_drops,
+distinct_returns, frames_rcvd, frames_lost, payload_crc_errors, brd_wkc_mismatches, kernel_rx_drops,
 carrier_down, carrier_up, carrier_changes,
 link_down_cp, link_up_cp, link_down_nl, link_up_nl, netlink_overflows,
 rx_bad_fcs_computed, rx_bad_fcs_auxdata, rx_truncated,
@@ -563,6 +575,7 @@ import pandas as pd
 df = pd.read_csv('results.csv')
 # BER against the wire-truth denominator (TxOk), not enqueued frames:
 df['loss_rate'] = df['frames_lost'] / df['txok']
-df['ber_crc']   = (df['nic_crc_errors'] + 0.5) / (df['txok'] * 12000)
-print(df[['elapsed_s','txok','frames_lost','txer','qdisc_drop','ber_crc']].tail())
+df['ber_fcs']     = (df['rx_bad_fcs_computed'] + 0.5) / (df['txok'] * 12000)
+df['ber_payload'] = (df['payload_crc_errors'] + 0.5) / (df['txok'] * 12000)
+print(df[['elapsed_s','txok','frames_lost','txer','qdisc_drop','ber_fcs']].tail())
 ```

@@ -263,8 +263,6 @@ typedef struct {
 
 /* ── Statistics ─────────────────────────────────────────────────────────── */
 typedef struct {
-    uint64_t nic_crc_errors;    /* from ethtool */
-    uint64_t nic_crc_errors_prev;
     /* Per-slave ESC counters (accumulated from 8-bit wrap-around registers).
      * Written only by the RX thread. */
     uint64_t esc_crc[MAX_SLAVES][4];      /* ports 0-3 */
@@ -505,12 +503,6 @@ static uint64_t ethtool_sum_counters(const char *iface,
     free(stats);
     close(fd);
     return total;
-}
-
-/* CRC/FCS error counter (RX). */
-static uint64_t read_nic_crc_errors(const char *iface) {
-    static const char *const needles[] = { "crc", "CRC", "fcs" };
-    return ethtool_sum_counters(iface, needles, 3, NULL);
 }
 
 /* On-wire TX packet counter. Sums the driver's transmitted-packet counters,
@@ -828,7 +820,7 @@ static uint64_t parse_return_frame(const uint8_t *buf, int len,
 }
 
 /* ── Print stats ────────────────────────────────────────────────────────── */
-static void print_stats(FILE *csv, uint64_t elapsed_ns, uint64_t new_nic_crc) {
+static void print_stats(FILE *csv, uint64_t elapsed_ns) {
     double elapsed_s  = elapsed_ns / 1e9;
 
     /* Snapshot atomics once for a consistent-ish view. */
@@ -856,11 +848,6 @@ static void print_stats(FILE *csv, uint64_t elapsed_ns, uint64_t new_nic_crc) {
 
     /* BER denominator = frames that actually reached the wire (TxOk). */
     uint64_t total_bits = txok * 12000ULL;
-
-    /* NIC CRC delta */
-    uint64_t nic_crc_delta = new_nic_crc - g_stats.nic_crc_errors_prev;
-    g_stats.nic_crc_errors += nic_crc_delta;
-    g_stats.nic_crc_errors_prev = new_nic_crc;
 
     /* Effective WIRE throughput since last call. Computed from TxOk (frames
      * actually clocked onto the wire), NOT from enqueued — during an outage TX
@@ -938,18 +925,26 @@ static void print_stats(FILE *csv, uint64_t elapsed_ns, uint64_t new_nic_crc) {
                    nl_ovf);
     }
     printf("  BRD WKC mismatches: %lu\n", wkcmm);
-    printf("  NIC CRC errors: %lu (cumulative)\n", g_stats.nic_crc_errors);
     printf("  Total wire bits:%.3e\n", (double)total_bits);
     if (total_bits > 0) {
         /* BER upper-bound estimator: (errors + 0.5) / N. The +0.5 gives a
          * conservative upper bound even when zero errors have been observed
          * (BER <= 0.5/N), and adds a consistent half-count margin once errors
-         * appear. Applied identically to both the FCS-based (NIC CRC) and the
-         * independent payload (CRC32C) error counts. */
-        printf("  BER (CRC) <=:   %.2e   ((%lu + 0.5) / N)\n",
-               ((double)g_stats.nic_crc_errors + 0.5) / (double)total_bits,
-               g_stats.nic_crc_errors);
-        printf("  BER (payload)<=:%.2e   ((%lu + 0.5) / N)\n",
+         * appear. Both numerators come from the tool's own SOFTWARE detectors
+         * (not the NIC's hardware CRC counter, which reads 0 under rx-all since
+         * bad frames are delivered to us rather than dropped-and-counted):
+         *   BER (FCS)     — whole-frame CRC (rx_bad_fcs_computed), ~100% coverage
+         *   BER (payload) — payload CRC32C, covers ~97.9% of the frame (all but
+         *                   the 32-byte Ethernet/EtherCAT/datagram headers, WKC,
+         *                   and the CRC field itself). For random bit errors the
+         *                   two should track within ~2%; a payload count much
+         *                   below the FCS count means errors are concentrated in
+         *                   the frame headers (front-of-frame link disruption),
+         *                   not uniformly-distributed bit errors. */
+        uint64_t bfc = atomic_load_explicit(&g_stats.rx_bad_fcs_computed, memory_order_relaxed);
+        printf("  BER (FCS) <=:   %.2e   ((%lu + 0.5) / N)  [whole frame]\n",
+               ((double)bfc + 0.5) / (double)total_bits, bfc);
+        printf("  BER (payload)<=:%.2e   ((%lu + 0.5) / N)  [97.9%% coverage]\n",
                ((double)plcrc + 0.5) / (double)total_bits, plcrc);
         printf("  Frame loss rate:%.2e  (lost / TxOk)\n",
                txok ? (double)lost / (double)txok : 0.0);
@@ -975,10 +970,10 @@ static void print_stats(FILE *csv, uint64_t elapsed_ns, uint64_t new_nic_crc) {
         uint64_t bfc  = atomic_load_explicit(&g_stats.rx_bad_fcs_computed, memory_order_relaxed);
         uint64_t bfa  = atomic_load_explicit(&g_stats.rx_bad_fcs_auxdata, memory_order_relaxed);
         uint64_t trunc= atomic_load_explicit(&g_stats.rx_truncated, memory_order_relaxed);
-        fprintf(csv, "%.3f,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,"
+        fprintf(csv, "%.3f,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,"
                      "%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu",
                 elapsed_s, sent, wire, txok, txer, qdrop, distinct, rcvd, lost,
-                g_stats.nic_crc_errors, plcrc, wkcmm, kdrops,
+                plcrc, wkcmm, kdrops,
                 g_stats.carrier_down, g_stats.carrier_up, g_stats.carrier_changes,
                 cp_d, cp_u, nl_d, nl_u, nl_o, bfc, bfa, trunc);
         for (int s = 0; s < g_num_slaves && s < MAX_SLAVES; s++)
@@ -994,7 +989,7 @@ static void print_stats(FILE *csv, uint64_t elapsed_ns, uint64_t new_nic_crc) {
 static void write_csv_header(FILE *csv, int num_slaves) {
     fprintf(csv, "elapsed_s,tx_enqueued,tx_wire,txok,txer,qdisc_drop,"
                  "distinct_returns,frames_rcvd,frames_lost,"
-                 "nic_crc_errors,payload_crc_errors,"
+                 "payload_crc_errors,"
                  "brd_wkc_mismatches,kernel_rx_drops,"
                  "carrier_down,carrier_up,carrier_changes,"
                  "link_down_cp,link_up_cp,link_down_nl,link_up_nl,netlink_overflows,"
@@ -1860,7 +1855,6 @@ int main(int argc, char *argv[]) {
     signal(SIGTERM, sig_handler);
 
     /* Initial NIC CRC baseline */
-    g_stats.nic_crc_errors_prev = read_nic_crc_errors(iface);
 
     /* Decide CPU pinning. On the 4-core/8-thread Ryzen 5300U we pin TX, RX and
      * the errqueue reader to separate cores; the supervisor (main) stays off
@@ -1970,8 +1964,7 @@ int main(int argc, char *argv[]) {
         }
 
         if (now - last_stat_ns >= 5000000000ULL) {
-            uint64_t nic_crc = read_nic_crc_errors(iface);
-            print_stats(csv, now - start_ns, nic_crc);
+            print_stats(csv, now - start_ns);
             last_stat_ns = now;
         }
     }
@@ -2046,8 +2039,7 @@ int main(int argc, char *argv[]) {
     if (have_cp) pthread_join(cp_tid, NULL);
     if (have_sm) pthread_join(sm_tid, NULL);
     uint64_t end_ns  = now_ns();
-    uint64_t nic_crc = read_nic_crc_errors(iface);
-    print_stats(csv, end_ns - start_ns, nic_crc);
+    print_stats(csv, end_ns - start_ns);
 
     if (g_linkev_csv) fclose(g_linkev_csv);
     fclose(csv);
