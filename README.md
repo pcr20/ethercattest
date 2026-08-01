@@ -4,7 +4,46 @@ Tests EtherCAT physical layer bit error rate by saturating a slave chain
 with NOP frames and logging CRC errors from both the host NIC PHY and
 ESC slave registers.
 
+## Link-loss monitoring (host NIC)
+
+Link-loss (carrier down/up) events on the host interface are counted two
+independent ways, which cross-check each other:
+
+**sysfs counters** (polled each supervisor tick) — three cumulative counters
+read from `/sys/class/net/<if>/`:
+- `carrier_down_count` — link-down events
+- `carrier_up_count` — link-up events
+- `carrier_changes` — total transitions (should equal down + up)
+
+**netlink events** (event-driven, timestamped) — a thread subscribed to
+`RTNLGRP_LINK` watches `IFF_LOWER_UP` transitions on the interface, counting
+down-events (up→down) and up-events (down→up) separately. Each transition is
+printed inline to stderr the instant it happens, with the recovery duration:
+
+```
+[+14.203s] LINK DOWN (host NIC enp2s0)
+[+14.251s] LINK UP (down 48ms)
+```
+
+The netlink down-count and the sysfs `carrier_down_count` delta measure the
+same physical events by different mechanisms and should agree; a divergence is
+itself diagnostic (e.g. a flap too brief for one path to observe).
+
+Output:
+- The running panel gains a **Link (host NIC)** section with all three sysfs
+  counters, the netlink down/up counts, and current link state.
+- The main CSV gains columns `carrier_down,carrier_up,carrier_changes,
+  link_down_nl,link_up_nl`.
+- A separate **`<output>_linkevents.csv`** logs one row per transition:
+  `t_rel_s,direction,down_duration_ms`. This is the drop timeline for
+  correlating link losses against, e.g., when you flexed a cable.
+
+This monitors the **host NIC's** link only (the PC↔slave-0 segment). For
+per-slave, per-port link loss deeper in the chain, the ESC lost-link register
+0x0310 would be read per slave — not yet wired into the APRD read.
+
 ## BER reporting
+
 
 BER is reported as an **upper-bound estimator**:
 

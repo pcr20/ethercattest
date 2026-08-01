@@ -67,6 +67,8 @@
 #include <linux/errqueue.h>
 #include <linux/ethtool.h>
 #include <linux/sockios.h>
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
 #include <arpa/inet.h>
 
 /* ── EtherCAT constants ─────────────────────────────────────────────────── */
@@ -261,6 +263,17 @@ typedef struct {
     uint64_t tx_wire_packets;          /* cumulative, from ethtool             */
     uint64_t tx_wire_base;             /* baseline at start                    */
     int      tx_ts_supported;          /* 1 if sw TX timestamping active       */
+    /* Link-loss tracking. sysfs deltas owned by supervisor; nl_* by netlink
+     * thread. */
+    uint64_t carrier_down;             /* sysfs carrier_down_count delta       */
+    uint64_t carrier_up;               /* sysfs carrier_up_count delta         */
+    uint64_t carrier_changes;          /* sysfs carrier_changes delta          */
+    uint64_t carrier_down_base;
+    uint64_t carrier_up_base;
+    uint64_t carrier_changes_base;
+    _Atomic uint64_t link_down_nl;     /* netlink down events                  */
+    _Atomic uint64_t link_up_nl;       /* netlink up events                    */
+    _Atomic int      link_state_up;    /* current IFF_LOWER_UP state (netlink) */
 } Stats;
 
 /* g_stats is defined here (ahead of the SeqTrack helpers that update it). */
@@ -349,6 +362,9 @@ static volatile int g_running   = 1;  /* master run flag (RX honours this)   */
 static volatile int g_tx_running = 1;  /* TX-only stop flag for drain barrier */
 static _Atomic uint64_t g_tx_final_seq = 0; /* seq count at TX stop */
 static _Atomic uint64_t g_tx_transmitted_hi = 0; /* highest transmitted seq +1 */
+static FILE        *g_linkev_csv = NULL;  /* per-event link log (may be NULL)  */
+static uint64_t     g_start_ns   = 0;     /* test start, for relative stamps   */
+static pthread_mutex_t g_linkev_mtx = PTHREAD_MUTEX_INITIALIZER;
 static int          g_verbose   = 0;
 static int          g_num_slaves = 0;
 static int          g_loopback   = 0;
@@ -472,6 +488,20 @@ static uint64_t read_nic_tx_packets(const char *iface) {
     /* Fall back to per-cast counters. */
     static const char *const cast[] = { "tx_unicast", "tx_multicast", "tx_broadcast" };
     return ethtool_sum_counters(iface, cast, 3, "err");
+}
+
+/* Read a uint64 from /sys/class/net/<iface>/<name>. Returns 0 and sets *ok=0
+ * on failure (file missing / unreadable). */
+static uint64_t read_sysfs_u64(const char *iface, const char *name, int *ok) {
+    char path[256];
+    snprintf(path, sizeof(path), "/sys/class/net/%s/%s", iface, name);
+    FILE *f = fopen(path, "r");
+    if (!f) { if (ok) *ok = 0; return 0; }
+    uint64_t v = 0;
+    int n = fscanf(f, "%lu", &v);
+    fclose(f);
+    if (ok) *ok = (n == 1);
+    return (n == 1) ? v : 0;
 }
 
 /* ── Build EtherCAT frame ───────────────────────────────────────────────── */
@@ -766,6 +796,21 @@ static void print_stats(FILE *csv, uint64_t elapsed_ns, uint64_t new_nic_crc) {
     printf("  TX backpressure:%lu  (EAGAIN/in-flight cap, normal)\n", backp);
     printf("  Kernel RX drops:%lu  %s\n", kdrops,
            kdrops ? "*** DRAIN SATURATED — BER INVALID ***" : "(none, drain healthy)");
+    /* ── Link (host NIC) ─────────────────────────────────────── */
+    uint64_t nl_down = atomic_load_explicit(&g_stats.link_down_nl, memory_order_relaxed);
+    uint64_t nl_up   = atomic_load_explicit(&g_stats.link_up_nl, memory_order_relaxed);
+    int link_up      = atomic_load_explicit(&g_stats.link_state_up, memory_order_relaxed);
+    if (g_stats.carrier_down || g_stats.carrier_up || g_stats.carrier_changes ||
+        nl_down || nl_up || 1) {
+        printf("  ── Link (host NIC) ─────────────────────────────────────\n");
+        printf("  Carrier down/up/chg (sysfs): %lu / %lu / %lu\n",
+               g_stats.carrier_down, g_stats.carrier_up, g_stats.carrier_changes);
+        printf("  Link events (netlink):       down %lu, up %lu   [now %s]\n",
+               nl_down, nl_up, link_up ? "UP" : "DOWN");
+        /* Consistency note: down+up should equal changes. */
+        if (g_stats.carrier_down + g_stats.carrier_up != g_stats.carrier_changes)
+            printf("  (note: down+up != changes — counters advanced mid-read)\n");
+    }
     printf("  BRD WKC mismatches: %lu\n", wkcmm);
     printf("  NIC CRC errors: %lu (cumulative)\n", g_stats.nic_crc_errors);
     printf("  Total wire bits:%.3e\n", (double)total_bits);
@@ -796,9 +841,13 @@ static void print_stats(FILE *csv, uint64_t elapsed_ns, uint64_t new_nic_crc) {
 
     /* CSV row */
     if (csv) {
-        fprintf(csv, "%.3f,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu",
+        uint64_t nl_d = atomic_load_explicit(&g_stats.link_down_nl, memory_order_relaxed);
+        uint64_t nl_u = atomic_load_explicit(&g_stats.link_up_nl, memory_order_relaxed);
+        fprintf(csv, "%.3f,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu",
                 elapsed_s, sent, wire, tsc, txd, rcvd, lost,
-                g_stats.nic_crc_errors, plcrc, wkcmm, kdrops, bad);
+                g_stats.nic_crc_errors, plcrc, wkcmm, kdrops, bad,
+                g_stats.carrier_down, g_stats.carrier_up, g_stats.carrier_changes,
+                nl_d, nl_u);
         for (int s = 0; s < g_num_slaves && s < MAX_SLAVES; s++)
             fprintf(csv, ",%lu,%lu,%lu,%lu",
                     g_stats.esc_crc[s][0], g_stats.esc_crc[s][1],
@@ -812,7 +861,8 @@ static void print_stats(FILE *csv, uint64_t elapsed_ns, uint64_t new_nic_crc) {
 static void write_csv_header(FILE *csv, int num_slaves) {
     fprintf(csv, "elapsed_s,tx_enqueued,tx_wire,tx_driver_xmit,tx_confirmed,"
                  "frames_rcvd,frames_lost,nic_crc_errors,payload_crc_errors,"
-                 "brd_wkc_mismatches,kernel_rx_drops,unknown_dup_seq");
+                 "brd_wkc_mismatches,kernel_rx_drops,unknown_dup_seq,"
+                 "carrier_down,carrier_up,carrier_changes,link_down_nl,link_up_nl");
     for (int s = 0; s < num_slaves; s++)
         fprintf(csv, ",slave%d_p0_crc,slave%d_p1_crc,slave%d_p2_crc,slave%d_p3_crc",
                 s, s, s, s);
@@ -842,6 +892,7 @@ static void write_csv_header(FILE *csv, int num_slaves) {
 typedef struct {
     int             sock;
     int             ifindex;
+    const char     *iface_name;   /* for sysfs/netlink lookups */
     uint8_t         src_mac[6];
     int             num_slaves;
     int             loopback;
@@ -1177,6 +1228,114 @@ static void *errq_thread(void *arg) {
     return NULL;
 }
 
+/* IFF_LOWER_UP = carrier present. Defined here to avoid pulling in
+ * <linux/if.h>, which conflicts with the already-included <net/if.h>. Value is
+ * stable ABI (bit 16). */
+#ifndef IFF_LOWER_UP
+#define IFF_LOWER_UP 0x10000
+#endif
+
+/* ── Netlink link-state monitor thread (Option A) ───────────────────────────
+ * Subscribes to RTNLGRP_LINK and watches IFF_LOWER_UP (carrier) transitions on
+ * our interface, distinguishing down-events (up->down) from up-events
+ * (down->up), each timestamped relative to test start. Event-driven: blocks in
+ * recv, consumes nothing between events, so it is left unpinned.
+ *
+ * Cross-checks the sysfs carrier_down_count delta (they measure the same
+ * physical events by different means and should agree). */
+static void *netlink_thread(void *arg) {
+    ThreadCtx *ctx = (ThreadCtx *)arg;
+
+    int nl = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
+    if (nl < 0) {
+        fprintf(stderr, "netlink socket: %s (link-event timing disabled)\n",
+                strerror(errno));
+        return NULL;
+    }
+    struct sockaddr_nl sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.nl_family = AF_NETLINK;
+    sa.nl_groups = RTMGRP_LINK;   /* subscribe to link-state changes */
+    if (bind(nl, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+        fprintf(stderr, "netlink bind: %s (link-event timing disabled)\n",
+                strerror(errno));
+        close(nl);
+        return NULL;
+    }
+
+    /* Seed current state from sysfs operstate/carrier so the first transition
+     * is measured correctly. */
+    int ok = 0;
+    uint64_t carrier = read_sysfs_u64(ctx->iface_name, "carrier", &ok);
+    int prev_up = ok ? (carrier != 0) : 1;
+    atomic_store_explicit(&g_stats.link_state_up, prev_up, memory_order_relaxed);
+
+    /* Track down-event time to report recovery duration on the following up. */
+    uint64_t last_down_ns = 0;
+
+    struct pollfd pfd = { .fd = nl, .events = POLLIN };
+    uint8_t buf[8192];
+
+    while (g_running) {
+        int pr = poll(&pfd, 1, 200);
+        if (pr < 0) { if (errno == EINTR) continue; break; }
+        if (pr == 0) continue;
+
+        ssize_t len = recv(nl, buf, sizeof(buf), MSG_DONTWAIT);
+        if (len <= 0) continue;
+
+        for (struct nlmsghdr *nh = (struct nlmsghdr *)buf;
+             NLMSG_OK(nh, (unsigned)len); nh = NLMSG_NEXT(nh, len)) {
+            if (nh->nlmsg_type == NLMSG_DONE) break;
+            if (nh->nlmsg_type != RTM_NEWLINK && nh->nlmsg_type != RTM_DELLINK)
+                continue;
+
+            struct ifinfomsg *ifi = (struct ifinfomsg *)NLMSG_DATA(nh);
+            if (ifi->ifi_index != ctx->ifindex) continue;   /* our iface only */
+
+            int up_now = (ifi->ifi_flags & IFF_LOWER_UP) ? 1 : 0;
+            if (up_now == prev_up) continue;                /* no transition */
+
+            uint64_t now = now_ns();
+            double t_rel = (now - g_start_ns) / 1e9;
+
+            if (!up_now) {
+                /* DOWN event */
+                atomic_fetch_add_explicit(&g_stats.link_down_nl, 1, memory_order_relaxed);
+                last_down_ns = now;
+                fprintf(stderr, "[+%.3fs] LINK DOWN (host NIC %s)\n",
+                        t_rel, ctx->iface_name);
+                if (g_linkev_csv) {
+                    pthread_mutex_lock(&g_linkev_mtx);
+                    fprintf(g_linkev_csv, "%.3f,DOWN,\n", t_rel);
+                    fflush(g_linkev_csv);
+                    pthread_mutex_unlock(&g_linkev_mtx);
+                }
+            } else {
+                /* UP event */
+                atomic_fetch_add_explicit(&g_stats.link_up_nl, 1, memory_order_relaxed);
+                double down_ms = last_down_ns ? (now - last_down_ns) / 1e6 : -1.0;
+                if (down_ms >= 0)
+                    fprintf(stderr, "[+%.3fs] LINK UP (down %.0fms)\n", t_rel, down_ms);
+                else
+                    fprintf(stderr, "[+%.3fs] LINK UP\n", t_rel);
+                if (g_linkev_csv) {
+                    pthread_mutex_lock(&g_linkev_mtx);
+                    if (down_ms >= 0) fprintf(g_linkev_csv, "%.3f,UP,%.0f\n", t_rel, down_ms);
+                    else              fprintf(g_linkev_csv, "%.3f,UP,\n", t_rel);
+                    fflush(g_linkev_csv);
+                    pthread_mutex_unlock(&g_linkev_mtx);
+                }
+            }
+            atomic_store_explicit(&g_stats.link_state_up, up_now, memory_order_relaxed);
+            prev_up = up_now;
+        }
+    }
+
+    close(nl);
+    return NULL;
+}
+
 /* ── Main ───────────────────────────────────────────────────────────────── */
 int main(int argc, char *argv[]) {
     const char *iface     = NULL;
@@ -1303,6 +1462,29 @@ int main(int argc, char *argv[]) {
         printf("NOTE: could not read ethtool tx_packets — wire count "
                "may be unavailable on this driver.\n");
 
+    /* Link-loss baselines (sysfs). All three exist on this kernel. */
+    { int ok1=0, ok2=0, ok3=0;
+      g_stats.carrier_down_base    = read_sysfs_u64(iface, "carrier_down_count", &ok1);
+      g_stats.carrier_up_base      = read_sysfs_u64(iface, "carrier_up_count", &ok2);
+      g_stats.carrier_changes_base = read_sysfs_u64(iface, "carrier_changes", &ok3);
+      printf("Link monitor: sysfs carrier counters %s; netlink events enabled\n",
+             (ok1 && ok2 && ok3) ? "available" : "PARTIAL (some missing)");
+    }
+
+    /* Open per-event link log: <csv_path> with _linkevents before extension. */
+    char linkev_path[512];
+    { const char *dot = strrchr(csv_path, '.');
+      if (dot) snprintf(linkev_path, sizeof(linkev_path), "%.*s_linkevents%s",
+                        (int)(dot - csv_path), csv_path, dot);
+      else     snprintf(linkev_path, sizeof(linkev_path), "%s_linkevents.csv", csv_path);
+    }
+    g_linkev_csv = fopen(linkev_path, "w");
+    if (g_linkev_csv) {
+        fprintf(g_linkev_csv, "t_rel_s,direction,down_duration_ms\n");
+        fflush(g_linkev_csv);
+        printf("Link events: %s\n", linkev_path);
+    }
+
     /* Open CSV */
     FILE *csv = fopen(csv_path, "w");
     if (!csv) { perror("fopen csv"); return 1; }
@@ -1332,6 +1514,7 @@ int main(int argc, char *argv[]) {
     memset(&ctx, 0, sizeof(ctx));
     ctx.sock       = sock;
     ctx.ifindex    = ifindex;
+    ctx.iface_name = iface;
     memcpy(ctx.src_mac, src_mac, 6);
     ctx.num_slaves = num_slaves;
     ctx.loopback   = g_loopback;
@@ -1342,6 +1525,7 @@ int main(int argc, char *argv[]) {
 
     uint64_t start_ns    = now_ns();
     uint64_t last_stat_ns = start_ns;
+    g_start_ns = start_ns;   /* for netlink relative timestamps */
 
     printf("Running... (Ctrl-C to stop)\n");
 
@@ -1359,6 +1543,13 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "warning: errqueue thread failed; "
                             "TX driver-xmit count disabled\n");
     }
+    /* Netlink link-state monitor (event-driven, unpinned). */
+    pthread_t nl_tid; int have_nl = 0;
+    if (pthread_create(&nl_tid, NULL, netlink_thread, &ctx) == 0)
+        have_nl = 1;
+    else
+        fprintf(stderr, "warning: netlink thread failed; "
+                        "link-event timing disabled\n");
     /* Small delay so RX is definitely in its poll loop. */
     sleep_ns(5 * 1000000);
     if (pthread_create(&tx_tid, NULL, tx_thread, &ctx) != 0) {
@@ -1385,6 +1576,14 @@ int main(int argc, char *argv[]) {
         poll_kernel_drops(sock);
         g_stats.tx_wire_packets =
             read_nic_tx_packets(iface) - g_stats.tx_wire_base;
+        { int ok;
+          uint64_t d = read_sysfs_u64(iface, "carrier_down_count", &ok);
+          if (ok) g_stats.carrier_down = d - g_stats.carrier_down_base;
+          uint64_t u = read_sysfs_u64(iface, "carrier_up_count", &ok);
+          if (ok) g_stats.carrier_up = u - g_stats.carrier_up_base;
+          uint64_t c = read_sysfs_u64(iface, "carrier_changes", &ok);
+          if (ok) g_stats.carrier_changes = c - g_stats.carrier_changes_base;
+        }
 
         if (now - last_stat_ns >= 5000000000ULL) {
             uint64_t nic_crc = read_nic_crc_errors(iface);
@@ -1461,13 +1660,23 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    /* Final kernel-drop poll, wire count, and stats. */
+    /* Final kernel-drop poll, wire count, sysfs carrier counters, and stats. */
     poll_kernel_drops(sock);
     g_stats.tx_wire_packets = read_nic_tx_packets(iface) - g_stats.tx_wire_base;
+    { int ok;
+      uint64_t d = read_sysfs_u64(iface, "carrier_down_count", &ok);
+      if (ok) g_stats.carrier_down = d - g_stats.carrier_down_base;
+      uint64_t u = read_sysfs_u64(iface, "carrier_up_count", &ok);
+      if (ok) g_stats.carrier_up = u - g_stats.carrier_up_base;
+      uint64_t c = read_sysfs_u64(iface, "carrier_changes", &ok);
+      if (ok) g_stats.carrier_changes = c - g_stats.carrier_changes_base;
+    }
+    if (have_nl) pthread_join(nl_tid, NULL);
     uint64_t end_ns  = now_ns();
     uint64_t nic_crc = read_nic_crc_errors(iface);
     print_stats(csv, end_ns - start_ns, nic_crc);
 
+    if (g_linkev_csv) fclose(g_linkev_csv);
     fclose(csv);
     close(sock);
 
