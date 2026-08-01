@@ -52,13 +52,13 @@ else
     echo "    counters, not delivered to the tool."
 fi
 
-# 4b. Raise txqueuelen so the qdisc can buffer the whole credit window during a
-#     brief link outage (frames are held, not dropped, until the link returns).
-#     Run qdisc_buffer_test.sh to confirm this NIC buffers rather than drops.
-echo "[4b] Raising txqueuelen to 16000 (qdisc buffer depth for outages)..."
-ip link set "$IFACE" txqueuelen 16000 2>/dev/null && \
-    echo "    txqueuelen=$(cat /sys/class/net/$IFACE/tx_queue_len)" || \
-    echo "    WARNING: could not set txqueuelen"
+# 4b. NOTE: the r8169 (RTL8125) DROPS frames at the driver when carrier is down
+#     — it does not buffer them in the qdisc, so raising txqueuelen provides no
+#     benefit (confirmed by qdisc_buffer_test.sh: tx_dropped climbs during a
+#     carrier-down regardless of txqueuelen). Frames offered during an outage
+#     are therefore lost; the RX-driven accounting counts them exactly as wire
+#     loss (back-calculated by the first good frame on each recovery). No
+#     txqueuelen change is applied.
 
 # 4b. Raise kernel socket buffer ceilings so the tool's 64MB RX buffer request
 #     is honoured (the drain thread relies on this headroom to never overflow).
