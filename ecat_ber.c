@@ -444,6 +444,53 @@ static volatile int g_tx_running = 1;  /* TX-only stop flag for drain barrier */
 static _Atomic uint64_t g_tx_final_seq = 0; /* seq count at TX stop */
 static FILE        *g_linkev_csv = NULL;  /* per-event link log (may be NULL)  */
 static uint64_t     g_start_ns   = 0;     /* test start, for relative stamps   */
+
+/* ── Bad-FCS event ring (SPSC, lock-free) ───────────────────────────────────
+ * The RX thread must NEVER block on console I/O (a slow terminal would stall
+ * the drain → kernel RX drops → BER invalid). So bad-FCS events are pushed
+ * into this single-producer (RX thread) / single-consumer (supervisor)
+ * lock-free ring; the supervisor drains and prints them on its 200ms tick,
+ * capped at BADFCS_PRINT_CAP prints per stats interval. Push on a full ring
+ * drops the event (counted) — it never waits. */
+#define BADFCS_RING       4096          /* power of two */
+#define BADFCS_PRINT_CAP  1000          /* prints per stats interval */
+typedef struct { uint64_t t_ns; int32_t len; uint32_t tp; } BadFcsEv;
+static BadFcsEv g_bfe[BADFCS_RING];
+static _Atomic uint64_t g_bfe_head = 0;      /* producer-written */
+static _Atomic uint64_t g_bfe_tail = 0;      /* consumer-written */
+static _Atomic uint64_t g_bfe_ringdrop = 0;  /* events dropped, ring full */
+
+static inline void badfcs_push(uint32_t tp, int len) {
+    uint64_t h = atomic_load_explicit(&g_bfe_head, memory_order_relaxed);
+    uint64_t t = atomic_load_explicit(&g_bfe_tail, memory_order_acquire);
+    if (h - t >= BADFCS_RING) {          /* full — drop, never block */
+        atomic_fetch_add_explicit(&g_bfe_ringdrop, 1, memory_order_relaxed);
+        return;
+    }
+    g_bfe[h & (BADFCS_RING - 1)] =
+        (BadFcsEv){ now_ns() - g_start_ns, (int32_t)len, tp };
+    atomic_store_explicit(&g_bfe_head, h + 1, memory_order_release);
+}
+
+/* Supervisor-side drain: consume all pending events, printing up to *budget
+ * of them (decrementing it) and counting the rest into *suppressed. Called
+ * only from the supervisor thread, which owns slow console I/O. */
+static void badfcs_drain(int *budget, uint64_t *suppressed) {
+    uint64_t h = atomic_load_explicit(&g_bfe_head, memory_order_acquire);
+    uint64_t t = atomic_load_explicit(&g_bfe_tail, memory_order_relaxed);
+    while (t < h) {
+        BadFcsEv ev = g_bfe[t & (BADFCS_RING - 1)];
+        if (*budget > 0) {
+            (*budget)--;
+            fprintf(stderr, "[bad-FCS frame] t=+%.3fs tp_status=0x%08x len=%d\n",
+                    ev.t_ns / 1e9, ev.tp, ev.len);
+        } else {
+            (*suppressed)++;
+        }
+        t++;
+    }
+    atomic_store_explicit(&g_bfe_tail, t, memory_order_release);
+}
 static pthread_mutex_t g_linkev_mtx = PTHREAD_MUTEX_INITIALIZER;
 static int          g_verbose   = 0;
 static int          g_num_slaves = 0;
@@ -1385,12 +1432,8 @@ static void *rx_thread(void *arg) {
                   eth_crc32(bufs[idx], raw_len), ETH_FCS_RESIDUAL);            \
             }                                                                 \
             /* Detector 1 calibration: print kernel tp_status on first few. */ \
-            static _Atomic uint64_t badseen = 0;                              \
-            uint64_t b = atomic_fetch_add_explicit(&badseen, 1,               \
-                                                   memory_order_relaxed);     \
-            if (have_aux && b < 8)                                            \
-                fprintf(stderr, "[bad-FCS frame] tp_status=0x%08x len=%d\n",   \
-                        tp_status, raw_len);                                   \
+            badfcs_push(tp_status, raw_len);   /* non-blocking; printed by  \
+                                                  the supervisor thread */    \
         }                                                                     \
         /* Detector 1: count frames the kernel flags via auxdata. We treat a   \
          * frame as auxdata-bad if it lacks CSUM_VALID AND our own check also  \
@@ -2026,6 +2069,8 @@ int main(int argc, char *argv[]) {
 
     uint64_t start_ns    = now_ns();
     uint64_t last_stat_ns = start_ns;
+    int      badfcs_budget = BADFCS_PRINT_CAP;   /* prints left this interval */
+    uint64_t badfcs_suppressed = 0;
     g_start_ns = start_ns;   /* for netlink relative timestamps */
     /* Assume link up until netlink seeds real state, so the in-flight cap is
      * active from the start rather than disabled by a 0-initialised flag. */
@@ -2091,6 +2136,8 @@ int main(int argc, char *argv[]) {
             break;
         }
 
+        badfcs_drain(&badfcs_budget, &badfcs_suppressed);
+
         poll_kernel_drops(sock);
         g_stats.tx_wire_packets =
             read_nic_tx_packets(iface) - g_stats.tx_wire_base;
@@ -2104,7 +2151,17 @@ int main(int argc, char *argv[]) {
         }
 
         if (now - last_stat_ns >= 5000000000ULL) {
+            uint64_t rd = atomic_exchange_explicit(&g_bfe_ringdrop, 0,
+                                                   memory_order_relaxed);
+            if (badfcs_suppressed || rd)
+                fprintf(stderr, "[bad-FCS] %lu print(s) suppressed this "
+                        "interval (cap %d)%s%lu%s\n",
+                        badfcs_suppressed, BADFCS_PRINT_CAP,
+                        rd ? "; ring overflow dropped " : "",
+                        rd, rd ? " event(s)" : "");
             print_stats(csv, now - start_ns);
+            badfcs_budget = BADFCS_PRINT_CAP;
+            badfcs_suppressed = 0;
             last_stat_ns = now;
         }
     }
@@ -2179,6 +2236,10 @@ int main(int argc, char *argv[]) {
     if (have_cp) pthread_join(cp_tid, NULL);
     if (have_sm) pthread_join(sm_tid, NULL);
     uint64_t end_ns  = now_ns();
+    badfcs_drain(&badfcs_budget, &badfcs_suppressed);
+    if (badfcs_suppressed)
+        fprintf(stderr, "[bad-FCS] %lu print(s) suppressed in final interval\n",
+                badfcs_suppressed);
     print_stats(csv, end_ns - start_ns);
 
     if (g_linkev_csv) fclose(g_linkev_csv);
