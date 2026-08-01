@@ -78,42 +78,43 @@ in (a one-line change). The standard-CRC32 algorithm itself is verified against
 the 0xCBF43926 check value, and the residual detection against 100 good + 100
 corrupted synthetic frames, at test time.
 
-## Link-loss monitoring (host NIC)
+## Link-loss monitoring (host NIC) — three independent sources
 
+Carrier (link) transitions on the host interface are tracked three ways, each
+with a different strength, so they cross-check:
 
-Link-loss (carrier down/up) events on the host interface are counted two
-independent ways, which cross-check each other:
+**1. sysfs counters — authoritative counts.** `carrier_down_count`,
+`carrier_up_count`, `carrier_changes` are incremented by the kernel on *every*
+transition with no coalescing, so they are the ground-truth totals. Polled each
+supervisor tick. Reported as "Transitions (sysfs, authoritative)".
 
-**sysfs counters** (polled each supervisor tick) — three cumulative counters
-read from `/sys/class/net/<if>/`:
-- `carrier_down_count` — link-down events
-- `carrier_up_count` — link-up events
-- `carrier_changes` — total transitions (should equal down + up)
+**2. POLLPRI carrier thread — current state + timed events.** A thread opens
+`/sys/class/net/<if>/carrier` and blocks on `poll(POLLPRI)`; the kernel's
+`sysfs_notify()` on carrier wakes it at each transition — event-driven, minimal
+latency. It owns `link_state_up` (the tool's live view of the link) and logs
+timestamped transitions. `sysfs_notify` coalesces, so this can merge very fast
+flaps — but it always reports the correct *current* state on wake, which is what
+coalescing preserves. If a driver/kernel does not support POLLPRI on carrier
+(some virtual interfaces), it automatically falls back to a 10ms timed re-read
+and says so.
 
-**netlink events** (event-driven, timestamped) — a thread subscribed to
-`RTNLGRP_LINK` watches `IFF_LOWER_UP` transitions on the interface, counting
-down-events (up→down) and up-events (down→up) separately. Each transition is
-printed inline to stderr the instant it happens, with the recovery duration:
+**3. netlink — independent cross-check.** An `RTMGRP_LINK` listener counts
+`IFF_LOWER_UP` transitions. netlink's linkwatch source is itself rate-limited/
+coalescing, so netlink is *not* authoritative for counts during a fast flap — it
+is a third independent measurement. Hardened against socket overflow (4MB
+receive buffer, tight drain); any residual `ENOBUFS`/`NLMSG_OVERRUN` is counted
+and surfaced ("netlink overflows: K") rather than silently lost.
 
-```
-[+14.203s] LINK DOWN (host NIC enp2s0)
-[+14.251s] LINK UP (down 48ms)
-```
+The design principle: **the sysfs counter is the true total; POLLPRI gives live
+state and timing; netlink is an independent cross-check.** During a fast flap
+storm the three diverge — e.g. sysfs `down 47`, carrier-thread `down 12`,
+netlink `down 7` — and that divergence quantifies how much faster the link
+thrashed than the notification layers could individually resolve. All appear in
+the CSV (`carrier_down/up/changes`, `link_down_cp/up_cp`, `link_down_nl/up_nl`,
+`netlink_overflows`), plus a per-event timeline in `<output>_linkevents.csv`
+(`t_rel_s,direction,down_duration_ms`).
 
-The netlink down-count and the sysfs `carrier_down_count` delta measure the
-same physical events by different mechanisms and should agree; a divergence is
-itself diagnostic (e.g. a flap too brief for one path to observe).
-
-Output:
-- The running panel gains a **Link (host NIC)** section with all three sysfs
-  counters, the netlink down/up counts, and current link state.
-- The main CSV gains columns `carrier_down,carrier_up,carrier_changes,
-  link_down_nl,link_up_nl`.
-- A separate **`<output>_linkevents.csv`** logs one row per transition:
-  `t_rel_s,direction,down_duration_ms`. This is the drop timeline for
-  correlating link losses against, e.g., when you flexed a cable.
-
-This monitors the **host NIC's** link only (the PC↔slave-0 segment). For
+This monitors the **host NIC's** link only (the PC-to-slave-0 segment). For
 per-slave, per-port link loss deeper in the chain, the ESC lost-link register
 0x0310 would be read per slave — not yet wired into the APRD read.
 

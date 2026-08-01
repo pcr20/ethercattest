@@ -290,17 +290,21 @@ typedef struct {
     uint64_t tx_wire_packets;          /* cumulative, from ethtool             */
     uint64_t tx_wire_base;             /* baseline at start                    */
     int      tx_ts_supported;          /* 1 if sw TX timestamping active       */
-    /* Link-loss tracking. sysfs deltas owned by supervisor; nl_* by netlink
-     * thread. */
+    /* Link-loss tracking. sysfs counter deltas owned by supervisor; nl_* by the
+     * netlink cross-check thread; carrier-poll events + link_state_up by the
+     * POLLPRI carrier thread. */
     uint64_t carrier_down;             /* sysfs carrier_down_count delta       */
     uint64_t carrier_up;               /* sysfs carrier_up_count delta         */
     uint64_t carrier_changes;          /* sysfs carrier_changes delta          */
     uint64_t carrier_down_base;
     uint64_t carrier_up_base;
     uint64_t carrier_changes_base;
-    _Atomic uint64_t link_down_nl;     /* netlink down events                  */
-    _Atomic uint64_t link_up_nl;       /* netlink up events                    */
-    _Atomic int      link_state_up;    /* current IFF_LOWER_UP state (netlink) */
+    _Atomic uint64_t link_down_nl;     /* netlink down events (cross-check)    */
+    _Atomic uint64_t link_up_nl;       /* netlink up events (cross-check)      */
+    _Atomic uint64_t netlink_overflows;/* netlink NETLINK_OVERRUN/ENOBUFS      */
+    _Atomic uint64_t link_down_cp;     /* POLLPRI carrier down events          */
+    _Atomic uint64_t link_up_cp;       /* POLLPRI carrier up events            */
+    _Atomic int      link_state_up;    /* current carrier state (POLLPRI owns) */
 } Stats;
 
 /* g_stats is defined here (ahead of the SeqTrack helpers that update it). */
@@ -934,20 +938,35 @@ static void print_stats(FILE *csv, uint64_t elapsed_ns, uint64_t new_nic_crc) {
     printf("  TX backpressure:%lu  (EAGAIN/in-flight cap, normal)\n", backp);
     printf("  Kernel RX drops:%lu  %s\n", kdrops,
            kdrops ? "*** DRAIN SATURATED — BER INVALID ***" : "(none, drain healthy)");
-    /* ── Link (host NIC) ─────────────────────────────────────── */
+    /* ── Link (host NIC) — three independent sources ───────────── */
     uint64_t nl_down = atomic_load_explicit(&g_stats.link_down_nl, memory_order_relaxed);
     uint64_t nl_up   = atomic_load_explicit(&g_stats.link_up_nl, memory_order_relaxed);
+    uint64_t nl_ovf  = atomic_load_explicit(&g_stats.netlink_overflows, memory_order_relaxed);
+    uint64_t cp_down = atomic_load_explicit(&g_stats.link_down_cp, memory_order_relaxed);
+    uint64_t cp_up   = atomic_load_explicit(&g_stats.link_up_cp, memory_order_relaxed);
     int link_up      = atomic_load_explicit(&g_stats.link_state_up, memory_order_relaxed);
-    if (g_stats.carrier_down || g_stats.carrier_up || g_stats.carrier_changes ||
-        nl_down || nl_up || 1) {
+    {
         printf("  ── Link (host NIC) ─────────────────────────────────────\n");
-        printf("  Carrier down/up/chg (sysfs): %lu / %lu / %lu\n",
+        printf("  Now: %s\n", link_up ? "UP" : "DOWN");
+        /* Authoritative counts: kernel sysfs counters (never coalesce). */
+        printf("  Transitions (sysfs, authoritative): down %lu / up %lu / changes %lu\n",
                g_stats.carrier_down, g_stats.carrier_up, g_stats.carrier_changes);
-        printf("  Link events (netlink):       down %lu, up %lu   [now %s]\n",
-               nl_down, nl_up, link_up ? "UP" : "DOWN");
-        /* Consistency note: down+up should equal changes. */
         if (g_stats.carrier_down + g_stats.carrier_up != g_stats.carrier_changes)
-            printf("  (note: down+up != changes — counters advanced mid-read)\n");
+            printf("    (down+up != changes — counters advanced mid-read; benign)\n");
+        /* Carrier thread: current-state + timed events (POLLPRI, or fast
+         * timed re-read fallback; may coalesce either way). */
+        printf("  Timed events (carrier thread):      down %lu / up %lu%s\n",
+               cp_down, cp_up,
+               (cp_down < g_stats.carrier_down)
+                 ? "   (fewer than sysfs: fast flaps coalesced)" : "");
+        /* Netlink cross-check (coalesces + can overflow). */
+        printf("  Cross-check (netlink):              down %lu / up %lu%s\n",
+               nl_down, nl_up,
+               (nl_down < g_stats.carrier_down)
+                 ? "   (undercounts fast flaps — expected)" : "");
+        if (nl_ovf)
+            printf("    netlink overflows: %lu  (messages dropped — cross-check incomplete)\n",
+                   nl_ovf);
     }
     printf("  BRD WKC mismatches: %lu\n", wkcmm);
     printf("  NIC CRC errors: %lu (cumulative)\n", g_stats.nic_crc_errors);
@@ -981,14 +1000,18 @@ static void print_stats(FILE *csv, uint64_t elapsed_ns, uint64_t new_nic_crc) {
     if (csv) {
         uint64_t nl_d = atomic_load_explicit(&g_stats.link_down_nl, memory_order_relaxed);
         uint64_t nl_u = atomic_load_explicit(&g_stats.link_up_nl, memory_order_relaxed);
+        uint64_t nl_o = atomic_load_explicit(&g_stats.netlink_overflows, memory_order_relaxed);
+        uint64_t cp_d = atomic_load_explicit(&g_stats.link_down_cp, memory_order_relaxed);
+        uint64_t cp_u = atomic_load_explicit(&g_stats.link_up_cp, memory_order_relaxed);
         uint64_t bfc  = atomic_load_explicit(&g_stats.rx_bad_fcs_computed, memory_order_relaxed);
         uint64_t bfa  = atomic_load_explicit(&g_stats.rx_bad_fcs_auxdata, memory_order_relaxed);
         uint64_t trunc= atomic_load_explicit(&g_stats.rx_truncated, memory_order_relaxed);
-        fprintf(csv, "%.3f,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu",
+        fprintf(csv, "%.3f,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,"
+                     "%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu",
                 elapsed_s, sent, wire, tsc, txd, rcvd, lost,
                 g_stats.nic_crc_errors, plcrc, wkcmm, kdrops, bad,
                 g_stats.carrier_down, g_stats.carrier_up, g_stats.carrier_changes,
-                nl_d, nl_u, bfc, bfa, trunc);
+                cp_d, cp_u, nl_d, nl_u, nl_o, bfc, bfa, trunc);
         for (int s = 0; s < g_num_slaves && s < MAX_SLAVES; s++)
             fprintf(csv, ",%lu,%lu,%lu,%lu",
                     g_stats.esc_crc[s][0], g_stats.esc_crc[s][1],
@@ -1003,7 +1026,8 @@ static void write_csv_header(FILE *csv, int num_slaves) {
     fprintf(csv, "elapsed_s,tx_enqueued,tx_wire,tx_driver_xmit,tx_confirmed,"
                  "frames_rcvd,frames_lost,nic_crc_errors,payload_crc_errors,"
                  "brd_wkc_mismatches,kernel_rx_drops,unknown_dup_seq,"
-                 "carrier_down,carrier_up,carrier_changes,link_down_nl,link_up_nl,"
+                 "carrier_down,carrier_up,carrier_changes,"
+                 "link_down_cp,link_up_cp,link_down_nl,link_up_nl,netlink_overflows,"
                  "rx_bad_fcs_computed,rx_bad_fcs_auxdata,rx_truncated");
     for (int s = 0; s < num_slaves; s++)
         fprintf(csv, ",slave%d_p0_crc,slave%d_p1_crc,slave%d_p2_crc,slave%d_p3_crc",
@@ -1101,27 +1125,26 @@ static void *tx_thread(void *arg) {
             }
         }
 
-        /* Bound outstanding frames. If RX hasn't caught up to within
-         * MAX_INFLIGHT, pause briefly — this is genuine wire backpressure.
+        /* Bound total in-flight frames = enqueued − received − aged-out.
          *
-         * Two corrections make this robust to link outages:
-         *  1. Link-aware: if the carrier is currently DOWN (netlink state),
-         *     don't throttle — outstanding frames are stranded, not in transit,
-         *     and blocking on them is pointless. TX keeps trying so that the
-         *     instant the link returns, frames flow again immediately.
-         *  2. Aged-out exclusion: frames the aging sweep has retired as lost
-         *     (g_aged_out) no longer count against the budget, so the cap
-         *     releases and TX resumes promptly after recovery instead of
-         *     wedging forever on frames destroyed by the outage.
-         * Guarded so a transient rcvd>sent (double-deliver on lo) can't
-         * underflow. */
-        int link_up = atomic_load_explicit(&g_stats.link_state_up, memory_order_relaxed);
-        uint64_t sent_now = atomic_load_explicit(&g_stats.frames_enqueued, memory_order_relaxed);
+         * This single bound handles both failure modes:
+         *  - Prevents runaway ENQUEUE during a link outage. When carrier is
+         *    down the kernel silently accepts and drops frames (no EAGAIN), so
+         *    without a bound on enqueued, TX spews hundreds of thousands of
+         *    frames into the void. Capping enqueued−received−aged holds it.
+         *  - Prevents the post-outage WEDGE. Frames destroyed mid-flight never
+         *    return, so without excluding them "received" can never catch up
+         *    and the cap stays pinned forever. The aging sweep retires them
+         *    into g_aged_out, which is subtracted here, so the cap releases and
+         *    TX resumes within ~100ms of link recovery.
+         * No link-state dependency — this is robust even when the tool's view
+         * of carrier state is stale during a fast flap storm. Guarded against
+         * transient underflow (double-deliver on lo). */
+        uint64_t enq_now  = atomic_load_explicit(&g_stats.frames_enqueued, memory_order_relaxed);
         uint64_t rcvd_now = atomic_load_explicit(&g_stats.frames_received, memory_order_relaxed);
         uint64_t aged_now = atomic_load_explicit(&g_aged_out, memory_order_relaxed);
         uint64_t accounted = rcvd_now + aged_now;   /* returned OR written off */
-        if (link_up && sent_now > accounted &&
-            (sent_now - accounted) >= MAX_INFLIGHT) {
+        if (enq_now > accounted && (enq_now - accounted) >= MAX_INFLIGHT) {
             atomic_fetch_add_explicit(&g_stats.tx_backpressure, 1, memory_order_relaxed);
             sleep_ns(10000);   /* 10us; loop re-checks g_tx_running */
             continue;
@@ -1524,100 +1547,200 @@ static void *errq_thread(void *arg) {
 #define IFF_LOWER_UP 0x10000
 #endif
 
-/* ── Netlink link-state monitor thread (Option A) ───────────────────────────
- * Subscribes to RTNLGRP_LINK and watches IFF_LOWER_UP (carrier) transitions on
- * our interface, distinguishing down-events (up->down) from up-events
- * (down->up), each timestamped relative to test start. Event-driven: blocks in
- * recv, consumes nothing between events, so it is left unpinned.
+/* ── POLLPRI carrier-state thread (primary current-state + timing) ──────────
+ * Opens /sys/class/net/<if>/carrier and blocks in poll() on POLLPRI|POLLERR.
+ * The netdev core calls sysfs_notify() on "carrier" at every transition, which
+ * wakes this thread — event-driven, no polling loop, minimal latency. On each
+ * wake it re-reads the attribute (lseek to 0 first, as sysfs requires) and
+ * updates link_state_up with the TRUE CURRENT value, and logs a timestamped
+ * transition.
  *
- * Cross-checks the sysfs carrier_down_count delta (they measure the same
- * physical events by different means and should agree). */
+ * NOTE ON COALESCING: sysfs_notify coalesces — if carrier changes twice before
+ * we read, we get one wake and see only the latest value. So this reliably
+ * tracks CURRENT STATE and gives timing for transitions it resolves, but is not
+ * a guaranteed count of every bounce. The authoritative transition COUNT is the
+ * kernel's carrier_*_count sysfs counters (read by the supervisor). This thread
+ * owns link_state_up because current-state is exactly what coalescing preserves. */
+static void *carrier_thread(void *arg) {
+    ThreadCtx *ctx = (ThreadCtx *)arg;
+
+    char path[256];
+    snprintf(path, sizeof(path), "/sys/class/net/%s/carrier", ctx->iface_name);
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        fprintf(stderr, "carrier open(%s): %s (POLLPRI state disabled)\n",
+                path, strerror(errno));
+        return NULL;
+    }
+
+    /* Prime: read initial value and consume the initial POLLPRI that poll()
+     * always reports immediately for a freshly-opened sysfs attribute. */
+    char c = '1';
+    { ssize_t r = pread(fd, &c, 1, 0); if (r < 1) c = '1'; }
+    int prev_up = (c == '1');
+    atomic_store_explicit(&g_stats.link_state_up, prev_up, memory_order_relaxed);
+
+    uint64_t last_down_ns = 0;
+    struct pollfd pfd = { .fd = fd, .events = POLLPRI | POLLERR };
+
+    /* Detect whether POLLPRI notification actually works on this attribute.
+     * Not all drivers/kernels call sysfs_notify() on "carrier" (some virtual
+     * interfaces don't). Probe once: a working attribute reports POLLPRI on the
+     * priming poll of a fresh fd. If it doesn't, fall back to a fast timed
+     * re-read so link_state_up stays correct regardless. */
+    int pollpri_works;
+    {
+        struct pollfd probe = { .fd = fd, .events = POLLPRI | POLLERR };
+        int pr = poll(&probe, 1, 0);
+        pollpri_works = (pr > 0 && (probe.revents & POLLPRI));
+        /* consume the priming event */
+        char tmp; if (pread(fd, &tmp, 1, 0) < 0) { /* ignore */ }
+    }
+    if (!pollpri_works)
+        fprintf(stderr, "note: POLLPRI carrier notification unavailable on %s; "
+                        "using fast timed re-read fallback (10ms)\n", ctx->iface_name);
+
+    while (g_running) {
+        int pr;
+        if (pollpri_works) {
+            pr = poll(&pfd, 1, 200);
+            if (pr < 0) { if (errno == EINTR) continue; break; }
+            if (pr == 0) continue;
+            if (!(pfd.revents & (POLLPRI | POLLERR))) continue;
+        } else {
+            /* Fallback: fast timed re-read. 10ms cadence catches all but the
+             * briefest flaps; still far better than nothing, and the sysfs
+             * counters remain the authoritative total regardless. */
+            sleep_ns(10 * 1000000);
+        }
+
+        /* Re-read current carrier value (must pread from offset 0). */
+        char v = '0';
+        if (pread(fd, &v, 1, 0) < 1) continue;
+        int up_now = (v == '1');
+        if (up_now == prev_up) continue;        /* spurious wake / no change */
+
+        uint64_t now = now_ns();
+        double t_rel = (now - g_start_ns) / 1e9;
+
+        if (!up_now) {
+            atomic_fetch_add_explicit(&g_stats.link_down_cp, 1, memory_order_relaxed);
+            last_down_ns = now;
+            fprintf(stderr, "[+%.3fs] LINK DOWN (host NIC %s)\n", t_rel, ctx->iface_name);
+            if (g_linkev_csv) {
+                pthread_mutex_lock(&g_linkev_mtx);
+                fprintf(g_linkev_csv, "%.3f,DOWN,\n", t_rel);
+                fflush(g_linkev_csv);
+                pthread_mutex_unlock(&g_linkev_mtx);
+            }
+        } else {
+            atomic_fetch_add_explicit(&g_stats.link_up_cp, 1, memory_order_relaxed);
+            double down_ms = last_down_ns ? (now - last_down_ns) / 1e6 : -1.0;
+            if (down_ms >= 0) fprintf(stderr, "[+%.3fs] LINK UP (down %.0fms)\n", t_rel, down_ms);
+            else              fprintf(stderr, "[+%.3fs] LINK UP\n", t_rel);
+            if (g_linkev_csv) {
+                pthread_mutex_lock(&g_linkev_mtx);
+                if (down_ms >= 0) fprintf(g_linkev_csv, "%.3f,UP,%.0f\n", t_rel, down_ms);
+                else              fprintf(g_linkev_csv, "%.3f,UP,\n", t_rel);
+                fflush(g_linkev_csv);
+                pthread_mutex_unlock(&g_linkev_mtx);
+            }
+        }
+        atomic_store_explicit(&g_stats.link_state_up, up_now, memory_order_relaxed);
+        prev_up = up_now;
+    }
+
+    close(fd);
+    return NULL;
+}
+
+/* ── Netlink link-state monitor thread (independent cross-check) ─────────────
+ * Third measurement of link transitions, independent of the sysfs counters and
+ * the POLLPRI thread. Netlink RTM_NEWLINK notifications are generated by the
+ * linkwatch subsystem, which is itself rate-limited/coalescing, so netlink is
+ * NOT authoritative for counts during a fast flap — it is a cross-check whose
+ * divergence from the sysfs counter quantifies flap severity.
+ *
+ * Improvements over the naive version:
+ *  - Large SO_RCVBUFFORCE so a burst of events doesn't overflow the socket.
+ *  - NETLINK_OVERRUN / ENOBUFS detected and COUNTED (not silently lost), so a
+ *    residual undercount is surfaced honestly.
+ *  - Tighter poll timeout + full drain each wake to minimise the overflow
+ *    window.
+ *  - Does NOT own link_state_up (the POLLPRI thread does) — it only maintains
+ *    its own cross-check counters. */
 static void *netlink_thread(void *arg) {
     ThreadCtx *ctx = (ThreadCtx *)arg;
 
     int nl = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
     if (nl < 0) {
-        fprintf(stderr, "netlink socket: %s (link-event timing disabled)\n",
-                strerror(errno));
+        fprintf(stderr, "netlink socket: %s (cross-check disabled)\n", strerror(errno));
         return NULL;
     }
+
+    /* (a) Large receive buffer so bursts don't overflow. Link messages are
+     * tiny; 4MB holds many thousands. */
+    int rcvbuf = 4 * 1024 * 1024;
+    if (setsockopt(nl, SOL_SOCKET, SO_RCVBUFFORCE, &rcvbuf, sizeof(rcvbuf)) < 0)
+        setsockopt(nl, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+
     struct sockaddr_nl sa;
     memset(&sa, 0, sizeof(sa));
     sa.nl_family = AF_NETLINK;
-    sa.nl_groups = RTMGRP_LINK;   /* subscribe to link-state changes */
+    sa.nl_groups = RTMGRP_LINK;   /* link-state changes only */
     if (bind(nl, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
-        fprintf(stderr, "netlink bind: %s (link-event timing disabled)\n",
-                strerror(errno));
+        fprintf(stderr, "netlink bind: %s (cross-check disabled)\n", strerror(errno));
         close(nl);
         return NULL;
     }
 
-    /* Seed current state from sysfs operstate/carrier so the first transition
-     * is measured correctly. */
     int ok = 0;
     uint64_t carrier = read_sysfs_u64(ctx->iface_name, "carrier", &ok);
     int prev_up = ok ? (carrier != 0) : 1;
-    atomic_store_explicit(&g_stats.link_state_up, prev_up, memory_order_relaxed);
-
-    /* Track down-event time to report recovery duration on the following up. */
-    uint64_t last_down_ns = 0;
 
     struct pollfd pfd = { .fd = nl, .events = POLLIN };
-    uint8_t buf[8192];
+    uint8_t buf[16384];
 
     while (g_running) {
-        int pr = poll(&pfd, 1, 200);
+        /* (c) Short timeout so we revisit the socket often, minimising the
+         * window in which a burst can overflow. */
+        int pr = poll(&pfd, 1, 50);
         if (pr < 0) { if (errno == EINTR) continue; break; }
         if (pr == 0) continue;
 
-        ssize_t len = recv(nl, buf, sizeof(buf), MSG_DONTWAIT);
-        if (len <= 0) continue;
-
-        for (struct nlmsghdr *nh = (struct nlmsghdr *)buf;
-             NLMSG_OK(nh, (unsigned)len); nh = NLMSG_NEXT(nh, len)) {
-            if (nh->nlmsg_type == NLMSG_DONE) break;
-            if (nh->nlmsg_type != RTM_NEWLINK && nh->nlmsg_type != RTM_DELLINK)
-                continue;
-
-            struct ifinfomsg *ifi = (struct ifinfomsg *)NLMSG_DATA(nh);
-            if (ifi->ifi_index != ctx->ifindex) continue;   /* our iface only */
-
-            int up_now = (ifi->ifi_flags & IFF_LOWER_UP) ? 1 : 0;
-            if (up_now == prev_up) continue;                /* no transition */
-
-            uint64_t now = now_ns();
-            double t_rel = (now - g_start_ns) / 1e9;
-
-            if (!up_now) {
-                /* DOWN event */
-                atomic_fetch_add_explicit(&g_stats.link_down_nl, 1, memory_order_relaxed);
-                last_down_ns = now;
-                fprintf(stderr, "[+%.3fs] LINK DOWN (host NIC %s)\n",
-                        t_rel, ctx->iface_name);
-                if (g_linkev_csv) {
-                    pthread_mutex_lock(&g_linkev_mtx);
-                    fprintf(g_linkev_csv, "%.3f,DOWN,\n", t_rel);
-                    fflush(g_linkev_csv);
-                    pthread_mutex_unlock(&g_linkev_mtx);
+        /* Full drain each wake. */
+        for (;;) {
+            ssize_t len = recv(nl, buf, sizeof(buf), MSG_DONTWAIT);
+            if (len < 0) {
+                /* (b) Overflow: kernel dropped messages. Count it, and note the
+                 * socket must be re-synced (the datagram is lost). */
+                if (errno == ENOBUFS) {
+                    atomic_fetch_add_explicit(&g_stats.netlink_overflows, 1,
+                                              memory_order_relaxed);
+                    continue;   /* keep draining */
                 }
-            } else {
-                /* UP event */
-                atomic_fetch_add_explicit(&g_stats.link_up_nl, 1, memory_order_relaxed);
-                double down_ms = last_down_ns ? (now - last_down_ns) / 1e6 : -1.0;
-                if (down_ms >= 0)
-                    fprintf(stderr, "[+%.3fs] LINK UP (down %.0fms)\n", t_rel, down_ms);
-                else
-                    fprintf(stderr, "[+%.3fs] LINK UP\n", t_rel);
-                if (g_linkev_csv) {
-                    pthread_mutex_lock(&g_linkev_mtx);
-                    if (down_ms >= 0) fprintf(g_linkev_csv, "%.3f,UP,%.0f\n", t_rel, down_ms);
-                    else              fprintf(g_linkev_csv, "%.3f,UP,\n", t_rel);
-                    fflush(g_linkev_csv);
-                    pthread_mutex_unlock(&g_linkev_mtx);
-                }
+                break;          /* EAGAIN — queue empty */
             }
-            atomic_store_explicit(&g_stats.link_state_up, up_now, memory_order_relaxed);
-            prev_up = up_now;
+            if (len == 0) break;
+
+            for (struct nlmsghdr *nh = (struct nlmsghdr *)buf;
+                 NLMSG_OK(nh, (unsigned)len); nh = NLMSG_NEXT(nh, len)) {
+                if (nh->nlmsg_type == NLMSG_DONE) break;
+                if (nh->nlmsg_type == NLMSG_OVERRUN) {
+                    atomic_fetch_add_explicit(&g_stats.netlink_overflows, 1,
+                                              memory_order_relaxed);
+                    continue;
+                }
+                if (nh->nlmsg_type != RTM_NEWLINK && nh->nlmsg_type != RTM_DELLINK)
+                    continue;
+                struct ifinfomsg *ifi = (struct ifinfomsg *)NLMSG_DATA(nh);
+                if (ifi->ifi_index != ctx->ifindex) continue;
+                int up_now = (ifi->ifi_flags & IFF_LOWER_UP) ? 1 : 0;
+                if (up_now == prev_up) continue;
+                if (!up_now) atomic_fetch_add_explicit(&g_stats.link_down_nl, 1, memory_order_relaxed);
+                else         atomic_fetch_add_explicit(&g_stats.link_up_nl, 1, memory_order_relaxed);
+                prev_up = up_now;
+            }
         }
     }
 
@@ -1860,13 +1983,20 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "warning: errqueue thread failed; "
                             "TX driver-xmit count disabled\n");
     }
-    /* Netlink link-state monitor (event-driven, unpinned). */
+    /* POLLPRI carrier-state monitor (primary current-state + timing). */
+    pthread_t cp_tid; int have_cp = 0;
+    if (pthread_create(&cp_tid, NULL, carrier_thread, &ctx) == 0)
+        have_cp = 1;
+    else
+        fprintf(stderr, "warning: carrier thread failed; "
+                        "link-state tracking degraded\n");
+    /* Netlink link-state monitor (independent cross-check, unpinned). */
     pthread_t nl_tid; int have_nl = 0;
     if (pthread_create(&nl_tid, NULL, netlink_thread, &ctx) == 0)
         have_nl = 1;
     else
         fprintf(stderr, "warning: netlink thread failed; "
-                        "link-event timing disabled\n");
+                        "link cross-check disabled\n");
     /* Small delay so RX is definitely in its poll loop. */
     sleep_ns(5 * 1000000);
     if (pthread_create(&tx_tid, NULL, tx_thread, &ctx) != 0) {
@@ -1989,6 +2119,7 @@ int main(int argc, char *argv[]) {
       if (ok) g_stats.carrier_changes = c - g_stats.carrier_changes_base;
     }
     if (have_nl) pthread_join(nl_tid, NULL);
+    if (have_cp) pthread_join(cp_tid, NULL);
     uint64_t end_ns  = now_ns();
     uint64_t nic_crc = read_nic_crc_errors(iface);
     print_stats(csv, end_ns - start_ns, nic_crc);
