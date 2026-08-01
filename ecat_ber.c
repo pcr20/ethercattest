@@ -83,6 +83,23 @@
 
 /* ESC diagnostic register base addresses (ETG.1000.6) */
 #define ESC_REG_CRC_BASE     0x0300  /* CRC error counters, one per port pair */
+
+/* ── EtherCAT wire byte order: LITTLE-ENDIAN ────────────────────────────────
+ * Per ETG.1000.4, ALL EtherCAT fields are little-endian on the wire: the frame
+ * header (11-bit length + 4-bit type), every datagram len/flags field
+ * (including the 'more' bit = bit 15 of the LE value), and the WKC. Using
+ * htons/ntohs (big-endian) here is a protocol violation that a real ESC
+ * detects instantly: it reads a byte-swapped frame header (type=13, garbage
+ * length), declares the frame invalid, and cuts it off mid-forwarding —
+ * returning ~16-byte runts for every frame. (A passive loopback plug never
+ * exposes this because nothing on the wire interprets the bytes.) */
+static inline void le16put(uint8_t *p, uint16_t v) {
+    p[0] = (uint8_t)(v & 0xFF);
+    p[1] = (uint8_t)(v >> 8);
+}
+static inline uint16_t le16get(const uint8_t *p) {
+    return (uint16_t)(p[0] | ((uint16_t)p[1] << 8));
+}
 #define ESC_REG_LOSTLNK_BASE 0x0310  /* Lost link counters, one per port      */
 
 /* Max slaves we support for APRD polling */
@@ -649,12 +666,12 @@ static int build_frame(uint8_t *buf, int buflen,
 
     /* Datagram 0: NOP carrying payload */
     int has_more_after_nop = (!loopback && num_slaves > 0) ? 1 : 0;
-    uint16_t nop_len_flags = htons((uint16_t)(nop_payload & 0x07FF)
+    uint16_t nop_len_flags = (uint16_t)((nop_payload & 0x07FF)
                                    | (has_more_after_nop ? 0x8000 : 0));
     buf[pos++] = ECAT_CMD_NOP;
     buf[pos++] = ECAT_IDX_NOP;
     buf[pos++] = 0; buf[pos++] = 0; buf[pos++] = 0; buf[pos++] = 0; /* addr */
-    memcpy(buf + pos, &nop_len_flags, 2); pos += 2;
+    le16put(buf + pos, nop_len_flags); pos += 2;   /* LE per ETG.1000.4 */
     buf[pos++] = 0; buf[pos++] = 0;  /* IRQ */
     /* Payload: [seq(8)][crc32c(4)][random(N)].
      * Ensure the payload is at least large enough for the header. */
@@ -679,11 +696,11 @@ static int build_frame(uint8_t *buf, int buflen,
     if (!loopback && num_slaves > 0) {
         /* Datagram 1: BRD reading register 0x0000 (type/revision, safe) */
         int has_more_after_brd = (num_slaves > 0) ? 1 : 0;
-        uint16_t brd_lf = htons(1 | (has_more_after_brd ? 0x8000 : 0));
+        uint16_t brd_lf = (uint16_t)(1 | (has_more_after_brd ? 0x8000 : 0));
         buf[pos++] = ECAT_CMD_BRD;
         buf[pos++] = ECAT_IDX_BRD;
         buf[pos++] = 0; buf[pos++] = 0; buf[pos++] = 0; buf[pos++] = 0;
-        memcpy(buf + pos, &brd_lf, 2); pos += 2;
+        le16put(buf + pos, brd_lf); pos += 2;   /* LE per ETG.1000.4 */
         buf[pos++] = 0; buf[pos++] = 0;  /* IRQ */
         buf[pos++] = 0;                   /* 1 byte data */
         buf[pos++] = 0; buf[pos++] = 0;  /* WKC */
@@ -694,7 +711,7 @@ static int build_frame(uint8_t *buf, int buflen,
          * this read; they would need a second APRD set (see parse side). */
         for (int s = 0; s < num_slaves; s++) {
             int is_last = (s == num_slaves - 1);
-            uint16_t aprd_lf = htons(16 | (is_last ? 0 : 0x8000));
+            uint16_t aprd_lf = (uint16_t)(16 | (is_last ? 0 : 0x8000));
             /* APRD address: upper 16 bits = auto-increment position (negated),
              * lower 16 bits = register offset.
              * Auto-increment: slave 0 sees address 0, slave 1 sees -1, etc.
@@ -708,7 +725,7 @@ static int build_frame(uint8_t *buf, int buflen,
             buf[pos++] = (node_le >> 8) & 0xFF;
             buf[pos++] = 0x00;   /* reg 0x0300 low byte */
             buf[pos++] = 0x03;   /* reg 0x0300 high byte */
-            memcpy(buf + pos, &aprd_lf, 2); pos += 2;
+            le16put(buf + pos, aprd_lf); pos += 2;   /* LE per ETG.1000.4 */
             buf[pos++] = 0; buf[pos++] = 0;  /* IRQ */
             memset(buf + pos, 0, 16);  /* 16 bytes data (zeroed, slaves fill in) */
             pos += 16;
@@ -718,8 +735,8 @@ static int build_frame(uint8_t *buf, int buflen,
 
     /* EtherCAT header: total datagram length, type=1 */
     int ecat_payload_len = pos - ETH_HDR_LEN - ECAT_HDR_LEN;
-    uint16_t ecat_hdr = htons((uint16_t)(ecat_payload_len & 0x07FF) | (0x1 << 12));
-    memcpy(buf + ETH_HDR_LEN, &ecat_hdr, 2);
+    uint16_t ecat_hdr = (uint16_t)((ecat_payload_len & 0x07FF) | (0x1 << 12));
+    le16put(buf + ETH_HDR_LEN, ecat_hdr);   /* LE per ETG.1000.4 */
 
     /* Self-check: pos must never exceed buflen. If it does, the overhead
      * budget above disagrees with what was actually written (exactly the class
@@ -747,9 +764,7 @@ static uint64_t parse_return_frame(const uint8_t *buf, int len,
 
     /* Datagram 0: NOP — extract sequence number from payload */
     if (pos + ECAT_DG_HDR_LEN > len) return UINT64_MAX;
-    uint16_t lf;
-    memcpy(&lf, buf + pos + 6, 2);
-    lf = ntohs(lf);
+    uint16_t lf = le16get(buf + pos + 6);   /* LE per ETG.1000.4 */
     uint16_t dg_len = lf & 0x07FF;
     pos += ECAT_DG_HDR_LEN;
     if (pos + dg_len + ECAT_DG_WKC_LEN > len) return UINT64_MAX;
@@ -781,13 +796,11 @@ static uint64_t parse_return_frame(const uint8_t *buf, int len,
 
     /* Datagram 1: BRD — read WKC */
     if (pos + ECAT_DG_HDR_LEN > len) return ret_seq;
-    memcpy(&lf, buf + pos + 6, 2); lf = ntohs(lf);
+    lf = le16get(buf + pos + 6);   /* LE */
     dg_len = lf & 0x07FF;
     pos += ECAT_DG_HDR_LEN + dg_len;
     if (pos + ECAT_DG_WKC_LEN > len) return ret_seq;
-    uint16_t brd_wkc;
-    memcpy(&brd_wkc, buf + pos, 2);
-    brd_wkc = ntohs(brd_wkc);
+    uint16_t brd_wkc = le16get(buf + pos);   /* WKC is LE too */
     pos += ECAT_DG_WKC_LEN;
 
     if (brd_wkc != (uint16_t)num_slaves) {
@@ -798,14 +811,12 @@ static uint64_t parse_return_frame(const uint8_t *buf, int len,
     /* Datagrams 2..N+1: APRD per slave */
     for (int s = 0; s < num_slaves && s < MAX_SLAVES; s++) {
         if (pos + ECAT_DG_HDR_LEN > len) break;
-        memcpy(&lf, buf + pos + 6, 2); lf = ntohs(lf);
+        lf = le16get(buf + pos + 6);   /* LE */
         dg_len = lf & 0x07FF;
         pos += ECAT_DG_HDR_LEN;
         if (pos + dg_len + ECAT_DG_WKC_LEN > len) break;
 
-        uint16_t aprd_wkc;
-        memcpy(&aprd_wkc, buf + pos + dg_len, 2);
-        aprd_wkc = ntohs(aprd_wkc);
+        uint16_t aprd_wkc = le16get(buf + pos + dg_len);   /* WKC is LE */
 
         if (aprd_wkc == 1 && dg_len >= 16) {
             /* Bytes 0-7: CRC error registers 0x0300-0x0307
