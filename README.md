@@ -4,7 +4,62 @@ Tests EtherCAT physical layer bit error rate by saturating a slave chain
 with NOP frames and logging CRC errors from both the host NIC PHY and
 ESC slave registers.
 
+## TX pipeline: three counters
+
+The tool measures the transmit path at three stages so you can see exactly
+where frames accumulate:
+
+- **TX enqueued (ring)** — `send()` calls the kernel accepted into the
+  socket/qdisc/ring. This is "handed to the kernel", not "on the wire".
+- **TX driver-xmit (sw ts)** — counted from software TX timestamp
+  completions drained off the socket error queue (`MSG_ERRQUEUE`). The
+  timestamp is taken in the driver's transmit path, just before the frame is
+  handed to hardware. The RTL8125 has **no PTP hardware clock**
+  (`ethtool -T` shows `PTP Hardware Clock: none`), so only *software* TX
+  timestamping is available — this stage is strictly upstream of the wire.
+- **TX on wire (ethtool)** — the driver's `tx_packets` hardware counter, read
+  via `ethtool -S`. On this NIC it is the **authoritative on-wire figure**
+  (closer to the wire than the software timestamp).
+
+Two gaps are derived and printed:
+
+- `enqueued − driver-xmit` = socket/qdisc backlog
+- `driver-xmit − wire` = driver→hardware backlog
+
+On a passive loopback plug you'll see the driver→wire gap grow (the plug's
+latency backs frames up in the ring); on a real slave chain both gaps stay
+near zero. This is what quantifies the TX buffering that older builds
+mistook for loss.
+
+## Independent payload integrity check (CRC32C)
+
+Each frame carries, in its NOP payload:
+
+```
+[ 8 bytes ] sequence number
+[ 4 bytes ] CRC32C over (sequence number ++ payload)
+[ N bytes ] pseudo-random payload (xorshift64 seeded from the sequence number)
+```
+
+On receive the tool recomputes CRC32C over the received sequence bytes and
+payload and compares to the embedded value. A mismatch increments
+**Payload CRC err** and is flagged `*** PAYLOAD CORRUPTION (FCS-independent)
+***`.
+
+This is **independent of the Ethernet FCS**. The link FCS is checked and
+regenerated at every hop, so a slave that corrupts data internally and then
+emits a valid FCS would show **zero** NIC CRC errors but a **non-zero**
+payload CRC error. That fault class is invisible to the FCS-based BER and is
+exactly what this check exists to catch. The payload is genuinely
+pseudo-random (not a constant), which also exercises the 100BASE-TX MLT-3
+scrambler far more realistically than a fixed fill.
+
+CRC32C uses the SSE4.2 hardware instruction on the Ryzen (falls back to a
+software table on CPUs without it). Build with `-msse4.2` (the Makefile does
+this).
+
 ## Architecture
+
 
 The tool runs three threads so the receive drain can never become the
 bottleneck and the send side is limited only by bus saturation:
@@ -257,11 +312,32 @@ real losses:
    **drain barrier** at shutdown: it stops TX, waits (up to 2s, or until
    returns catch up) for in-flight frames to come back, and only then sweeps
    the sequence window for genuine losses. In-flight frames at stop time are
-   no longer miscounted as lost.
+   no longer miscounted as lost. In addition, TX now **bounds outstanding
+   frames to `MAX_INFLIGHT` (4000)** so the sent/received gap can never grow
+   unboundedly on a high-latency link; this keeps backpressure tied to the
+   wire rather than to buffering, and leaves almost nothing stuck at
+   shutdown. Any residual shutdown "loss" on a passive plug is TX-side ring
+   buffering, not wire loss.
 
-The remaining lost/`Unknown-dup seq` counts you may see on `lo` specifically
-are the loopback double-delivery artifact described below — not present on a
-real wire.
+**Bottom line on the passive plug:** it validates the tooling (bus
+saturation, zero-drop drain, clean CRC baseline) but its latency inflation
+and — on `lo` — double delivery make its loss/in-flight figures unreliable.
+For trustworthy end-to-end numbers, test with a real slave (below).
+
+### Validate with one real slave, not the plug
+
+The passive loopback plug cannot exercise the per-slave CRC/BRD/APRD path and
+distorts in-flight accounting. Insert a single AX58100 slave and run:
+
+```bash
+sudo ./ecat_ber -i enp2s0 -s 1 -v
+```
+
+A real slave returns each frame exactly once and regenerates the signal with
+microsecond latency, so in-flight stays near zero, shutdown is clean, and the
+BRD working-counter / per-slave CRC registers become meaningful. Scale to
+`-s 4` once the single-slave case looks right.
+
 
 ### Testing against the `lo` interface shows inflated lost/dup counts
 

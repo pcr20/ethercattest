@@ -1,5 +1,5 @@
 CC      = gcc
-CFLAGS  = -O2 -Wall -Wextra -std=c11
+CFLAGS  = -O2 -Wall -Wextra -std=c11 -msse4.2
 LDFLAGS = -lm -lpthread
 TARGET  = ecat_ber
 

@@ -63,6 +63,8 @@
 #include <net/ethernet.h>
 #include <linux/if_packet.h>
 #include <linux/if_ether.h>
+#include <linux/net_tstamp.h>
+#include <linux/errqueue.h>
 #include <linux/ethtool.h>
 #include <linux/sockios.h>
 #include <arpa/inet.h>
@@ -97,6 +99,132 @@
 /* Poll ESC counters every this many frames */
 #define ESC_POLL_INTERVAL    10000
 
+/* ── NOP payload layout ─────────────────────────────────────────────────────
+ *   [ 8 bytes ] sequence number (uint64 LE)
+ *   [ 4 bytes ] CRC32C over (seq bytes ++ payload bytes)
+ *   [ N bytes ] pseudo-random payload (xorshift64 seeded from seq)
+ * The CRC covers the 8 seq bytes and all N payload bytes. */
+#define PL_SEQ_OFF   0
+#define PL_SEQ_LEN   8
+#define PL_CRC_OFF   8
+#define PL_CRC_LEN   4
+#define PL_DATA_OFF  12          /* pseudo-random payload starts here */
+#define PL_HDR_LEN   (PL_SEQ_LEN + PL_CRC_LEN)   /* 12 bytes before random data */
+
+/* ── CRC32C (Castagnoli) ────────────────────────────────────────────────────
+ * Hardware SSE4.2 path when available (Ryzen 5300U has it), portable
+ * table-driven software fallback otherwise. Both ends use the same function,
+ * so the choice is transparent to correctness. */
+#if defined(__x86_64__) || defined(__i386__)
+#include <cpuid.h>
+#include <nmmintrin.h>   /* _mm_crc32_u8/u64 */
+static int g_have_sse42 = 0;
+static void crc32c_detect(void) {
+    unsigned int eax, ebx, ecx, edx;
+    if (__get_cpuid(1, &eax, &ebx, &ecx, &edx))
+        g_have_sse42 = (ecx & bit_SSE4_2) ? 1 : 0;
+}
+#else
+static int g_have_sse42 = 0;
+static void crc32c_detect(void) { g_have_sse42 = 0; }
+#endif
+
+static uint32_t g_crc32c_tab[256];
+static void crc32c_init_table(void) {
+    for (uint32_t i = 0; i < 256; i++) {
+        uint32_t c = i;
+        for (int k = 0; k < 8; k++)
+            c = (c & 1) ? (0x82F63B78u ^ (c >> 1)) : (c >> 1);
+        g_crc32c_tab[i] = c;
+    }
+}
+static void crc32c_init(void) { crc32c_detect(); crc32c_init_table(); }
+
+static inline uint32_t crc32c_sw(uint32_t crc, const uint8_t *p, size_t n) {
+    crc = ~crc;
+    for (size_t i = 0; i < n; i++)
+        crc = g_crc32c_tab[(crc ^ p[i]) & 0xFF] ^ (crc >> 8);
+    return ~crc;
+}
+
+static inline uint32_t crc32c(const uint8_t *p, size_t n) {
+#if defined(__x86_64__) || defined(__i386__)
+    if (g_have_sse42) {
+        uint32_t crc = ~0u;
+        size_t i = 0;
+    #if defined(__x86_64__)
+        for (; i + 8 <= n; i += 8) {
+            uint64_t v; memcpy(&v, p + i, 8);
+            crc = (uint32_t)_mm_crc32_u64(crc, v);
+        }
+    #endif
+        for (; i < n; i++) crc = _mm_crc32_u8(crc, p[i]);
+        return ~crc;
+    }
+#endif
+    return crc32c_sw(0, p, n);
+}
+
+/* Incremental CRC32C: process a chunk given the running *inverted* state.
+ * Call crc32c_begin() to get the initial state, feed chunks with
+ * crc32c_update(), finish with crc32c_final(). This lets us CRC two
+ * non-contiguous regions (seq and payload, separated by the CRC hole) as one
+ * logical byte stream. */
+static inline uint32_t crc32c_begin(void) { return ~0u; }
+static inline uint32_t crc32c_update(uint32_t crc, const uint8_t *p, size_t n) {
+#if defined(__x86_64__) || defined(__i386__)
+    if (g_have_sse42) {
+        size_t i = 0;
+    #if defined(__x86_64__)
+        for (; i + 8 <= n; i += 8) {
+            uint64_t v; memcpy(&v, p + i, 8);
+            crc = (uint32_t)_mm_crc32_u64(crc, v);
+        }
+    #endif
+        for (; i < n; i++) crc = _mm_crc32_u8(crc, p[i]);
+        return crc;
+    }
+#endif
+    for (size_t i = 0; i < n; i++)
+        crc = g_crc32c_tab[(crc ^ p[i]) & 0xFF] ^ (crc >> 8);
+    return crc;
+}
+static inline uint32_t crc32c_final(uint32_t crc) { return ~crc; }
+
+/* Convenience: CRC32C over two regions treated as one contiguous stream. */
+static inline uint32_t crc32c_chain(const uint8_t *a, size_t na,
+                                    const uint8_t *b, size_t nb) {
+    uint32_t crc = crc32c_begin();
+    crc = crc32c_update(crc, a, na);
+    crc = crc32c_update(crc, b, nb);
+    return crc32c_final(crc);
+}
+
+/* ── xorshift64 PRNG (deterministic per-frame payload fill) ──────────────────
+ * Seeded from the sequence number. Spectrally rich enough to properly exercise
+ * the 100BASE-TX MLT-3 scrambler (unlike a constant fill). */
+static inline uint64_t xorshift64(uint64_t *s) {
+    uint64_t x = *s;
+    x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+    *s = x;
+    return x;
+}
+/* Fill buf[0..n) with pseudo-random bytes seeded from seq. Seed is offset by a
+ * constant so seq=0 doesn't yield the xorshift fixed point (0 -> all zeros). */
+static inline void fill_random_payload(uint8_t *buf, size_t n, uint64_t seq) {
+    uint64_t s = seq ^ 0x9E3779B97F4A7C15ULL;   /* avoid zero-state */
+    if (s == 0) s = 0xDEADBEEFCAFEBABEULL;
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        uint64_t r = xorshift64(&s);
+        memcpy(buf + i, &r, 8);
+    }
+    if (i < n) {
+        uint64_t r = xorshift64(&s);
+        memcpy(buf + i, &r, n - i);
+    }
+}
+
 /* ── Frame layout helpers ───────────────────────────────────────────────── */
 typedef struct {
     uint8_t  cmd;
@@ -119,13 +247,19 @@ typedef struct {
     uint8_t  esc_lostlnk_prev[MAX_SLAVES][4];
     uint32_t brd_wkc_expected;   /* = num_slaves */
     /* Cross-thread counters — atomic. Owner in comment. */
-    _Atomic uint64_t frames_sent;      /* TX thread */
-    _Atomic uint64_t frames_received;  /* RX thread */
-    _Atomic uint64_t frames_lost;      /* TX thread (retire) */
-    _Atomic uint64_t seq_bad;          /* RX thread */
-    _Atomic uint64_t tx_backpressure;  /* TX thread — EAGAIN, normal */
-    _Atomic uint64_t brd_wkc_mismatches;/* RX thread */
-    _Atomic uint64_t kernel_drops;     /* main thread, from PACKET_STATISTICS */
+    _Atomic uint64_t frames_enqueued;  /* TX thread — send() accepted (ring)   */
+    _Atomic uint64_t frames_received;  /* RX thread                            */
+    _Atomic uint64_t frames_lost;      /* TX thread (retire)                   */
+    _Atomic uint64_t seq_bad;          /* RX thread                            */
+    _Atomic uint64_t tx_backpressure;  /* TX thread — EAGAIN/in-flight cap     */
+    _Atomic uint64_t brd_wkc_mismatches;/* RX thread                           */
+    _Atomic uint64_t kernel_drops;     /* main thread, from PACKET_STATISTICS  */
+    _Atomic uint64_t payload_crc_errors;/* RX thread — CRC32C mismatch         */
+    _Atomic uint64_t tx_ts_completions;/* errqueue thread — sw TX timestamps   */
+    /* On-wire TX packet count (ethtool tx_packets). Owned by supervisor. */
+    uint64_t tx_wire_packets;          /* cumulative, from ethtool             */
+    uint64_t tx_wire_base;             /* baseline at start                    */
+    int      tx_ts_supported;          /* 1 if sw TX timestamping active       */
 } Stats;
 
 /* g_stats is defined here (ahead of the SeqTrack helpers that update it). */
@@ -258,13 +392,16 @@ static int get_ifindex(int sock, const char *iface) {
     return ifr.ifr_ifindex;
 }
 
-/* ── ethtool CRC / error counter read ──────────────────────────────────── */
-/*
- * RTL8125 exposes "rx_crc_errors" in ethtool -S.
- * RTL8111 exposes "rx_crc_errors" similarly.
- * We iterate gstrings to find it by name — this works across chipsets.
- */
-static uint64_t read_nic_crc_errors(const char *iface) {
+/* ── ethtool counter reader ─────────────────────────────────────────────────
+ * Generic helper: sum all ethtool -S counters whose name contains ANY of the
+ * given substrings (case-insensitive on the needles as written). Used for both
+ * CRC/FCS error counting and TX-packet (on-wire) counting across chipsets.
+ *
+ * exclude, if non-NULL, is a substring that disqualifies a match (e.g. exclude
+ * "err" when summing tx_packets so we don't pick up tx_*_errors). */
+static uint64_t ethtool_sum_counters(const char *iface,
+                                     const char *const *needles, int n_needles,
+                                     const char *exclude) {
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (fd < 0) return 0;
 
@@ -272,7 +409,6 @@ static uint64_t read_nic_crc_errors(const char *iface) {
     memset(&ifr, 0, sizeof(ifr));
     strncpy(ifr.ifr_name, iface, IFNAMSIZ - 1);
 
-    /* Get number of stats */
     struct ethtool_drvinfo drvinfo;
     drvinfo.cmd = ETHTOOL_GDRVINFO;
     ifr.ifr_data = (void *)&drvinfo;
@@ -281,7 +417,6 @@ static uint64_t read_nic_crc_errors(const char *iface) {
     uint32_t n_stats = drvinfo.n_stats;
     if (n_stats == 0) { close(fd); return 0; }
 
-    /* Get stat strings */
     size_t sset_size = sizeof(struct ethtool_gstrings) + n_stats * ETH_GSTRING_LEN;
     struct ethtool_gstrings *gstrings = calloc(1, sset_size);
     if (!gstrings) { close(fd); return 0; }
@@ -291,7 +426,6 @@ static uint64_t read_nic_crc_errors(const char *iface) {
     ifr.ifr_data = (void *)gstrings;
     if (ioctl(fd, SIOCETHTOOL, &ifr) < 0) { free(gstrings); close(fd); return 0; }
 
-    /* Get stat values */
     size_t stats_size = sizeof(struct ethtool_stats) + n_stats * sizeof(uint64_t);
     struct ethtool_stats *stats = calloc(1, stats_size);
     if (!stats) { free(gstrings); close(fd); return 0; }
@@ -300,21 +434,42 @@ static uint64_t read_nic_crc_errors(const char *iface) {
     ifr.ifr_data = (void *)stats;
     if (ioctl(fd, SIOCETHTOOL, &ifr) < 0) { free(gstrings); free(stats); close(fd); return 0; }
 
-    uint64_t crc_total = 0;
+    uint64_t total = 0;
     for (uint32_t i = 0; i < n_stats; i++) {
         char name[ETH_GSTRING_LEN + 1];
         memcpy(name, gstrings->data + i * ETH_GSTRING_LEN, ETH_GSTRING_LEN);
         name[ETH_GSTRING_LEN] = '\0';
-        /* Match common CRC counter names across Realtek and Intel drivers */
-        if (strstr(name, "crc") || strstr(name, "CRC") || strstr(name, "fcs")) {
-            crc_total += stats->data[i];
+        if (exclude && strstr(name, exclude)) continue;
+        for (int k = 0; k < n_needles; k++) {
+            if (strstr(name, needles[k])) { total += stats->data[i]; break; }
         }
     }
 
     free(gstrings);
     free(stats);
     close(fd);
-    return crc_total;
+    return total;
+}
+
+/* CRC/FCS error counter (RX). */
+static uint64_t read_nic_crc_errors(const char *iface) {
+    static const char *const needles[] = { "crc", "CRC", "fcs" };
+    return ethtool_sum_counters(iface, needles, 3, NULL);
+}
+
+/* On-wire TX packet counter. Sums the driver's transmitted-packet counters,
+ * excluding any *error* counters. Names vary: r8169/RTL8125 exposes
+ * "tx_packets"; some drivers use "tx_unicast"+"tx_multicast"+"tx_broadcast".
+ * We prefer an exact "tx_packets" if present, else fall back to the sum of the
+ * per-cast counters. Returns 0 if none found (caller notes unavailability). */
+static uint64_t read_nic_tx_packets(const char *iface) {
+    /* First try the single authoritative counter. */
+    static const char *const exact[] = { "tx_packets" };
+    uint64_t v = ethtool_sum_counters(iface, exact, 1, "err");
+    if (v) return v;
+    /* Fall back to per-cast counters. */
+    static const char *const cast[] = { "tx_unicast", "tx_multicast", "tx_broadcast" };
+    return ethtool_sum_counters(iface, cast, 3, "err");
 }
 
 /* ── Build EtherCAT frame ───────────────────────────────────────────────── */
@@ -360,9 +515,23 @@ static int build_frame(uint8_t *buf, int buflen,
     buf[pos++] = 0; buf[pos++] = 0; buf[pos++] = 0; buf[pos++] = 0; /* addr */
     memcpy(buf + pos, &nop_len_flags, 2); pos += 2;
     buf[pos++] = 0; buf[pos++] = 0;  /* IRQ */
-    /* Fill payload with sequence number + pattern */
-    memcpy(buf + pos, &seq, sizeof(seq));
-    memset(buf + pos + sizeof(seq), 0xA5, nop_payload - sizeof(seq));
+    /* Payload: [seq(8)][crc32c(4)][random(N)].
+     * Ensure the payload is at least large enough for the header. */
+    if (nop_payload < PL_HDR_LEN) nop_payload = PL_HDR_LEN;
+    {
+        uint8_t *pl = buf + pos;
+        /* seq (LE) */
+        memcpy(pl + PL_SEQ_OFF, &seq, PL_SEQ_LEN);
+        /* pseudo-random payload after the 12-byte header */
+        int rnd_len = nop_payload - PL_DATA_OFF;
+        if (rnd_len < 0) rnd_len = 0;
+        fill_random_payload(pl + PL_DATA_OFF, rnd_len, seq);
+        /* CRC32C over seq bytes ++ random payload bytes, as one logical
+         * stream (they are separated on the wire by the 4-byte CRC hole). */
+        uint32_t crc = crc32c_chain(pl + PL_SEQ_OFF, PL_SEQ_LEN,
+                                    pl + PL_DATA_OFF, (size_t)rnd_len);
+        memcpy(pl + PL_CRC_OFF, &crc, PL_CRC_LEN);
+    }
     pos += nop_payload;
     buf[pos++] = 0; buf[pos++] = 0;  /* WKC */
 
@@ -436,7 +605,24 @@ static uint64_t parse_return_frame(const uint8_t *buf, int len,
     if (pos + dg_len + ECAT_DG_WKC_LEN > len) return UINT64_MAX;
 
     uint64_t ret_seq = UINT64_MAX;
-    if (dg_len >= 8) memcpy(&ret_seq, buf + pos, 8);
+    if (dg_len >= PL_HDR_LEN) {
+        const uint8_t *pl = buf + pos;
+        memcpy(&ret_seq, pl + PL_SEQ_OFF, PL_SEQ_LEN);
+
+        /* Independent payload integrity check: recompute CRC32C over
+         * (seq ++ random payload) and compare to the embedded field. This is
+         * independent of the Ethernet FCS — it catches corruption that a slave
+         * regenerating a valid FCS would otherwise mask. */
+        uint32_t embedded;
+        memcpy(&embedded, pl + PL_CRC_OFF, PL_CRC_LEN);
+        int rnd_len = (int)dg_len - PL_DATA_OFF;
+        if (rnd_len < 0) rnd_len = 0;
+        uint32_t calc = crc32c_chain(pl + PL_SEQ_OFF, PL_SEQ_LEN,
+                                     pl + PL_DATA_OFF, (size_t)rnd_len);
+        if (calc != embedded)
+            atomic_fetch_add_explicit(&g_stats.payload_crc_errors, 1,
+                                      memory_order_relaxed);
+    }
     pos += dg_len + ECAT_DG_WKC_LEN;
 
     if (loopback || num_slaves == 0) return ret_seq;
@@ -506,13 +692,16 @@ static void print_stats(FILE *csv, uint64_t elapsed_ns, uint64_t new_nic_crc) {
     double elapsed_s  = elapsed_ns / 1e9;
 
     /* Snapshot atomics once for a consistent-ish view. */
-    uint64_t sent     = atomic_load_explicit(&g_stats.frames_sent, memory_order_relaxed);
+    uint64_t sent     = atomic_load_explicit(&g_stats.frames_enqueued, memory_order_relaxed);
     uint64_t rcvd     = atomic_load_explicit(&g_stats.frames_received, memory_order_relaxed);
     uint64_t lost     = atomic_load_explicit(&g_stats.frames_lost, memory_order_relaxed);
     uint64_t bad      = atomic_load_explicit(&g_stats.seq_bad, memory_order_relaxed);
     uint64_t backp    = atomic_load_explicit(&g_stats.tx_backpressure, memory_order_relaxed);
     uint64_t wkcmm    = atomic_load_explicit(&g_stats.brd_wkc_mismatches, memory_order_relaxed);
     uint64_t kdrops   = atomic_load_explicit(&g_stats.kernel_drops, memory_order_relaxed);
+    uint64_t plcrc    = atomic_load_explicit(&g_stats.payload_crc_errors, memory_order_relaxed);
+    uint64_t tsc      = atomic_load_explicit(&g_stats.tx_ts_completions, memory_order_relaxed);
+    uint64_t wire     = g_stats.tx_wire_packets;
 
     uint64_t total_bits = sent * 12000ULL;
 
@@ -536,16 +725,33 @@ static void print_stats(FILE *csv, uint64_t elapsed_ns, uint64_t new_nic_crc) {
         fps = (double)(sent - prev_sent) / ((elapsed_ns - prev_ns) / 1e9);
     prev_sent = sent; prev_ns = elapsed_ns;
 
+    /* TX pipeline gaps. Guard against transient negatives. */
+    int64_t gap_ring_drv  = (int64_t)sent - (int64_t)tsc;   /* socket/qdisc backlog */
+    int64_t gap_drv_wire  = (int64_t)tsc  - (int64_t)wire;  /* driver->hw backlog   */
+    if (gap_ring_drv < 0) gap_ring_drv = 0;
+    if (gap_drv_wire < 0) gap_drv_wire = 0;
+
     printf("\n── EtherCAT BER Test ─────────────────────────────────────\n");
     printf("  Elapsed:        %.1f s\n", elapsed_s);
-    printf("  Frames sent:    %lu\n",    sent);
+    printf("  ── TX pipeline ─────────────────────────────────────────\n");
+    printf("  TX enqueued (ring):      %lu\n", sent);
+    if (g_stats.tx_ts_supported)
+        printf("  TX driver-xmit (sw ts):  %lu   (gap vs ring: %ld)\n",
+               tsc, (long)gap_ring_drv);
+    else
+        printf("  TX driver-xmit (sw ts):  n/a (unsupported)\n");
+    printf("  TX on wire (ethtool):    %lu   (gap vs driver: %ld)\n",
+           wire, (long)gap_drv_wire);
+    printf("  ── RX / integrity ──────────────────────────────────────\n");
     printf("  Frames rcvd:    %lu\n",    rcvd);
     printf("  Throughput:     %.0f fps  (%.1f Mbit/s)\n",
            fps, fps * 12000.0 / 1e6);
     printf("  In flight:      %ld  (queue lag, not loss)\n", (long)in_flight);
     printf("  Lost frames:    %lu  (aged out, never returned)\n", lost);
     printf("  Unknown/dup seq:%lu\n",    bad);
-    printf("  TX backpressure:%lu  (EAGAIN = bus saturation, normal)\n", backp);
+    printf("  Payload CRC err:%lu  %s\n", plcrc,
+           plcrc ? "*** PAYLOAD CORRUPTION (FCS-independent) ***" : "(clean)");
+    printf("  TX backpressure:%lu  (EAGAIN/in-flight cap, normal)\n", backp);
     printf("  Kernel RX drops:%lu  %s\n", kdrops,
            kdrops ? "*** DRAIN SATURATED — BER INVALID ***" : "(none, drain healthy)");
     printf("  BRD WKC mismatches: %lu\n", wkcmm);
@@ -554,6 +760,8 @@ static void print_stats(FILE *csv, uint64_t elapsed_ns, uint64_t new_nic_crc) {
     if (total_bits > 0) {
         printf("  Est. BER (CRC): %.2e\n",
                (double)g_stats.nic_crc_errors / (double)total_bits);
+        printf("  Payload BER:    %.2e\n",
+               (double)plcrc / (double)total_bits);
         printf("  Frame loss rate:%.2e\n",
                sent ? (double)lost / (double)sent : 0.0);
     }
@@ -570,9 +778,9 @@ static void print_stats(FILE *csv, uint64_t elapsed_ns, uint64_t new_nic_crc) {
 
     /* CSV row */
     if (csv) {
-        fprintf(csv, "%.3f,%lu,%lu,%lu,%lu,%lu,%lu",
-                elapsed_s, sent, rcvd, lost, g_stats.nic_crc_errors,
-                wkcmm, kdrops);
+        fprintf(csv, "%.3f,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu",
+                elapsed_s, sent, wire, tsc, rcvd, lost,
+                g_stats.nic_crc_errors, plcrc, wkcmm, kdrops, bad);
         for (int s = 0; s < g_num_slaves && s < MAX_SLAVES; s++)
             fprintf(csv, ",%lu,%lu,%lu,%lu",
                     g_stats.esc_crc[s][0], g_stats.esc_crc[s][1],
@@ -584,8 +792,9 @@ static void print_stats(FILE *csv, uint64_t elapsed_ns, uint64_t new_nic_crc) {
 
 /* ── CSV header ─────────────────────────────────────────────────────────── */
 static void write_csv_header(FILE *csv, int num_slaves) {
-    fprintf(csv, "elapsed_s,frames_sent,frames_rcvd,frames_lost,"
-                 "nic_crc_errors,brd_wkc_mismatches,kernel_rx_drops");
+    fprintf(csv, "elapsed_s,tx_enqueued,tx_wire,tx_driver_xmit,frames_rcvd,"
+                 "frames_lost,nic_crc_errors,payload_crc_errors,"
+                 "brd_wkc_mismatches,kernel_rx_drops,unknown_dup_seq");
     for (int s = 0; s < num_slaves; s++)
         fprintf(csv, ",slave%d_p0_crc,slave%d_p1_crc,slave%d_p2_crc,slave%d_p3_crc",
                 s, s, s, s);
@@ -621,6 +830,7 @@ typedef struct {
     long            rate_hz;      /* 0 = saturate */
     int             tx_core;      /* CPU to pin TX thread (-1 = no pin) */
     int             rx_core;      /* CPU to pin RX thread (-1 = no pin) */
+    int             errq_core;    /* CPU to pin errqueue thread (-1 = none) */
 } ThreadCtx;
 
 /* Pin the calling thread to a single CPU core. Returns 0 on success. */
@@ -644,6 +854,16 @@ static void try_realtime(int prio) {
 }
 
 /* ── TX thread ──────────────────────────────────────────────────────────── */
+/* Maximum frames allowed outstanding (sent but not yet returned) before TX
+ * pauses. This bounds the sent/received gap so backpressure reflects the WIRE
+ * draining frames, not the kernel TX ring / socket buffer swallowing them.
+ * Without this cap, large buffers + a high-latency link (e.g. a passive
+ * loopback plug) let TX build a huge backlog that then shows up as spurious
+ * "loss" at shutdown. On a real EtherCAT chain the RTT is microseconds so the
+ * cap is essentially never hit; it only clamps pathological buffering.
+ * ~4000 frames ≈ 0.5s of wire time at 8100 fps — ample in-flight headroom. */
+#define MAX_INFLIGHT 4000
+
 static void *tx_thread(void *arg) {
     ThreadCtx *ctx = (ThreadCtx *)arg;
     pin_to_core(ctx->tx_core);
@@ -663,6 +883,18 @@ static void *tx_thread(void *arg) {
             }
         }
 
+        /* Bound outstanding frames. If RX hasn't caught up to within
+         * MAX_INFLIGHT, pause briefly — this is genuine wire backpressure,
+         * not a buffering artifact. Guarded so a transient rcvd>sent (possible
+         * on interfaces that double-deliver, e.g. lo) can't underflow. */
+        uint64_t sent_now = atomic_load_explicit(&g_stats.frames_enqueued, memory_order_relaxed);
+        uint64_t rcvd_now = atomic_load_explicit(&g_stats.frames_received, memory_order_relaxed);
+        if (sent_now > rcvd_now && (sent_now - rcvd_now) >= MAX_INFLIGHT) {
+            atomic_fetch_add_explicit(&g_stats.tx_backpressure, 1, memory_order_relaxed);
+            sleep_ns(10000);   /* 10us; loop re-checks g_tx_running */
+            continue;
+        }
+
         int frame_len = build_frame(tx_buf, sizeof(tx_buf), ctx->src_mac,
                                     ctx->loopback ? 0 : ctx->num_slaves,
                                     seq, ctx->loopback);
@@ -670,7 +902,7 @@ static void *tx_thread(void *arg) {
         int sent = send(ctx->sock, tx_buf, frame_len, 0);
         if (sent > 0) {
             seq_mark_sent(seq);   /* inline retirement of the reused slot */
-            atomic_fetch_add_explicit(&g_stats.frames_sent, 1, memory_order_relaxed);
+            atomic_fetch_add_explicit(&g_stats.frames_enqueued, 1, memory_order_relaxed);
             seq++;
             if (interval_ns) next_send_ns += interval_ns;
 
@@ -791,6 +1023,81 @@ static void poll_kernel_drops(int sock) {
     }
 }
 
+/* ── Software TX timestamping ────────────────────────────────────────────────
+ * This NIC (RTL8125) has no PTP hardware clock, so only SOFTWARE TX
+ * timestamping is available. The timestamp is taken in the kernel driver's
+ * xmit path — strictly UPSTREAM of the wire — so this counter measures
+ * "frames the driver pushed toward hardware", not true on-wire time. The
+ * ethtool tx_packets counter remains the authoritative on-wire figure.
+ *
+ * Enable and return 1 on success, 0 if unsupported. */
+static int enable_tx_timestamping(int sock) {
+    int flags = SOF_TIMESTAMPING_TX_SOFTWARE   /* sw timestamp on TX */
+              | SOF_TIMESTAMPING_SOFTWARE       /* report sw timestamps */
+              | SOF_TIMESTAMPING_OPT_ID         /* per-frame id */
+              | SOF_TIMESTAMPING_OPT_TSONLY;    /* don't copy frame back */
+    if (setsockopt(sock, SOL_SOCKET, SO_TIMESTAMPING, &flags, sizeof(flags)) < 0)
+        return 0;
+    return 1;
+}
+
+/* ── Error-queue reader thread ──────────────────────────────────────────────
+ * Drains MSG_ERRQUEUE, counting SCM_TIMESTAMPING completions — one per
+ * transmitted frame. This is TX counter (c): "driver-xmit (sw ts)". Pinned to
+ * a spare core; the completion rate equals the TX rate (~8k/s) so overhead is
+ * negligible. */
+static void *errq_thread(void *arg) {
+    ThreadCtx *ctx = (ThreadCtx *)arg;
+    pin_to_core(ctx->errq_core);
+
+    char ctrl[512];
+    struct msghdr msg;
+    struct pollfd pfd = { .fd = ctx->sock, .events = POLLERR };
+
+    while (g_running) {
+        /* POLLERR signals the error queue has data. Short timeout so we
+         * re-check g_running for prompt shutdown. */
+        int pr = poll(&pfd, 1, 100);
+        if (pr < 0) { if (errno == EINTR) continue; break; }
+        if (pr == 0) continue;
+
+        /* Drain all pending completions. */
+        for (;;) {
+            memset(&msg, 0, sizeof(msg));
+            msg.msg_control    = ctrl;
+            msg.msg_controllen = sizeof(ctrl);
+            int n = recvmsg(ctx->sock, &msg, MSG_ERRQUEUE | MSG_DONTWAIT);
+            if (n < 0) break;   /* EAGAIN — queue empty */
+
+            /* Count each SCM_TIMESTAMPING control message as one TX
+             * completion. */
+            for (struct cmsghdr *cm = CMSG_FIRSTHDR(&msg); cm;
+                 cm = CMSG_NXTHDR(&msg, cm)) {
+                if (cm->cmsg_level == SOL_SOCKET &&
+                    cm->cmsg_type  == SCM_TIMESTAMPING) {
+                    atomic_fetch_add_explicit(&g_stats.tx_ts_completions, 1,
+                                              memory_order_relaxed);
+                }
+            }
+        }
+    }
+
+    /* Final drain. */
+    for (int i = 0; i < 1000; i++) {
+        memset(&msg, 0, sizeof(msg));
+        msg.msg_control = ctrl; msg.msg_controllen = sizeof(ctrl);
+        int n = recvmsg(ctx->sock, &msg, MSG_ERRQUEUE | MSG_DONTWAIT);
+        if (n < 0) break;
+        for (struct cmsghdr *cm = CMSG_FIRSTHDR(&msg); cm;
+             cm = CMSG_NXTHDR(&msg, cm)) {
+            if (cm->cmsg_level == SOL_SOCKET && cm->cmsg_type == SCM_TIMESTAMPING)
+                atomic_fetch_add_explicit(&g_stats.tx_ts_completions, 1,
+                                          memory_order_relaxed);
+        }
+    }
+    return NULL;
+}
+
 /* ── Main ───────────────────────────────────────────────────────────────── */
 int main(int argc, char *argv[]) {
     const char *iface     = NULL;
@@ -899,6 +1206,24 @@ int main(int argc, char *argv[]) {
     poll_kernel_drops(sock);
     atomic_store_explicit(&g_stats.kernel_drops, 0, memory_order_relaxed);
 
+    /* Initialise CRC32C (detect SSE4.2, build table). */
+    crc32c_init();
+    printf("Payload check: CRC32C over seq+payload, %s; payload = xorshift64\n",
+           g_have_sse42 ? "SSE4.2 accelerated" : "software");
+
+    /* Enable software TX timestamping (no PTP HW clock on RTL8125). */
+    g_stats.tx_ts_supported = enable_tx_timestamping(sock);
+    printf("TX timestamping: %s\n",
+           g_stats.tx_ts_supported
+             ? "software (driver-xmit stage; ethtool tx_packets is wire truth)"
+             : "unavailable");
+
+    /* On-wire TX baseline (ethtool tx_packets). */
+    g_stats.tx_wire_base = read_nic_tx_packets(iface);
+    if (g_stats.tx_wire_base == 0)
+        printf("NOTE: could not read ethtool tx_packets — wire count "
+               "may be unavailable on this driver.\n");
+
     /* Open CSV */
     FILE *csv = fopen(csv_path, "w");
     if (!csv) { perror("fopen csv"); return 1; }
@@ -911,14 +1236,16 @@ int main(int argc, char *argv[]) {
     /* Initial NIC CRC baseline */
     g_stats.nic_crc_errors_prev = read_nic_crc_errors(iface);
 
-    /* Decide CPU pinning. On the 4-core/8-thread Ryzen 5300U we pin RX and TX
-     * to separate physical cores and keep the stats thread (main) off both. */
+    /* Decide CPU pinning. On the 4-core/8-thread Ryzen 5300U we pin TX, RX and
+     * the errqueue reader to separate cores; the supervisor (main) stays off
+     * them. */
     long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
-    int tx_core = (ncpu >= 3) ? 1 : -1;
-    int rx_core = (ncpu >= 3) ? 2 : -1;
+    int tx_core   = (ncpu >= 3) ? 1 : -1;
+    int rx_core   = (ncpu >= 3) ? 2 : -1;
+    int errq_core = (ncpu >= 4) ? 3 : -1;
     if (tx_core >= 0)
-        printf("Pinning: TX->core %d, RX->core %d (of %ld)\n",
-               tx_core, rx_core, ncpu);
+        printf("Pinning: TX->core %d, RX->core %d, errq->core %d (of %ld)\n",
+               tx_core, rx_core, errq_core, ncpu);
     else
         printf("Pinning: disabled (only %ld CPUs online)\n", ncpu);
 
@@ -932,6 +1259,7 @@ int main(int argc, char *argv[]) {
     ctx.rate_hz    = rate_hz;
     ctx.tx_core    = tx_core;
     ctx.rx_core    = rx_core;
+    ctx.errq_core  = errq_core;
 
     uint64_t start_ns    = now_ns();
     uint64_t last_stat_ns = start_ns;
@@ -939,15 +1267,26 @@ int main(int argc, char *argv[]) {
     printf("Running... (Ctrl-C to stop)\n");
 
     /* Spawn RX first so it is draining before TX starts producing. */
-    pthread_t rx_tid, tx_tid;
+    pthread_t rx_tid, tx_tid, errq_tid;
+    int have_errq = 0;
     if (pthread_create(&rx_tid, NULL, rx_thread, &ctx) != 0) {
         perror("pthread_create rx"); return 1;
     }
-    /* Small delay so RX is definitely in its recvmmsg loop. */
+    /* Error-queue reader (only if TX timestamping enabled). */
+    if (g_stats.tx_ts_supported) {
+        if (pthread_create(&errq_tid, NULL, errq_thread, &ctx) == 0)
+            have_errq = 1;
+        else
+            fprintf(stderr, "warning: errqueue thread failed; "
+                            "TX driver-xmit count disabled\n");
+    }
+    /* Small delay so RX is definitely in its poll loop. */
     sleep_ns(5 * 1000000);
     if (pthread_create(&tx_tid, NULL, tx_thread, &ctx) != 0) {
         perror("pthread_create tx"); g_running = 0;
-        pthread_join(rx_tid, NULL); return 1;
+        pthread_join(rx_tid, NULL);
+        if (have_errq) pthread_join(errq_tid, NULL);
+        return 1;
     }
 
     /* Main thread = supervisor: prints stats, polls kernel drops, enforces
@@ -965,6 +1304,8 @@ int main(int argc, char *argv[]) {
         }
 
         poll_kernel_drops(sock);
+        g_stats.tx_wire_packets =
+            read_nic_tx_packets(iface) - g_stats.tx_wire_base;
 
         if (now - last_stat_ns >= 5000000000ULL) {
             uint64_t nic_crc = read_nic_crc_errors(iface);
@@ -992,7 +1333,7 @@ int main(int argc, char *argv[]) {
     while (now_ns() < drain_deadline) {
         sleep_ns(50 * 1000000);   /* 50 ms */
         uint64_t rcvd = atomic_load_explicit(&g_stats.frames_received, memory_order_relaxed);
-        uint64_t sent = atomic_load_explicit(&g_stats.frames_sent, memory_order_relaxed);
+        uint64_t sent = atomic_load_explicit(&g_stats.frames_enqueued, memory_order_relaxed);
         if (rcvd >= sent) break;             /* everything came back */
         if (rcvd == prev_rcvd) {
             if (++stable_ticks >= 4) break;  /* 200ms with no new returns */
@@ -1002,13 +1343,16 @@ int main(int argc, char *argv[]) {
         prev_rcvd = rcvd;
     }
 
-    /* Now stop RX and sweep the window for anything that never returned. */
+    /* Now stop RX (and errq) and sweep the window for anything that never
+     * returned. */
     g_running = 0;
     pthread_join(rx_tid, NULL);
+    if (have_errq) pthread_join(errq_tid, NULL);
     seq_retire_final(tx_final);   /* count genuine losses only */
 
-    /* Final kernel-drop poll and stats. */
+    /* Final kernel-drop poll, wire count, and stats. */
     poll_kernel_drops(sock);
+    g_stats.tx_wire_packets = read_nic_tx_packets(iface) - g_stats.tx_wire_base;
     uint64_t end_ns  = now_ns();
     uint64_t nic_crc = read_nic_crc_errors(iface);
     print_stats(csv, end_ns - start_ns, nic_crc);
