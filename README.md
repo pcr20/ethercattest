@@ -201,22 +201,27 @@ NIC's hardware CRC counter, which reads 0 under `rx-all` because bad frames are
 delivered to us rather than dropped-and-counted):
 
 - **BER (FCS)** — from the software FCS-residual detector
-  (`rx_bad_fcs_computed`). Covers the whole frame (~100%).
-- **BER (payload)** — from the independent CRC32C payload check
-  (`payload_crc_errors`). Covers **1482 of 1514 bytes ≈ 97.9%** of the frame —
-  everything except the 32 bytes of Ethernet/EtherCAT/datagram headers, the WKC,
-  and the CRC field itself (which can't be self-covered).
+  (`rx_bad_fcs_computed`): received frames whose whole-frame Ethernet CRC is
+  invalid, whatever their length (cut frames have a garbage trailer and count).
+- **BER (payload)** — from `payload_crc_errors`: **received frames without a
+  valid payload CRC32C** — whether the CRC is *invalid* (bit errors in the
+  delivered payload) or the payload was *never received* (frame cut short or
+  unparseable, so the CRC could not possibly verify). Every received frame is
+  classified exactly one way: valid payload CRC, or counted here. There is no
+  third bucket.
 
-**Reading the FCS/payload ratio as a diagnostic.** For *random* bit errors the
-two counts should track within ~2% (the coverage gap). If the payload count is
-much lower than the FCS count, the errors are concentrated in the frame headers
-— the front of the frame, where a PHY re-synchronising after a carrier flap does
-its damage. A low ratio therefore means **link-disruption artifacts, not clean
-bit errors**; a ratio near 0.98 means genuinely random bit errors spread across
-the frame. (Example: a pins-short run showed 8 payload vs 35 FCS = 0.23, ~4×
-below the 0.98 random expectation — confirming those were front-of-frame link
-disruptions, not the bit-error-rate you ultimately want to measure on a degraded
-cable.)
+The two counters therefore sample the same population (all received frames) and
+can be compared directly. A frame cut mid-flight typically counts in **both**
+(bad FCS trailer + missing payload); a full-length frame with a bit flip in the
+payload counts in both; a full-length frame damaged only in the
+headers/WKC/CRC-field region counts in FCS only. The independent value of the
+payload check is the fault class it uniquely catches: **a slave that corrupts
+data internally and then emits a valid regenerated FCS** shows zero FCS errors
+but a payload CRC failure.
+
+A third counter, **Rx frame length errors** (`rx_len_errors`), counts every
+received frame whose length differs from the (constant, runtime-known) TX frame
+length — a direct, CRC-independent detector of cut or padded frames.
 
 Note this is the "add-half" rule of thumb, not a specific confidence level. For
 reference, a 95%-confidence zero-error bound would use `2.996/N` and 90% would
@@ -430,7 +435,7 @@ The tool reports estimated BER in the periodic status output.
   BRD WKC mismatches: 0        ← if non-zero, a slave dropped out
   Total wire bits:3.50e+11
   BER (FCS) <=:   ...   [whole frame]
-  BER (payload)<=:...   [97.9% coverage]
+  BER (payload)<=:...   [no valid payload CRC]
 ──────────────────────────────────────────────────────────
 ```
 
@@ -593,7 +598,7 @@ elapsed_s, tx_enqueued, tx_wire, txok, txer, qdisc_drop,
 distinct_returns, frames_rcvd, frames_lost, payload_crc_errors, brd_wkc_mismatches, kernel_rx_drops,
 carrier_down, carrier_up, carrier_changes,
 link_down_cp, link_up_cp, link_down_nl, link_up_nl, netlink_overflows,
-rx_bad_fcs_computed, rx_bad_fcs_auxdata, rx_truncated,
+rx_bad_fcs_computed, rx_bad_fcs_auxdata, rx_truncated, rx_len_errors,
 [slave0_p0_crc, slave0_p1_crc, slave0_p2_crc, slave0_p3_crc, slave1_...]
 ```
 

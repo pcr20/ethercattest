@@ -298,6 +298,7 @@ typedef struct {
     _Atomic uint64_t credit_writeoff_events;/* TX thread — valve fired count    */
     _Atomic uint64_t brd_wkc_mismatches;/* RX thread                           */
     _Atomic uint64_t distinct_returns; /* RX thread — deduped returned seqs     */
+    _Atomic uint64_t rx_len_errors;    /* RX thread — frame length != TX length */
     _Atomic uint64_t kernel_drops;     /* main thread, from PACKET_STATISTICS  */
     _Atomic uint64_t payload_crc_errors;/* RX thread — CRC32C mismatch         */
     _Atomic uint64_t rx_bad_fcs_auxdata;/* RX thread — kernel PACKET_AUXDATA    */
@@ -418,6 +419,23 @@ static _Atomic uint64_t g_qdisc_drop = 0;  /* per-run qdisc tx_dropped (kernel) 
  * symbols are excluded: an error there cannot produce a CRC count). 0 until
  * the first frame is built. */
 static _Atomic uint64_t g_wire_bits_per_frame = 0;
+
+/* Rx frame length check: every TX frame in a run has the SAME size (published
+ * in g_wire_bits_per_frame as (frame_len + FCS) * 8), so every return must
+ * arrive with exactly that size. raw_len is the delivered length, which
+ * includes the 4-byte FCS trailer iff rx-fcs is on. Returns 1 (and counts) on
+ * a length mismatch; 0 if the length is correct or the expected size is not
+ * yet known (TX hasn't built the first frame). */
+static inline int rx_check_len(int raw_len, int rx_fcs_on) {
+    uint64_t bpf = atomic_load_explicit(&g_wire_bits_per_frame, memory_order_relaxed);
+    if (!bpf) return 0;
+    int expected = (int)(bpf / 8) - (rx_fcs_on ? 0 : 4);
+    if (raw_len != expected) {
+        atomic_fetch_add_explicit(&g_stats.rx_len_errors, 1, memory_order_relaxed);
+        return 1;
+    }
+    return 0;
+}
 
 
 /* ── Globals ────────────────────────────────────────────────────────────── */
@@ -784,23 +802,37 @@ static int build_frame(uint8_t *buf, int buflen,
  * regions; one garbage 8-bit counter value poisons the delta accumulation
  * permanently. The ESC registers are cumulative in the slave, so skipping
  * corrupt frames loses nothing — the next good frame reports the same value. */
+/* Payload-CRC failure: increment and bail. payload_crc_errors counts EVERY
+ * received frame without a valid payload CRC — whether the CRC is invalid or
+ * the payload never arrived (frame cut short / unparseable). A frame too short
+ * to contain the payload cannot have a valid payload CRC, so it counts. */
+static inline uint64_t pl_fail(void) {
+    atomic_fetch_add_explicit(&g_stats.payload_crc_errors, 1,
+                              memory_order_relaxed);
+    return UINT64_MAX;
+}
+
 static uint64_t parse_return_frame(const uint8_t *buf, int len,
                                    int num_slaves, int loopback,
                                    int fcs_ok, int *payload_ok) {
     if (payload_ok) *payload_ok = 0;
-    if (len < ETH_HDR_LEN + ECAT_HDR_LEN) return UINT64_MAX;
+    if (len < ETH_HDR_LEN + ECAT_HDR_LEN) return pl_fail();
 
     int pos = ETH_HDR_LEN + ECAT_HDR_LEN;
 
     /* Datagram 0: NOP — extract sequence number from payload */
-    if (pos + ECAT_DG_HDR_LEN > len) return UINT64_MAX;
+    if (pos + ECAT_DG_HDR_LEN > len) return pl_fail();
     uint16_t lf = le16get(buf + pos + 6);   /* LE per ETG.1000.4 */
     uint16_t dg_len = lf & 0x07FF;
     pos += ECAT_DG_HDR_LEN;
-    if (pos + dg_len + ECAT_DG_WKC_LEN > len) return UINT64_MAX;
+    if (pos + dg_len + ECAT_DG_WKC_LEN > len) return pl_fail();
 
     uint64_t ret_seq = UINT64_MAX;
-    if (dg_len >= PL_HDR_LEN) {
+    if (dg_len < PL_HDR_LEN) {
+        /* Payload too small to even hold seq+CRC — no valid payload CRC. */
+        atomic_fetch_add_explicit(&g_stats.payload_crc_errors, 1,
+                                  memory_order_relaxed);
+    } else {
         const uint8_t *pl = buf + pos;
         memcpy(&ret_seq, pl + PL_SEQ_OFF, PL_SEQ_LEN);
 
@@ -969,7 +1001,8 @@ static void print_stats(FILE *csv, uint64_t elapsed_ns) {
            fps, fps * (double)bits_per_frame / 1e6);
     printf("  Lost frames:    %lu  (TxOk − good returns; includes corrupt)\n", lost);
     printf("  Payload CRC err:%lu  %s\n", plcrc,
-           plcrc ? "*** PAYLOAD CORRUPTION (FCS-independent) ***" : "(clean)");
+           plcrc ? "(frames without a valid payload CRC — invalid or missing)"
+                 : "(clean)");
     { uint64_t bfc = atomic_load_explicit(&g_stats.rx_bad_fcs_computed, memory_order_relaxed);
       uint64_t bfa = atomic_load_explicit(&g_stats.rx_bad_fcs_auxdata, memory_order_relaxed);
       uint64_t trunc = atomic_load_explicit(&g_stats.rx_truncated, memory_order_relaxed);
@@ -977,6 +1010,9 @@ static void print_stats(FILE *csv, uint64_t elapsed_ns) {
              bfc ? "*** CORRUPT FRAMES RECEIVED ***" : "(none)");
       if (trunc)
           printf("  Truncated frames: %lu  (too short to parse)\n", trunc);
+      uint64_t lerr = atomic_load_explicit(&g_stats.rx_len_errors, memory_order_relaxed);
+      printf("  Rx frame length errors: %lu  %s\n", lerr,
+             lerr ? "(received length != TX frame length)" : "(all correct length)");
     }
     printf("  TX backpressure:%lu  (EAGAIN ring-full, normal)\n", backp);
     printf("  Kernel RX drops:%lu  %s\n", kdrops,
@@ -1032,7 +1068,7 @@ static void print_stats(FILE *csv, uint64_t elapsed_ns) {
         uint64_t bfc = atomic_load_explicit(&g_stats.rx_bad_fcs_computed, memory_order_relaxed);
         printf("  BER (FCS) <=:   %.2e   ((%lu + 0.5) / N)  [whole frame]\n",
                ((double)bfc + 0.5) / (double)total_bits, bfc);
-        printf("  BER (payload)<=:%.2e   ((%lu + 0.5) / N)  [97.9%% coverage]\n",
+        printf("  BER (payload)<=:%.2e   ((%lu + 0.5) / N)  [no valid payload CRC]\n",
                ((double)plcrc + 0.5) / (double)total_bits, plcrc);
         printf("  Frame loss rate:%.2e  (lost / TxOk)\n",
                txok ? (double)lost / (double)txok : 0.0);
@@ -1061,12 +1097,13 @@ static void print_stats(FILE *csv, uint64_t elapsed_ns) {
         uint64_t bfc  = atomic_load_explicit(&g_stats.rx_bad_fcs_computed, memory_order_relaxed);
         uint64_t bfa  = atomic_load_explicit(&g_stats.rx_bad_fcs_auxdata, memory_order_relaxed);
         uint64_t trunc= atomic_load_explicit(&g_stats.rx_truncated, memory_order_relaxed);
+        uint64_t lerr = atomic_load_explicit(&g_stats.rx_len_errors, memory_order_relaxed);
         fprintf(csv, "%.3f,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,"
-                     "%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu",
+                     "%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu",
                 elapsed_s, sent, wire, txok, txer, qdrop, distinct, rcvd, lost,
                 plcrc, wkcmm, kdrops,
                 g_stats.carrier_down, g_stats.carrier_up, g_stats.carrier_changes,
-                cp_d, cp_u, nl_d, nl_u, nl_o, bfc, bfa, trunc);
+                cp_d, cp_u, nl_d, nl_u, nl_o, bfc, bfa, trunc, lerr);
         for (int s = 0; s < g_num_slaves && s < MAX_SLAVES; s++)
             fprintf(csv, ",%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu",
                     g_stats.esc_crc[s][0], g_stats.esc_crc[s][1],
@@ -1086,7 +1123,7 @@ static void write_csv_header(FILE *csv, int num_slaves) {
                  "brd_wkc_mismatches,kernel_rx_drops,"
                  "carrier_down,carrier_up,carrier_changes,"
                  "link_down_cp,link_up_cp,link_down_nl,link_up_nl,netlink_overflows,"
-                 "rx_bad_fcs_computed,rx_bad_fcs_auxdata,rx_truncated");
+                 "rx_bad_fcs_computed,rx_bad_fcs_auxdata,rx_truncated,rx_len_errors");
     for (int s = 0; s < num_slaves; s++)
         fprintf(csv, ",slave%d_p0_crc,slave%d_p1_crc,slave%d_p2_crc,slave%d_p3_crc"
                      ",slave%d_p0_lost,slave%d_p1_lost,slave%d_p2_lost,slave%d_p3_lost",
@@ -1289,6 +1326,7 @@ static void *rx_thread(void *arg) {
         int raw_len = msgs[idx].msg_len;                                        \
         atomic_fetch_add_explicit(&g_stats.frames_received, 1,                  \
                                   memory_order_relaxed);                       \
+        rx_check_len(raw_len, ctx->rx_fcs_on);                                 \
         /* Grab PACKET_AUXDATA tp_status (detector 1 source). */               \
         uint32_t tp_status = 0; int have_aux = 0;                              \
         for (struct cmsghdr *cm = CMSG_FIRSTHDR(&msgs[idx].msg_hdr); cm;       \
