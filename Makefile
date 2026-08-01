@@ -1,19 +1,23 @@
 CC      = gcc
-CFLAGS  = -O2 -Wall -Wextra -std=c11 -msse4.2
-LDFLAGS = -lm -lpthread
-TARGET  = ecat_ber
+CFLAGS  = -D_GNU_SOURCE -O2 -Wall -Wextra -std=c11 -msse4.2 -flto
+LDFLAGS = -flto -lm -lpthread
+OBJS    = crc.o stats.o frame.o nic.o threads.o main.o
 
-.PHONY: all clean install
+ecat_ber: $(OBJS)
+	$(CC) -o $@ $(OBJS) $(LDFLAGS)
 
-all: $(TARGET)
+%.o: %.c ecat_common.h crc.h stats.h frame.h nic.h threads.h
+	$(CC) $(CFLAGS) -c $< -o $@
 
-$(TARGET): ecat_ber.c
-	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+TESTS = t_wirefmt t_framesz t_txok t_crc t_resid3 t_escgate t_plsem t_ring
+test: $(TESTS:%=tests/%)
+	@for t in $(TESTS); do ./tests/$$t || exit 1; done
+	@echo "ALL TEST SUITES PASS"
 
-# Install with CAP_NET_RAW so it can run without sudo
-install: $(TARGET)
-	sudo cp $(TARGET) /usr/local/bin/
-	sudo setcap cap_net_raw+ep /usr/local/bin/$(TARGET)
+tests/%: tests/%.c crc.c stats.c frame.c ecat_common.h crc.h stats.h frame.h
+	$(CC) -D_GNU_SOURCE -O2 -Wall -std=c11 -msse4.2 -I. -o $@ $< -lm -lpthread
 
 clean:
-	rm -f $(TARGET)
+	rm -f ecat_ber $(OBJS) $(TESTS:%=tests/%)
+
+.PHONY: test clean

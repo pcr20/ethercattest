@@ -4,6 +4,32 @@ Tests EtherCAT physical layer bit error rate by saturating a slave chain
 with NOP frames and logging CRC errors from both the host NIC PHY and
 ESC slave registers.
 
+## Source layout
+
+The tool is split into cohesive modules (c/h pairs); `make` builds the binary,
+`make test` builds and runs the unit-test suites:
+
+- `ecat_common.h` — tunables, EtherCAT constants, little-endian wire helpers
+  (with the endianness history), timing helpers, shared run-state externs.
+- `crc.c/h` — CRC32C (SSE4.2 + software fallback) and Ethernet FCS, shared
+  tables (defined once; `crc32c_init()` is mandatory before use — a zeroed
+  table silently degenerates the CRC to a constant), FCS residual constants.
+- `stats.c/h` — the Stats structure and all shared counters, accounting
+  primitives (good-return dedup, wire-truth atomics, length check), the
+  lock-free bad-FCS event ring, panel printing and CSV output.
+- `frame.c/h` — `build_frame` / `parse_return_frame`: the protocol heart.
+- `nic.c/h` — kernel/driver interface: ethtool tally counters (TxOk/TxER),
+  sysfs, MAC/ifindex, feature toggles, RX-drop polling.
+- `threads.c/h` — all worker threads: TX, RX, error-queue, wire-truth
+  sampler, POLLPRI carrier monitor, netlink cross-check.
+- `main.c` — argument parsing, setup, supervisor loop, good-frame-gated
+  termination.
+- `tests/` — eight unit-test suites (wire format as an ESC reads it, frame
+  sizing with overrun canary, TxOk loss model, CRC/payload detection, FCS
+  residual, ESC-counter gating, payload-CRC semantics, bad-FCS ring). Each
+  test includes exactly the module sources it exercises, so its include list
+  documents the dependency; every test calls `crc32c_init()` first.
+
 ## Accounting model (TxOk wire-truth boundary)
 
 The measurement boundary is **the r8169 and everything wire-side of it** — the
