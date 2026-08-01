@@ -116,11 +116,62 @@ typedef struct {
     uint8_t  esc_lostlnk_prev[MAX_SLAVES][4];
     uint32_t brd_wkc_expected;   /* = num_slaves */
     uint32_t brd_wkc_mismatches; /* BRD returned wrong WKC */
+    uint64_t seq_reordered;      /* frames returned out of order */
+    uint64_t seq_bad;            /* returned seq we never sent / duplicate */
+    uint64_t tx_backpressure;    /* EAGAIN on send — normal, not a loss */
 } Stats;
+
+/* g_stats is defined here (ahead of the SeqTrack helpers that update it). */
+static Stats g_stats;
+
+/* ── Outstanding-frame tracking window ──────────────────────────────────────
+ * Ring of in-flight sequence numbers. A frame is "outstanding" from the moment
+ * it is sent until its seq comes back on the wire. If a seq is still
+ * outstanding when it falls off the back of the window (older than WINDOW
+ * frames), it is counted as genuinely lost — this distinguishes true loss
+ * from mere RX-queue lag. */
+#define SEQ_WINDOW 65536              /* power of 2, must exceed max in-flight */
+#define SEQ_MASK   (SEQ_WINDOW - 1)
+typedef struct {
+    uint8_t  state[SEQ_WINDOW];   /* 0=free, 1=outstanding, 2=returned */
+    uint64_t seq_at_slot[SEQ_WINDOW]; /* which seq currently occupies the slot */
+    uint64_t oldest_unretired;    /* lowest seq not yet reconciled */
+} SeqTrack;
+static SeqTrack g_seq;
+
+static inline void seq_mark_sent(uint64_t seq) {
+    uint32_t slot = seq & SEQ_MASK;
+    g_seq.state[slot]       = 1;   /* outstanding */
+    g_seq.seq_at_slot[slot] = seq;
+}
+
+static inline void seq_mark_returned(uint64_t seq) {
+    uint32_t slot = seq & SEQ_MASK;
+    if (g_seq.seq_at_slot[slot] == seq && g_seq.state[slot] == 1) {
+        g_seq.state[slot] = 2;     /* returned OK */
+    } else {
+        g_stats.seq_bad++;         /* seq we don't recognise, or duplicate */
+    }
+}
+
+/* Retire all sequences that have aged out of the window (older than
+ * next_seq - SEQ_WINDOW). Any still 'outstanding' at retirement = lost. */
+static inline void seq_retire(uint64_t next_seq) {
+    if (next_seq < SEQ_WINDOW) return;
+    uint64_t retire_upto = next_seq - SEQ_WINDOW;
+    while (g_seq.oldest_unretired < retire_upto) {
+        uint32_t slot = g_seq.oldest_unretired & SEQ_MASK;
+        if (g_seq.seq_at_slot[slot] == g_seq.oldest_unretired) {
+            if (g_seq.state[slot] == 1)
+                g_stats.frames_lost++;   /* aged out still outstanding */
+        }
+        g_seq.state[slot] = 0;           /* free the slot */
+        g_seq.oldest_unretired++;
+    }
+}
 
 /* ── Globals ────────────────────────────────────────────────────────────── */
 static volatile int g_running = 1;
-static Stats        g_stats;
 static int          g_verbose  = 0;
 static int          g_num_slaves = 0;
 static int          g_loopback   = 0;
@@ -319,34 +370,36 @@ static int build_frame(uint8_t *buf, int buflen,
     return pos;  /* actual frame length */
 }
 
-/* ── Parse returned frame, update stats ─────────────────────────────────── */
-static void parse_return_frame(const uint8_t *buf, int len,
-                               int num_slaves, int loopback) {
-    if (len < ETH_HDR_LEN + ECAT_HDR_LEN) return;
+/* ── Parse returned frame, update stats ─────────────────────────────────────
+ * Returns the sequence number extracted from the NOP payload, or UINT64_MAX
+ * if the frame could not be parsed / is not one of ours. */
+static uint64_t parse_return_frame(const uint8_t *buf, int len,
+                                   int num_slaves, int loopback) {
+    if (len < ETH_HDR_LEN + ECAT_HDR_LEN) return UINT64_MAX;
 
     int pos = ETH_HDR_LEN + ECAT_HDR_LEN;
 
-    /* Datagram 0: NOP — skip over it */
-    if (pos + ECAT_DG_HDR_LEN > len) return;
+    /* Datagram 0: NOP — extract sequence number from payload */
+    if (pos + ECAT_DG_HDR_LEN > len) return UINT64_MAX;
     uint16_t lf;
     memcpy(&lf, buf + pos + 6, 2);
     lf = ntohs(lf);
     uint16_t dg_len = lf & 0x07FF;
     pos += ECAT_DG_HDR_LEN;
-    if (pos + dg_len + ECAT_DG_WKC_LEN > len) return;
+    if (pos + dg_len + ECAT_DG_WKC_LEN > len) return UINT64_MAX;
 
-    uint64_t ret_seq = 0;
+    uint64_t ret_seq = UINT64_MAX;
     if (dg_len >= 8) memcpy(&ret_seq, buf + pos, 8);
     pos += dg_len + ECAT_DG_WKC_LEN;
 
-    if (loopback || num_slaves == 0) return;
+    if (loopback || num_slaves == 0) return ret_seq;
 
     /* Datagram 1: BRD — read WKC */
-    if (pos + ECAT_DG_HDR_LEN > len) return;
+    if (pos + ECAT_DG_HDR_LEN > len) return ret_seq;
     memcpy(&lf, buf + pos + 6, 2); lf = ntohs(lf);
     dg_len = lf & 0x07FF;
     pos += ECAT_DG_HDR_LEN + dg_len;
-    if (pos + ECAT_DG_WKC_LEN > len) return;
+    if (pos + ECAT_DG_WKC_LEN > len) return ret_seq;
     uint16_t brd_wkc;
     memcpy(&brd_wkc, buf + pos, 2);
     brd_wkc = ntohs(brd_wkc);
@@ -396,6 +449,8 @@ static void parse_return_frame(const uint8_t *buf, int len,
 
         pos += dg_len + ECAT_DG_WKC_LEN;
     }
+
+    return ret_seq;
 }
 
 /* ── Print stats ────────────────────────────────────────────────────────── */
@@ -408,18 +463,34 @@ static void print_stats(FILE *csv, uint64_t elapsed_ns, uint64_t new_nic_crc) {
     g_stats.nic_crc_errors += nic_crc_delta;
     g_stats.nic_crc_errors_prev = new_nic_crc;
 
+    /* Frames still legitimately in flight (sent, not yet returned, not yet
+     * aged out). This is the queue-lag figure — informational, NOT loss. */
+    uint64_t in_flight = g_stats.frames_sent
+                       - g_stats.frames_received
+                       - g_stats.frames_lost;
+
     printf("\n── EtherCAT BER Test ─────────────────────────────────────\n");
     printf("  Elapsed:        %.1f s\n", elapsed_s);
     printf("  Frames sent:    %lu\n",    g_stats.frames_sent);
     printf("  Frames rcvd:    %lu\n",    g_stats.frames_received);
-    printf("  Lost frames:    %lu  (%.2e)\n",
-           g_stats.frames_lost, (double)g_stats.frames_lost);
+    printf("  In flight:      %ld  (queue lag, not loss)\n", (int64_t)in_flight);
+    printf("  Lost frames:    %lu  (aged out, never returned)\n",
+           g_stats.frames_lost);
+    printf("  Unknown/dup seq:%lu\n",    g_stats.seq_bad);
+    printf("  TX backpressure:%lu  (EAGAIN, normal)\n", g_stats.tx_backpressure);
     printf("  BRD WKC mismatches: %u\n", g_stats.brd_wkc_mismatches);
     printf("  NIC CRC errors: %lu (cumulative)\n", g_stats.nic_crc_errors);
     printf("  Total bits:     %.3e\n", (double)total_bits);
-    if (total_bits > 0)
-        printf("  Est. BER:       %.2e\n",
+    if (total_bits > 0) {
+        /* Report BER against the direct physical error signal (NIC CRC),
+         * and separately a frame-loss rate. CRC is the more sensitive
+         * BER estimator; a lost frame usually implies >=1 bit error too. */
+        printf("  Est. BER (CRC): %.2e\n",
                (double)g_stats.nic_crc_errors / (double)total_bits);
+        printf("  Frame loss rate:%.2e\n",
+               g_stats.frames_sent ?
+               (double)g_stats.frames_lost / (double)g_stats.frames_sent : 0.0);
+    }
 
     if (g_verbose && !g_loopback) {
         printf("  ── Per-slave ESC CRC counters ──────────────────────────\n");
@@ -583,40 +654,49 @@ int main(int argc, char *argv[]) {
                                         seq, g_loopback);
             int sent = send(sock, tx_buf, frame_len, 0);
             if (sent > 0) {
+                seq_mark_sent(seq);
                 g_stats.frames_sent++;
                 seq++;
+                if (interval_ns > 0)
+                    next_send_ns += interval_ns;
+            } else if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS) {
+                /* TX ring full — normal backpressure in saturate mode.
+                 * Do NOT advance seq or next_send_ns; retry same frame next
+                 * iteration after draining RX. This is not an error and is
+                 * not counted as a loss. */
+                g_stats.tx_backpressure++;
             } else {
-                /* Report the first few send failures, then rate-limit.
-                 * A silent send() failure was previously masking an
-                 * oversized-frame (EMSGSIZE) bug — never hide these again. */
+                /* A genuine, unexpected send error. */
                 static uint64_t send_errors = 0;
                 if (send_errors < 5) {
-                    fprintf(stderr,
-                        "send() failed (frame_len=%d): %s\n",
-                        frame_len, strerror(errno));
+                    fprintf(stderr, "send() failed (frame_len=%d): %s\n",
+                            frame_len, strerror(errno));
                     if (errno == EMSGSIZE)
                         fprintf(stderr,
-                            "  -> frame too large for interface MTU. "
-                            "Check MTU with: ip link show\n");
+                            "  -> frame too large for interface MTU.\n");
                 }
                 send_errors++;
                 if (send_errors == 5)
                     fprintf(stderr, "(further send errors suppressed)\n");
+                if (interval_ns > 0)
+                    next_send_ns += interval_ns;
             }
-            if (interval_ns > 0)
-                next_send_ns += interval_ns;
         }
 
-        /* Drain receive queue */
-        int n = recv(sock, rx_buf, sizeof(rx_buf), 0);
-        if (n > 0) {
+        /* Drain the ENTIRE receive queue this iteration, not just one frame.
+         * This is what prevents received frames piling up in the socket
+         * buffer and being misread as losses. */
+        for (;;) {
+            int n = recv(sock, rx_buf, sizeof(rx_buf), 0);
+            if (n <= 0) break;   /* EAGAIN when queue empty -> done draining */
             g_stats.frames_received++;
-            parse_return_frame(rx_buf, n, num_slaves, g_loopback);
+            uint64_t rseq = parse_return_frame(rx_buf, n, num_slaves, g_loopback);
+            if (rseq != UINT64_MAX)
+                seq_mark_returned(rseq);
         }
 
-        /* Compute lost frames: simple heuristic — if received lags sent by >2 */
-        if (g_stats.frames_sent > g_stats.frames_received + 2)
-            g_stats.frames_lost = g_stats.frames_sent - g_stats.frames_received - 2;
+        /* Retire aged-out sequences; genuinely-lost frames are counted here. */
+        seq_retire(seq);
 
         /* Periodic stats print (every 5 seconds) */
         if (now - last_stat_ns >= 5000000000ULL) {
@@ -625,6 +705,17 @@ int main(int argc, char *argv[]) {
             last_stat_ns = now;
         }
     }
+
+    /* Drain any final in-flight frames and retire everything before summary. */
+    for (int flush = 0; flush < 1000; flush++) {
+        int n = recv(sock, rx_buf, sizeof(rx_buf), 0);
+        if (n <= 0) { sleep_ns(1000000); continue; }
+        g_stats.frames_received++;
+        uint64_t rseq = parse_return_frame(rx_buf, n, num_slaves, g_loopback);
+        if (rseq != UINT64_MAX)
+            seq_mark_returned(rseq);
+    }
+    seq_retire(seq + SEQ_WINDOW);  /* force-retire all remaining slots */
 
     /* Final stats */
     uint64_t end_ns  = now_ns();
