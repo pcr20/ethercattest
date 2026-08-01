@@ -4,7 +4,40 @@ Tests EtherCAT physical layer bit error rate by saturating a slave chain
 with NOP frames and logging CRC errors from both the host NIC PHY and
 ESC slave registers.
 
+## Wire-exact loss accounting (model B)
+
+A frame is marked "outstanding" (eligible to be counted lost) only when its
+**software TX timestamp completion** confirms it left the driver — not when
+`send()` accepts it into the ring. The error-queue reader thread reads each
+completion's `SOF_TIMESTAMPING_OPT_ID` value (verified to equal the send-order
+sequence number, one completion per send) and marks that sequence transmitted.
+
+Consequences:
+
+- **`Lost frames` is wire-exact**: it counts only frames confirmed transmitted
+  that never returned. A frame enqueued but never transmitted (the socket/qdisc
+  tail discarded at shutdown) is never marked outstanding and so can never be
+  miscounted as loss.
+- A new line, **`TX confirmed (loss base)`**, shows how many frames were
+  confirmed transmitted — this is the denominator for the loss rate.
+- **`Enqueued, never tx`** appears at shutdown showing the discarded tail
+  (`enqueued − transmitted`), explicitly labelled *NOT loss*. This is where the
+  frames that older builds reported as phantom "lost" now correctly land.
+
+If TX timestamping is unavailable, the tool falls back to marking frames
+outstanding at enqueue (the frame is still counted, but the loss figure is then
+enqueue-based rather than wire-exact — flagged in the header line).
+
+### Completion-accounting guard
+
+Model B's loss figure depends on the TX completion stream being complete. At
+shutdown the tool cross-checks the number of counted completions against the
+driver's own `tx_packets`; if they diverge by more than ~0.1%, it prints a
+warning that completions were dropped and the loss figure may be overcounted,
+directing you to cross-check against the (independent) NIC CRC error count.
+
 ## TX pipeline: three counters
+
 
 The tool measures the transmit path at three stages so you can see exactly
 where frames accumulate:

@@ -248,6 +248,7 @@ typedef struct {
     uint32_t brd_wkc_expected;   /* = num_slaves */
     /* Cross-thread counters — atomic. Owner in comment. */
     _Atomic uint64_t frames_enqueued;  /* TX thread — send() accepted (ring)   */
+    _Atomic uint64_t frames_transmitted;/* errq thread — TX ts confirmed on wire*/
     _Atomic uint64_t frames_received;  /* RX thread                            */
     _Atomic uint64_t frames_lost;      /* TX thread (retire)                   */
     _Atomic uint64_t seq_bad;          /* RX thread                            */
@@ -347,6 +348,7 @@ static inline void seq_retire_final(uint64_t next_seq) {
 static volatile int g_running   = 1;  /* master run flag (RX honours this)   */
 static volatile int g_tx_running = 1;  /* TX-only stop flag for drain barrier */
 static _Atomic uint64_t g_tx_final_seq = 0; /* seq count at TX stop */
+static _Atomic uint64_t g_tx_transmitted_hi = 0; /* highest transmitted seq +1 */
 static int          g_verbose   = 0;
 static int          g_num_slaves = 0;
 static int          g_loopback   = 0;
@@ -701,22 +703,28 @@ static void print_stats(FILE *csv, uint64_t elapsed_ns, uint64_t new_nic_crc) {
     uint64_t kdrops   = atomic_load_explicit(&g_stats.kernel_drops, memory_order_relaxed);
     uint64_t plcrc    = atomic_load_explicit(&g_stats.payload_crc_errors, memory_order_relaxed);
     uint64_t tsc      = atomic_load_explicit(&g_stats.tx_ts_completions, memory_order_relaxed);
+    uint64_t txd      = atomic_load_explicit(&g_stats.frames_transmitted, memory_order_relaxed);
     uint64_t wire     = g_stats.tx_wire_packets;
 
-    uint64_t total_bits = sent * 12000ULL;
+    /* Bits actually put on the wire (transmitted), used for BER denominators —
+     * a frame never transmitted contributes no wire bits. */
+    uint64_t total_bits = txd * 12000ULL;
 
     /* NIC CRC delta */
     uint64_t nic_crc_delta = new_nic_crc - g_stats.nic_crc_errors_prev;
     g_stats.nic_crc_errors += nic_crc_delta;
     g_stats.nic_crc_errors_prev = new_nic_crc;
 
-    /* Frames still legitimately in flight — informational, NOT loss.
-     * Clamp at 0: on some interfaces (notably loopback) a frame can be
-     * delivered to the raw socket more than once, making received+lost
-     * momentarily exceed sent. That is a property of the test interface,
-     * not a real negative in-flight count. */
-    int64_t in_flight = (int64_t)sent - (int64_t)rcvd - (int64_t)lost;
+    /* Frames still legitimately in flight — informational, NOT loss. Under
+     * model B, in-flight = transmitted - received - lost (only transmitted
+     * frames are expected back). Clamp at 0 for interfaces that double-deliver. */
+    int64_t in_flight = (int64_t)txd - (int64_t)rcvd - (int64_t)lost;
     if (in_flight < 0) in_flight = 0;
+
+    /* Frames enqueued but never confirmed transmitted (socket/qdisc tail,
+     * discarded at shutdown). NOT loss — they never reached the wire. */
+    int64_t never_tx = (int64_t)sent - (int64_t)txd;
+    if (never_tx < 0) never_tx = 0;
 
     /* Effective throughput since last call. */
     static uint64_t prev_sent = 0, prev_ns = 0;
@@ -739,15 +747,19 @@ static void print_stats(FILE *csv, uint64_t elapsed_ns, uint64_t new_nic_crc) {
         printf("  TX driver-xmit (sw ts):  %lu   (gap vs ring: %ld)\n",
                tsc, (long)gap_ring_drv);
     else
-        printf("  TX driver-xmit (sw ts):  n/a (unsupported)\n");
+        printf("  TX driver-xmit (sw ts):  n/a (unsupported; marking at enqueue)\n");
     printf("  TX on wire (ethtool):    %lu   (gap vs driver: %ld)\n",
            wire, (long)gap_drv_wire);
+    printf("  TX confirmed (loss base):%lu\n", txd);
+    if (never_tx)
+        printf("  Enqueued, never tx:      %ld  (discarded, NOT loss)\n",
+               (long)never_tx);
     printf("  ── RX / integrity ──────────────────────────────────────\n");
     printf("  Frames rcvd:    %lu\n",    rcvd);
     printf("  Throughput:     %.0f fps  (%.1f Mbit/s)\n",
            fps, fps * 12000.0 / 1e6);
     printf("  In flight:      %ld  (queue lag, not loss)\n", (long)in_flight);
-    printf("  Lost frames:    %lu  (aged out, never returned)\n", lost);
+    printf("  Lost frames:    %lu  (transmitted, never returned)\n", lost);
     printf("  Unknown/dup seq:%lu\n",    bad);
     printf("  Payload CRC err:%lu  %s\n", plcrc,
            plcrc ? "*** PAYLOAD CORRUPTION (FCS-independent) ***" : "(clean)");
@@ -756,14 +768,14 @@ static void print_stats(FILE *csv, uint64_t elapsed_ns, uint64_t new_nic_crc) {
            kdrops ? "*** DRAIN SATURATED — BER INVALID ***" : "(none, drain healthy)");
     printf("  BRD WKC mismatches: %lu\n", wkcmm);
     printf("  NIC CRC errors: %lu (cumulative)\n", g_stats.nic_crc_errors);
-    printf("  Total bits:     %.3e\n", (double)total_bits);
+    printf("  Total wire bits:%.3e\n", (double)total_bits);
     if (total_bits > 0) {
         printf("  Est. BER (CRC): %.2e\n",
                (double)g_stats.nic_crc_errors / (double)total_bits);
         printf("  Payload BER:    %.2e\n",
                (double)plcrc / (double)total_bits);
-        printf("  Frame loss rate:%.2e\n",
-               sent ? (double)lost / (double)sent : 0.0);
+        printf("  Frame loss rate:%.2e  (lost / transmitted)\n",
+               txd ? (double)lost / (double)txd : 0.0);
     }
 
     if (g_verbose && !g_loopback) {
@@ -778,8 +790,8 @@ static void print_stats(FILE *csv, uint64_t elapsed_ns, uint64_t new_nic_crc) {
 
     /* CSV row */
     if (csv) {
-        fprintf(csv, "%.3f,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu",
-                elapsed_s, sent, wire, tsc, rcvd, lost,
+        fprintf(csv, "%.3f,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu",
+                elapsed_s, sent, wire, tsc, txd, rcvd, lost,
                 g_stats.nic_crc_errors, plcrc, wkcmm, kdrops, bad);
         for (int s = 0; s < g_num_slaves && s < MAX_SLAVES; s++)
             fprintf(csv, ",%lu,%lu,%lu,%lu",
@@ -792,8 +804,8 @@ static void print_stats(FILE *csv, uint64_t elapsed_ns, uint64_t new_nic_crc) {
 
 /* ── CSV header ─────────────────────────────────────────────────────────── */
 static void write_csv_header(FILE *csv, int num_slaves) {
-    fprintf(csv, "elapsed_s,tx_enqueued,tx_wire,tx_driver_xmit,frames_rcvd,"
-                 "frames_lost,nic_crc_errors,payload_crc_errors,"
+    fprintf(csv, "elapsed_s,tx_enqueued,tx_wire,tx_driver_xmit,tx_confirmed,"
+                 "frames_rcvd,frames_lost,nic_crc_errors,payload_crc_errors,"
                  "brd_wkc_mismatches,kernel_rx_drops,unknown_dup_seq");
     for (int s = 0; s < num_slaves; s++)
         fprintf(csv, ",slave%d_p0_crc,slave%d_p1_crc,slave%d_p2_crc,slave%d_p3_crc",
@@ -901,7 +913,21 @@ static void *tx_thread(void *arg) {
 
         int sent = send(ctx->sock, tx_buf, frame_len, 0);
         if (sent > 0) {
-            seq_mark_sent(seq);   /* inline retirement of the reused slot */
+            /* Model B: the errqueue thread marks the seq outstanding when the
+             * TX timestamp completion confirms transmission — see errq_thread.
+             * FALLBACK: if TX timestamping is unavailable, there are no
+             * completions, so we must mark at enqueue here (model A) or every
+             * frame would look lost. */
+            if (!g_stats.tx_ts_supported) {
+                seq_mark_sent(seq);
+                uint64_t hi = atomic_load_explicit(&g_tx_transmitted_hi,
+                                                   memory_order_relaxed);
+                if (seq + 1 > hi)
+                    atomic_store_explicit(&g_tx_transmitted_hi, seq + 1,
+                                          memory_order_relaxed);
+                atomic_fetch_add_explicit(&g_stats.frames_transmitted, 1,
+                                          memory_order_relaxed);
+            }
             atomic_fetch_add_explicit(&g_stats.frames_enqueued, 1, memory_order_relaxed);
             seq++;
             if (interval_ns) next_send_ns += interval_ns;
@@ -929,10 +955,11 @@ static void *tx_thread(void *arg) {
         }
     }
 
-    /* Publish the final sequence number so the main thread can run the loss
-     * sweep AFTER the post-TX drain barrier — NOT here. Sweeping now would
-     * count every still-in-flight frame as lost, which is wrong: those frames
-     * are still legitimately returning and RX is still draining them. */
+    /* Publish the final ENQUEUED sequence count. The loss sweep at shutdown
+     * uses the highest TRANSMITTED seq (g_tx_transmitted_hi, owned by the
+     * errqueue thread), not this — because only transmitted frames can be
+     * wire-lost. The gap (enqueued - transmitted) is reported separately as
+     * "discarded, never transmitted". */
     atomic_store_explicit(&g_tx_final_seq, seq, memory_order_release);
     return NULL;
 }
@@ -1041,60 +1068,106 @@ static int enable_tx_timestamping(int sock) {
     return 1;
 }
 
-/* ── Error-queue reader thread ──────────────────────────────────────────────
- * Drains MSG_ERRQUEUE, counting SCM_TIMESTAMPING completions — one per
- * transmitted frame. This is TX counter (c): "driver-xmit (sw ts)". Pinned to
- * a spare core; the completion rate equals the TX rate (~8k/s) so overhead is
- * negligible. */
+/* ── Error-queue reader thread (model B: TX-confirmation allocator) ──────────
+ * Drains MSG_ERRQUEUE. Each completion carries:
+ *   - an SCM_TIMESTAMPING cmsg (the software timestamp), and
+ *   - a sock_extended_err cmsg whose ee_data is the per-send frame ID
+ *     (enabled via SOF_TIMESTAMPING_OPT_ID). Verified empirically that
+ *     ee_data == send-order index == our seq (one frame per send, in order).
+ *
+ * For each completion we call seq_mark_sent(id): THIS is where a frame becomes
+ * "outstanding on the wire". Loss is therefore wire-exact — a frame enqueued
+ * but never transmitted never gets a completion, is never marked outstanding,
+ * and so can never be counted as lost.
+ *
+ * This thread is now the sole allocator (0->1) and reclaimer (->0) of seq
+ * slots, preserving the single-writer invariant of the lock-free tracker
+ * (RX still does the only 1->2 transition via CAS).
+ *
+ * ee_data is 32-bit and wraps at 2^32. At 8127 fps that is ~6 days before the
+ * first wrap; we widen it to 64-bit by tracking the high word, so long BER
+ * runs remain correct. */
 static void *errq_thread(void *arg) {
     ThreadCtx *ctx = (ThreadCtx *)arg;
     pin_to_core(ctx->errq_core);
+    try_realtime(85);   /* between RX(90) and TX(80): must keep up with TX */
 
     char ctrl[512];
     struct msghdr msg;
     struct pollfd pfd = { .fd = ctx->sock, .events = POLLERR };
 
+    uint32_t last_id32 = 0;     /* for 32->64 bit unwrap */
+    uint64_t id_hi     = 0;
+    int      have_prev = 0;
+
+    /* Process one drained completion: extract ee_data, widen, mark sent. */
+    #define HANDLE_COMPLETION(msgp) do {                                        \
+        uint32_t id32; int got_id = 0;                                         \
+        for (struct cmsghdr *cm = CMSG_FIRSTHDR(msgp); cm;                     \
+             cm = CMSG_NXTHDR(msgp, cm)) {                                     \
+            if (cm->cmsg_level == SOL_SOCKET &&                               \
+                cm->cmsg_type  == SCM_TIMESTAMPING) {                         \
+                atomic_fetch_add_explicit(&g_stats.tx_ts_completions, 1,       \
+                                          memory_order_relaxed);              \
+            }                                                                 \
+            /* sock_extended_err carries the OPT_ID value in ee_data. It may  \
+             * arrive at SOL_PACKET/PACKET_TX_TIMESTAMP or IP*_RECVERR level  \
+             * depending on family; match by origin instead of level/type. */ \
+            if (cm->cmsg_len >= CMSG_LEN(sizeof(struct sock_extended_err))) { \
+                struct sock_extended_err ee;                                  \
+                memcpy(&ee, CMSG_DATA(cm), sizeof(ee));                       \
+                if (ee.ee_origin == SO_EE_ORIGIN_TIMESTAMPING) {             \
+                    id32 = ee.ee_data; got_id = 1;                           \
+                }                                                             \
+            }                                                                 \
+        }                                                                     \
+        if (got_id) {                                                         \
+            /* 32->64 unwrap: detect wrap when id32 < last_id32 by a large    \
+             * margin. */                                                     \
+            if (have_prev && id32 < last_id32 &&                             \
+                (last_id32 - id32) > 0x80000000u)                            \
+                id_hi += 0x100000000ull;                                     \
+            last_id32 = id32; have_prev = 1;                                 \
+            uint64_t seq = id_hi + id32;                                     \
+            seq_mark_sent(seq);   /* inline slot-reuse retirement */         \
+            atomic_fetch_add_explicit(&g_stats.frames_transmitted, 1,         \
+                                      memory_order_relaxed);                 \
+            uint64_t hi = atomic_load_explicit(&g_tx_transmitted_hi,          \
+                                               memory_order_relaxed);        \
+            if (seq + 1 > hi)                                                 \
+                atomic_store_explicit(&g_tx_transmitted_hi, seq + 1,          \
+                                      memory_order_relaxed);                 \
+        }                                                                     \
+    } while (0)
+
     while (g_running) {
-        /* POLLERR signals the error queue has data. Short timeout so we
-         * re-check g_running for prompt shutdown. */
         int pr = poll(&pfd, 1, 100);
         if (pr < 0) { if (errno == EINTR) continue; break; }
         if (pr == 0) continue;
 
-        /* Drain all pending completions. */
         for (;;) {
             memset(&msg, 0, sizeof(msg));
-            msg.msg_control    = ctrl;
-            msg.msg_controllen = sizeof(ctrl);
+            msg.msg_control = ctrl; msg.msg_controllen = sizeof(ctrl);
             int n = recvmsg(ctx->sock, &msg, MSG_ERRQUEUE | MSG_DONTWAIT);
-            if (n < 0) break;   /* EAGAIN — queue empty */
-
-            /* Count each SCM_TIMESTAMPING control message as one TX
-             * completion. */
-            for (struct cmsghdr *cm = CMSG_FIRSTHDR(&msg); cm;
-                 cm = CMSG_NXTHDR(&msg, cm)) {
-                if (cm->cmsg_level == SOL_SOCKET &&
-                    cm->cmsg_type  == SCM_TIMESTAMPING) {
-                    atomic_fetch_add_explicit(&g_stats.tx_ts_completions, 1,
-                                              memory_order_relaxed);
-                }
-            }
+            if (n < 0) break;
+            HANDLE_COMPLETION(&msg);
         }
     }
 
-    /* Final drain. */
-    for (int i = 0; i < 1000; i++) {
-        memset(&msg, 0, sizeof(msg));
-        msg.msg_control = ctrl; msg.msg_controllen = sizeof(ctrl);
-        int n = recvmsg(ctx->sock, &msg, MSG_ERRQUEUE | MSG_DONTWAIT);
-        if (n < 0) break;
-        for (struct cmsghdr *cm = CMSG_FIRSTHDR(&msg); cm;
-             cm = CMSG_NXTHDR(&msg, cm)) {
-            if (cm->cmsg_level == SOL_SOCKET && cm->cmsg_type == SCM_TIMESTAMPING)
-                atomic_fetch_add_explicit(&g_stats.tx_ts_completions, 1,
-                                          memory_order_relaxed);
+    /* Final drain — catch completions for the last frames TX pushed out. */
+    uint64_t deadline = now_ns() + 500 * 1000000ULL;
+    while (now_ns() < deadline) {
+        int pr = poll(&pfd, 1, 50);
+        if (pr <= 0) { if (pr == 0) break; continue; }
+        for (;;) {
+            memset(&msg, 0, sizeof(msg));
+            msg.msg_control = ctrl; msg.msg_controllen = sizeof(ctrl);
+            int n = recvmsg(ctx->sock, &msg, MSG_ERRQUEUE | MSG_DONTWAIT);
+            if (n < 0) break;
+            HANDLE_COMPLETION(&msg);
         }
     }
+    #undef HANDLE_COMPLETION
     return NULL;
 }
 
@@ -1314,41 +1387,73 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    /* ── Drain barrier ──────────────────────────────────────────────────────
-     * TX has stopped (or is about to). Wait for the TX thread to finish, then
-     * let RX keep draining so every frame still legitimately in flight has
-     * time to return. Only after this quiet period do we sweep the sequence
-     * window for genuine losses. This is what prevents the ~60k in-flight
-     * frames at shutdown from being miscounted as lost. */
+    /* ── Drain barrier (model B) ────────────────────────────────────────────
+     * Ordered shutdown that makes the loss count wire-exact:
+     *   1. Stop TX, join it — no more sends.
+     *   2. Let the errqueue thread finish confirming transmissions (it marks
+     *      each transmitted seq outstanding). This settles how many frames
+     *      actually reached the wire.
+     *   3. Let RX drain returns for those transmitted frames.
+     *   4. Stop errq + RX, join.
+     *   5. Sweep only up to the highest TRANSMITTED seq — frames enqueued but
+     *      never transmitted are never swept, never counted as lost.
+     */
     g_tx_running = 0;
     pthread_join(tx_tid, NULL);
 
-    uint64_t tx_final = atomic_load_explicit(&g_tx_final_seq, memory_order_acquire);
+    uint64_t enq_final = atomic_load_explicit(&g_tx_final_seq, memory_order_acquire);
+    printf("\nTX stopped: %lu enqueued. Draining transmissions + returns...\n",
+           enq_final);
 
-    /* Wait until the in-flight count stops falling (RX has caught up) or a
-     * hard timeout elapses. In-flight = sent - received - lost(=0 so far). */
-    printf("\nTX stopped at seq %lu. Draining in-flight frames...\n", tx_final);
-    uint64_t drain_deadline = now_ns() + 2000ULL * 1000000ULL;  /* 2s max */
-    uint64_t prev_rcvd = 0, stable_ticks = 0;
+    /* Wait for the transmitted count to stop rising (errq caught up) AND the
+     * received count to reach transmitted (RX caught up), or a hard timeout. */
+    uint64_t drain_deadline = now_ns() + 3000ULL * 1000000ULL;  /* 3s max */
+    uint64_t prev_tx = 0, prev_rcvd = 0, stable = 0;
     while (now_ns() < drain_deadline) {
-        sleep_ns(50 * 1000000);   /* 50 ms */
+        sleep_ns(50 * 1000000);
+        uint64_t tx   = atomic_load_explicit(&g_stats.frames_transmitted, memory_order_relaxed);
         uint64_t rcvd = atomic_load_explicit(&g_stats.frames_received, memory_order_relaxed);
-        uint64_t sent = atomic_load_explicit(&g_stats.frames_enqueued, memory_order_relaxed);
-        if (rcvd >= sent) break;             /* everything came back */
-        if (rcvd == prev_rcvd) {
-            if (++stable_ticks >= 4) break;  /* 200ms with no new returns */
+        /* Done when transmissions have settled and returns have caught up. */
+        if (tx == prev_tx && rcvd >= tx) break;
+        if (tx == prev_tx && rcvd == prev_rcvd) {
+            if (++stable >= 4) break;   /* 200ms with no progress on either */
         } else {
-            stable_ticks = 0;
+            stable = 0;
         }
-        prev_rcvd = rcvd;
+        prev_tx = tx; prev_rcvd = rcvd;
     }
 
-    /* Now stop RX (and errq) and sweep the window for anything that never
-     * returned. */
+    /* Stop errq + RX and sweep. Sweep bound = highest transmitted seq, so only
+     * frames that actually reached the wire can be counted lost. */
     g_running = 0;
     pthread_join(rx_tid, NULL);
     if (have_errq) pthread_join(errq_tid, NULL);
-    seq_retire_final(tx_final);   /* count genuine losses only */
+    uint64_t tx_hi = atomic_load_explicit(&g_tx_transmitted_hi, memory_order_acquire);
+    seq_retire_final(tx_hi);   /* wire-exact loss: transmitted-but-not-returned */
+
+    /* Completion-accounting guard (model B integrity check). If the number of
+     * TX timestamp completions we counted diverges materially from the driver's
+     * own on-wire tx_packets count, some completions were dropped/coalesced —
+     * meaning some transmitted frames were never marked outstanding and could
+     * be wrongly counted as lost. Warn loudly rather than report a silently
+     * corrupted loss figure. A small difference (the last few frames whose
+     * completions are still in flight) is normal. */
+    if (have_errq) {
+        uint64_t txd  = atomic_load_explicit(&g_stats.frames_transmitted, memory_order_relaxed);
+        uint64_t wire = read_nic_tx_packets(iface) - g_stats.tx_wire_base;
+        int64_t  diff = (int64_t)wire - (int64_t)txd;
+        if (diff < 0) diff = -diff;
+        if (wire && diff > (int64_t)(wire / 1000 + 100)) {   /* >0.1% + 100 */
+            fprintf(stderr,
+                "\n*** WARNING: TX completion accounting mismatch ***\n"
+                "  ethtool wire tx_packets = %lu\n"
+                "  counted TX completions  = %lu  (diff %ld)\n"
+                "  Some TX timestamp completions were dropped/coalesced.\n"
+                "  The 'lost frames' figure may be OVERCOUNTED for this run.\n"
+                "  Cross-check against NIC CRC errors (which are independent).\n",
+                wire, txd, (long)diff);
+        }
+    }
 
     /* Final kernel-drop poll, wire count, and stats. */
     poll_kernel_drops(sock);
