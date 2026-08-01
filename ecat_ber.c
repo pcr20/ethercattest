@@ -310,132 +310,103 @@ typedef struct {
 /* g_stats is defined here (ahead of the SeqTrack helpers that update it). */
 static Stats g_stats;
 
-/* ── Outstanding-frame tracking window ──────────────────────────────────────
- * Ring of in-flight sequence numbers, shared between the TX and RX threads.
+/* ── RX-driven accounting (high-water mark) ─────────────────────────────────
+ * Accounting is resolved EXCLUSIVELY by good received frames, never by any
+ * TX-side signal. Frames are sent in strict seq order, so a good frame
+ * returning with seq N proves that seqs 0..N were all put on the wire (a later
+ * frame cannot return before an earlier one on a FIFO wire/loopback). This lets
+ * a single good frame back-calculate loss across an entire gap.
  *
- *   state transitions:     owner
- *     0 -> 1  (mark_sent)     TX
- *     1 -> 2  (mark_returned) RX   (atomic CAS)
- *     {1,2} -> 0 (retire)     TX
+ * INVARIANT: the high-water mark `hw` = highest seq that has returned GOOD, +1.
+ * When a good frame returns with seq N >= hw, every seq in [hw, N) was provably
+ * transmitted, and is resolved as exactly one of:
+ *   - returned corrupt  (recorded when the corrupt frame arrived) — counted as
+ *     a corruption event, NOT loss.
+ *   - absent            (no return recorded) — counted as WIRE LOSS now.
+ * Then hw = N+1.
  *
- * Because the TX thread is the sole allocator (0->1) and sole reclaimer
- * (->0), and retires a seq before it can reuse that slot (seq+WINDOW),
- * the only cross-thread write is RX's 1->2, done with an atomic CAS.
- * seq_at_slot is published by TX with a release store on state and read
- * by RX after an acquire load, giving correct visibility without a lock. */
-#define SEQ_WINDOW (1u << 20)         /* 1,048,576 — vastly exceeds in-flight */
+ * Frames at/above hw are simply NOT YET COUNTED — not loss, not anything —
+ * until a later good frame resolves them. Kernel-buffered/dropped frames during
+ * an outage therefore never get miscounted: they sit above hw until the first
+ * good frame on link recovery resolves the whole gap in one step.
+ *
+ * TERMINATION: the test may only conclude on a good frame (which resolves
+ * everything up to it). If the link is down at the intended end, we wait,
+ * warning once per second up to 10 times, and error out if no good frame comes.
+ *
+ * All seq values are uint64 — at 8127 fps a 32-bit counter would wrap in ~6
+ * days; uint64 never wraps within any realistic run. The window is a
+ * power-of-two ring indexed by (seq & MASK); the window (1M) vastly exceeds the
+ * credit depth (~4k), so a slot is never aliased before hw passes it.
+ *
+ * THREADING: the RX thread is the SOLE owner of all accounting state (hw, the
+ * returned records, loss/corruption counters). No other thread writes it, so no
+ * locking is needed. TX reads only the atomic credit counters. */
+#define SEQ_WINDOW (1u << 20)         /* 1,048,576 — vastly exceeds credit depth */
 #define SEQ_MASK   (SEQ_WINDOW - 1)
-typedef struct {
-    uint8_t  state[SEQ_WINDOW];       /* 0=free 1=outstanding 2=returned */
-    uint64_t seq_at_slot[SEQ_WINDOW];
-    uint64_t sent_ns[SEQ_WINDOW];     /* when slot marked outstanding (allocator) */
-} SeqTrack;
-static SeqTrack g_seq;
 
-/* Frames confirmed dead by the mid-run aging sweep (outstanding longer than the
- * stale timeout while the link was up). These are genuine losses, counted as
- * they age out rather than only at shutdown. Kept separate so the in-flight cap
- * can exclude them and TX can resume promptly after a link recovery. */
-static _Atomic uint64_t g_aged_out = 0;
+typedef struct {
+    /* Per-slot record of the seq that last returned and how. Owned by RX.
+     *   ret_seq[slot]  = the seq value whose return is recorded in this slot
+     *   ret_kind[slot] = 0 none, 1 good, 2 corrupt
+     * A slot is only meaningful when ret_seq[slot] matches the seq queried. */
+    uint64_t ret_seq[SEQ_WINDOW];
+    uint8_t  ret_kind[SEQ_WINDOW];
+    uint64_t hw;              /* high-water: highest GOOD-returned seq, +1       */
+    int      hw_valid;        /* 0 until the first good frame establishes hw     */
+} RxAccount;
+static RxAccount g_rx;
 
 static inline uint64_t now_ns(void);   /* defined below */
 
-/* TX thread: before reusing a slot, retire its previous occupant.
- * The slot that seq will occupy was last used by (seq - SEQ_WINDOW). If that
- * previous occupant is still 'outstanding' (state 1), it never came back =
- * genuine loss. This inline retirement guarantees retirement always stays
- * exactly in lock-step with reuse, closing the aliasing window that a
- * lazy/batched retire left open. */
-static inline void seq_mark_sent(uint64_t seq) {
+/* Credit accounting for TX throughput control (Issue 2). g_frames_resolved is
+ * advanced by the RX thread as the high-water mark passes seqs; TX computes
+ * credit = sent - resolved and caps it. */
+static _Atomic uint64_t g_frames_resolved = 0;
+
+/* Record that seq returned (good or corrupt). RX-thread only. */
+static inline void rx_record_return(uint64_t seq, int corrupt) {
     uint32_t slot = seq & SEQ_MASK;
-
-    /* Retire the previous occupant of this slot, if any. */
-    if (seq >= SEQ_WINDOW) {
-        uint64_t prev = seq - SEQ_WINDOW;
-        /* seq_at_slot still holds 'prev' here (we haven't overwritten yet). */
-        uint8_t st = __atomic_load_n(&g_seq.state[slot], __ATOMIC_ACQUIRE);
-        if (st == 1)
-            atomic_fetch_add_explicit(&g_stats.frames_lost, 1,
-                                      memory_order_relaxed);
-        (void)prev;
-    }
-
-    /* Publish new occupant: write seq_at_slot + timestamp, then release-store
-     * state=1 so a reader that sees state==1 also sees a consistent timestamp. */
-    g_seq.seq_at_slot[slot] = seq;
-    g_seq.sent_ns[slot]     = now_ns();
-    __atomic_store_n(&g_seq.state[slot], 1, __ATOMIC_RELEASE);
+    g_rx.ret_seq[slot]  = seq;
+    g_rx.ret_kind[slot] = corrupt ? 2 : 1;
 }
 
-/* RX thread: acquire-load state; if outstanding and seq matches, CAS 1->2. */
-static inline void seq_mark_returned(uint64_t seq) {
+/* Was seq recorded as returned (either kind) — and if so, corrupt? */
+static inline int rx_was_returned(uint64_t seq, int *corrupt) {
     uint32_t slot = seq & SEQ_MASK;
-    uint8_t st = __atomic_load_n(&g_seq.state[slot], __ATOMIC_ACQUIRE);
-    if (st == 1 && g_seq.seq_at_slot[slot] == seq) {
-        uint8_t expected = 1;
-        if (__atomic_compare_exchange_n(&g_seq.state[slot], &expected, 2,
-                                        0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
-            return;                    /* successfully marked returned */
+    if (g_rx.ret_seq[slot] == seq && g_rx.ret_kind[slot] != 0) {
+        if (corrupt) *corrupt = (g_rx.ret_kind[slot] == 2);
+        return 1;
     }
-    atomic_fetch_add_explicit(&g_stats.seq_bad, 1, memory_order_relaxed);
+    return 0;
 }
 
-/* TX thread, shutdown only: sweep the whole window and count any slot still
- * 'outstanding' as lost. Inline retirement in seq_mark_sent handles the
- * steady state; this catches the final in-flight tail that will never be
- * reused because sending has stopped. Idempotent. */
-static inline void seq_retire_final(uint64_t next_seq) {
-    uint64_t lo = (next_seq >= SEQ_WINDOW) ? (next_seq - SEQ_WINDOW) : 0;
-    for (uint64_t s = lo; s < next_seq; s++) {
-        uint32_t slot = s & SEQ_MASK;
-        if (g_seq.seq_at_slot[slot] == s) {
-            uint8_t st = __atomic_load_n(&g_seq.state[slot], __ATOMIC_ACQUIRE);
-            if (st == 1) {
-                atomic_fetch_add_explicit(&g_stats.frames_lost, 1,
-                                          memory_order_relaxed);
-                __atomic_store_n(&g_seq.state[slot], 0, __ATOMIC_RELEASE);
-            }
-        }
+/* Resolve the span up to a GOOD frame with seq N, back-calculating exact wire
+ * loss for absent seqs. RX-thread only. Advances hw and g_frames_resolved. */
+static inline void rx_resolve_good(uint64_t n) {
+    uint64_t from;
+    if (!g_rx.hw_valid) {
+        from = 0;                 /* first good frame resolves 0..n */
+        g_rx.hw_valid = 1;
+    } else {
+        if (n + 1 <= g_rx.hw) return;   /* already resolved (dup / out-of-order) */
+        from = g_rx.hw;
     }
-}
-
-/* Mid-run aging retirement. Called ONLY by the allocator (errqueue thread under
- * model B, or TX in the no-timestamp fallback) to preserve the single-writer
- * invariant on state 1->0. Scans the currently-outstanding seq range and
- * retires any slot outstanding longer than timeout_ns while treating it as
- * lost (aged out). This frees frames stranded by a link outage so the in-flight
- * cap releases and TX resumes promptly once the link recovers.
- *
- * The real wire RTT is microseconds, so a timeout of ~100ms can only ever fire
- * on genuinely dead frames — never on a frame that would still legitimately
- * return. Bounds the scan to [lo, hi) where hi is the highest transmitted seq
- * and lo tracks the last swept point, so cost is proportional to new frames,
- * not the whole window. */
-static inline void seq_age_out(uint64_t lo, uint64_t hi, uint64_t timeout_ns,
-                               uint64_t now) {
-    for (uint64_t s = lo; s < hi; s++) {
-        uint32_t slot = s & SEQ_MASK;
-        if (g_seq.seq_at_slot[slot] != s) continue;
-        uint8_t st = __atomic_load_n(&g_seq.state[slot], __ATOMIC_ACQUIRE);
-        if (st != 1) continue;
-        uint64_t sent = g_seq.sent_ns[slot];
-        if (sent && (now - sent) >= timeout_ns) {
-            /* Retire as aged-out loss. */
-            uint8_t expected = 1;
-            if (__atomic_compare_exchange_n(&g_seq.state[slot], &expected, 0,
-                                            0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
-                atomic_fetch_add_explicit(&g_stats.frames_lost, 1, memory_order_relaxed);
-                atomic_fetch_add_explicit(&g_aged_out, 1, memory_order_relaxed);
-            }
-        }
+    for (uint64_t s = from; s < n; s++) {
+        int corrupt = 0;
+        if (!rx_was_returned(s, &corrupt))
+            atomic_fetch_add_explicit(&g_stats.frames_lost, 1, memory_order_relaxed);
+        /* corrupt returns were already counted as corruption on arrival */
     }
+    g_rx.hw = n + 1;
+    /* Credit: everything up to and including n is now resolved. */
+    atomic_store_explicit(&g_frames_resolved, n + 1, memory_order_relaxed);
 }
 
 /* ── Globals ────────────────────────────────────────────────────────────── */
 static volatile int g_running   = 1;  /* master run flag (RX honours this)   */
 static volatile int g_tx_running = 1;  /* TX-only stop flag for drain barrier */
 static _Atomic uint64_t g_tx_final_seq = 0; /* seq count at TX stop */
-static _Atomic uint64_t g_tx_transmitted_hi = 0; /* highest transmitted seq +1 */
 static FILE        *g_linkev_csv = NULL;  /* per-event link log (may be NULL)  */
 static uint64_t     g_start_ns   = 0;     /* test start, for relative stamps   */
 static pthread_mutex_t g_linkev_mtx = PTHREAD_MUTEX_INITIALIZER;
@@ -752,7 +723,9 @@ static int build_frame(uint8_t *buf, int buflen,
  * Returns the sequence number extracted from the NOP payload, or UINT64_MAX
  * if the frame could not be parsed / is not one of ours. */
 static uint64_t parse_return_frame(const uint8_t *buf, int len,
-                                   int num_slaves, int loopback) {
+                                   int num_slaves, int loopback,
+                                   int *payload_ok) {
+    if (payload_ok) *payload_ok = 0;
     if (len < ETH_HDR_LEN + ECAT_HDR_LEN) return UINT64_MAX;
 
     int pos = ETH_HDR_LEN + ECAT_HDR_LEN;
@@ -784,6 +757,8 @@ static uint64_t parse_return_frame(const uint8_t *buf, int len,
         if (calc != embedded)
             atomic_fetch_add_explicit(&g_stats.payload_crc_errors, 1,
                                       memory_order_relaxed);
+        else if (payload_ok)
+            *payload_ok = 1;   /* payload CRC32C verified good */
     }
     pos += dg_len + ECAT_DG_WKC_LEN;
 
@@ -857,34 +832,28 @@ static void print_stats(FILE *csv, uint64_t elapsed_ns, uint64_t new_nic_crc) {
     uint64_t sent     = atomic_load_explicit(&g_stats.frames_enqueued, memory_order_relaxed);
     uint64_t rcvd     = atomic_load_explicit(&g_stats.frames_received, memory_order_relaxed);
     uint64_t lost     = atomic_load_explicit(&g_stats.frames_lost, memory_order_relaxed);
-    uint64_t bad      = atomic_load_explicit(&g_stats.seq_bad, memory_order_relaxed);
     uint64_t backp    = atomic_load_explicit(&g_stats.tx_backpressure, memory_order_relaxed);
     uint64_t wkcmm    = atomic_load_explicit(&g_stats.brd_wkc_mismatches, memory_order_relaxed);
     uint64_t kdrops   = atomic_load_explicit(&g_stats.kernel_drops, memory_order_relaxed);
     uint64_t plcrc    = atomic_load_explicit(&g_stats.payload_crc_errors, memory_order_relaxed);
     uint64_t tsc      = atomic_load_explicit(&g_stats.tx_ts_completions, memory_order_relaxed);
-    uint64_t txd      = atomic_load_explicit(&g_stats.frames_transmitted, memory_order_relaxed);
     uint64_t wire     = g_stats.tx_wire_packets;
+    /* Resolved = high-water mark = frames confirmed on the wire by a good
+     * return. This is the authoritative denominator for BER: every resolved
+     * frame provably traversed the wire. */
+    uint64_t resolved = atomic_load_explicit(&g_frames_resolved, memory_order_relaxed);
 
-    /* Bits actually put on the wire (transmitted), used for BER denominators —
-     * a frame never transmitted contributes no wire bits. */
-    uint64_t total_bits = txd * 12000ULL;
+    uint64_t total_bits = resolved * 12000ULL;
 
     /* NIC CRC delta */
     uint64_t nic_crc_delta = new_nic_crc - g_stats.nic_crc_errors_prev;
     g_stats.nic_crc_errors += nic_crc_delta;
     g_stats.nic_crc_errors_prev = new_nic_crc;
 
-    /* Frames still legitimately in flight — informational, NOT loss. Under
-     * model B, in-flight = transmitted - received - lost (only transmitted
-     * frames are expected back). Clamp at 0 for interfaces that double-deliver. */
-    int64_t in_flight = (int64_t)txd - (int64_t)rcvd - (int64_t)lost;
-    if (in_flight < 0) in_flight = 0;
-
-    /* Frames enqueued but never confirmed transmitted (socket/qdisc tail,
-     * discarded at shutdown). NOT loss — they never reached the wire. */
-    int64_t never_tx = (int64_t)sent - (int64_t)txd;
-    if (never_tx < 0) never_tx = 0;
+    /* Frames sent but not yet resolved (in flight + any not-yet-confirmed
+     * backlog). Informational, NOT loss — pending the next good frame. */
+    int64_t unresolved = (int64_t)sent - (int64_t)resolved;
+    if (unresolved < 0) unresolved = 0;
 
     /* Effective throughput since last call. */
     static uint64_t prev_sent = 0, prev_ns = 0;
@@ -893,38 +862,22 @@ static void print_stats(FILE *csv, uint64_t elapsed_ns, uint64_t new_nic_crc) {
         fps = (double)(sent - prev_sent) / ((elapsed_ns - prev_ns) / 1e9);
     prev_sent = sent; prev_ns = elapsed_ns;
 
-    /* TX pipeline gaps. Guard against transient negatives. */
-    int64_t gap_ring_drv  = (int64_t)sent - (int64_t)tsc;   /* socket/qdisc backlog */
-    int64_t gap_drv_wire  = (int64_t)tsc  - (int64_t)wire;  /* driver->hw backlog   */
-    if (gap_ring_drv < 0) gap_ring_drv = 0;
-    if (gap_drv_wire < 0) gap_drv_wire = 0;
-
     printf("\n── EtherCAT BER Test ─────────────────────────────────────\n");
     printf("  Elapsed:        %.1f s\n", elapsed_s);
-    printf("  ── TX pipeline ─────────────────────────────────────────\n");
+    printf("  ── TX pipeline (diagnostic) ────────────────────────────\n");
     printf("  TX enqueued (ring):      %lu\n", sent);
     if (g_stats.tx_ts_supported)
-        printf("  TX driver-xmit (sw ts):  %lu   (gap vs ring: %ld)\n",
-               tsc, (long)gap_ring_drv);
-    else
-        printf("  TX driver-xmit (sw ts):  n/a (unsupported; marking at enqueue)\n");
-    printf("  TX on wire (ethtool):    %lu   (gap vs driver: %ld)\n",
-           wire, (long)gap_drv_wire);
-    printf("  TX confirmed (loss base):%lu\n", txd);
-    if (never_tx)
-        printf("  Enqueued, never tx:      %ld  (discarded, NOT loss)\n",
-               (long)never_tx);
-    printf("  ── RX / integrity ──────────────────────────────────────\n");
+        printf("  TX driver-xmit (sw ts):  %lu\n", tsc);
+    printf("  TX on wire (ethtool):    %lu\n", wire);
+    printf("  ── Accounting (RX-driven) ──────────────────────────────\n");
     printf("  Frames rcvd:    %lu\n",    rcvd);
+    printf("  Resolved (high-water): %lu  (confirmed on wire by good return)\n",
+           resolved);
+    printf("  Unresolved:     %ld  (sent, pending next good frame — NOT loss)\n",
+           (long)unresolved);
     printf("  Throughput:     %.0f fps  (%.1f Mbit/s)\n",
            fps, fps * 12000.0 / 1e6);
-    printf("  In flight:      %ld  (queue lag, not loss)\n", (long)in_flight);
-    printf("  Lost frames:    %lu  (transmitted, never returned)\n", lost);
-    { uint64_t aged = atomic_load_explicit(&g_aged_out, memory_order_relaxed);
-      if (aged)
-          printf("    of which aged out (link-outage collateral): %lu\n", aged);
-    }
-    printf("  Unknown/dup seq:%lu\n",    bad);
+    printf("  Lost frames:    %lu  (absent below high-water — wire loss)\n", lost);
     printf("  Payload CRC err:%lu  %s\n", plcrc,
            plcrc ? "*** PAYLOAD CORRUPTION (FCS-independent) ***" : "(clean)");
     { uint64_t bfc = atomic_load_explicit(&g_stats.rx_bad_fcs_computed, memory_order_relaxed);
@@ -982,8 +935,8 @@ static void print_stats(FILE *csv, uint64_t elapsed_ns, uint64_t new_nic_crc) {
                g_stats.nic_crc_errors);
         printf("  BER (payload)<=:%.2e   ((%lu + 0.5) / N)\n",
                ((double)plcrc + 0.5) / (double)total_bits, plcrc);
-        printf("  Frame loss rate:%.2e  (lost / transmitted)\n",
-               txd ? (double)lost / (double)txd : 0.0);
+        printf("  Frame loss rate:%.2e  (lost / resolved)\n",
+               resolved ? (double)lost / (double)resolved : 0.0);
     }
 
     if (g_verbose && !g_loopback) {
@@ -1008,8 +961,8 @@ static void print_stats(FILE *csv, uint64_t elapsed_ns, uint64_t new_nic_crc) {
         uint64_t trunc= atomic_load_explicit(&g_stats.rx_truncated, memory_order_relaxed);
         fprintf(csv, "%.3f,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,"
                      "%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu",
-                elapsed_s, sent, wire, tsc, txd, rcvd, lost,
-                g_stats.nic_crc_errors, plcrc, wkcmm, kdrops, bad,
+                elapsed_s, sent, wire, tsc, resolved, rcvd, lost,
+                g_stats.nic_crc_errors, plcrc, wkcmm, kdrops, (uint64_t)unresolved,
                 g_stats.carrier_down, g_stats.carrier_up, g_stats.carrier_changes,
                 cp_d, cp_u, nl_d, nl_u, nl_o, bfc, bfa, trunc);
         for (int s = 0; s < g_num_slaves && s < MAX_SLAVES; s++)
@@ -1023,9 +976,9 @@ static void print_stats(FILE *csv, uint64_t elapsed_ns, uint64_t new_nic_crc) {
 
 /* ── CSV header ─────────────────────────────────────────────────────────── */
 static void write_csv_header(FILE *csv, int num_slaves) {
-    fprintf(csv, "elapsed_s,tx_enqueued,tx_wire,tx_driver_xmit,tx_confirmed,"
+    fprintf(csv, "elapsed_s,tx_enqueued,tx_wire,tx_driver_xmit,resolved,"
                  "frames_rcvd,frames_lost,nic_crc_errors,payload_crc_errors,"
-                 "brd_wkc_mismatches,kernel_rx_drops,unknown_dup_seq,"
+                 "brd_wkc_mismatches,kernel_rx_drops,unresolved,"
                  "carrier_down,carrier_up,carrier_changes,"
                  "link_down_cp,link_up_cp,link_down_nl,link_up_nl,netlink_overflows,"
                  "rx_bad_fcs_computed,rx_bad_fcs_auxdata,rx_truncated");
@@ -1100,16 +1053,6 @@ static void try_realtime(int prio) {
  * cap is essentially never hit; it only clamps pathological buffering.
  * ~4000 frames ≈ 0.5s of wire time at 8100 fps — ample in-flight headroom. */
 #define MAX_INFLIGHT 4000
-/* Backlog cap: bounds enqueued − transmitted (frames accepted by send() but not
- * yet confirmed on the wire). Larger than MAX_INFLIGHT because in normal
- * operation this gap is just completion latency (~4000); the cap only bites
- * during a link outage, where it stops runaway enqueueing into a dead link. */
-#define BACKLOG_LIMIT 8000
-/* A frame outstanding longer than this while the link is up is presumed lost
- * and aged out mid-run. Real wire RTT is microseconds; 100ms is far beyond any
- * legitimate return, but short enough that TX resumes promptly after a link
- * recovery once stranded frames age out. */
-#define STALE_TIMEOUT_NS (100ULL * 1000000ULL)
 
 static void *tx_thread(void *arg) {
     ThreadCtx *ctx = (ThreadCtx *)arg;
@@ -1130,41 +1073,23 @@ static void *tx_thread(void *arg) {
             }
         }
 
-        /* Two independent caps, both must be satisfied to send. This is what
-         * makes TX robust to link outages without either wedging or exploding.
-         *
-         * (1) IN-FLIGHT cap: transmitted − received − aged ≥ MAX_INFLIGHT.
-         *     Bounds frames confirmed on the wire but not yet returned. Uses
-         *     TRANSMITTED (not enqueued) so that frames stuck in the enqueue→
-         *     transmit gap — never confirmed, never returned, never aged — do
-         *     NOT pin this cap. Aged-out (link-outage collateral) is subtracted
-         *     so the cap releases and TX resumes promptly after recovery. This
-         *     fixes the post-outage wedge.
-         *
-         * (2) BACKLOG cap: enqueued − transmitted ≥ BACKLOG_LIMIT.
-         *     Bounds the pre-transmission backlog (socket/qdisc). During a link
-         *     outage TRANSMITTED freezes (no completions), so this cap engages
-         *     and stops TX from spewing hundreds of thousands of frames into the
-         *     dead link (the kernel silently drops them; send() does not reliably
-         *     EAGAIN on a raw AF_PACKET socket with no carrier). Once the link
-         *     returns, transmitted advances, the backlog drains, and this cap
-         *     releases. This prevents the enqueue explosion.
-         *
-         * Normal operation: cap (1) dominates (backlog is small, ~completion
-         * latency). Outage: cap (2) dominates (in-flight is near zero as nothing
-         * is confirmed). Neither depends on the tool's view of carrier state, so
-         * both are robust during a fast flap storm. Guarded against transient
-         * underflow (double-deliver on lo). */
-        uint64_t enq_now  = atomic_load_explicit(&g_stats.frames_enqueued, memory_order_relaxed);
-        uint64_t txd_now  = atomic_load_explicit(&g_stats.frames_transmitted, memory_order_relaxed);
-        uint64_t rcvd_now = atomic_load_explicit(&g_stats.frames_received, memory_order_relaxed);
-        uint64_t aged_now = atomic_load_explicit(&g_aged_out, memory_order_relaxed);
-        uint64_t inflight_accounted = rcvd_now + aged_now;
-        int inflight_capped = (txd_now > inflight_accounted) &&
-                              ((txd_now - inflight_accounted) >= MAX_INFLIGHT);
-        int backlog_capped  = (enq_now > txd_now) &&
-                              ((enq_now - txd_now) >= BACKLOG_LIMIT);
-        if (inflight_capped || backlog_capped) {
+        /* Credit window (Issue 2): keep at most ~MAX_INFLIGHT frames unresolved
+         * on the wire. credit = sent - resolved, where "resolved" is advanced
+         * purely by the RX high-water mark (a good frame resolves its whole
+         * span). This is fully decoupled from accounting and cannot wedge:
+         *  - Normal: frames resolve as they return (~100us); credit cycles;
+         *    TX stays saturated (EAGAIN paces at line rate).
+         *  - Outage: returns stop, resolved freezes, credit fills to the cap,
+         *    TX pauses (bounded — no explosion). Frames offered are held by the
+         *    qdisc (see setup: large txqueuelen) or, if dropped, resolved as
+         *    loss by the first good frame on recovery.
+         *  - Recovery: the first good frame advances the high-water mark across
+         *    the whole gap, resolving all of it at once; credit frees; TX
+         *    resumes full-rate immediately.
+         * Guarded against transient resolved>sent underflow. */
+        uint64_t sent_now = atomic_load_explicit(&g_stats.frames_enqueued, memory_order_relaxed);
+        uint64_t resolved = atomic_load_explicit(&g_frames_resolved, memory_order_relaxed);
+        if (sent_now > resolved && (sent_now - resolved) >= MAX_INFLIGHT) {
             atomic_fetch_add_explicit(&g_stats.tx_backpressure, 1, memory_order_relaxed);
             sleep_ns(10000);   /* 10us; loop re-checks g_tx_running */
             continue;
@@ -1176,33 +1101,16 @@ static void *tx_thread(void *arg) {
 
         int sent = send(ctx->sock, tx_buf, frame_len, 0);
         if (sent > 0) {
-            /* Model B: the errqueue thread marks the seq outstanding when the
-             * TX timestamp completion confirms transmission — see errq_thread.
-             * FALLBACK: if TX timestamping is unavailable, there are no
-             * completions, so we must mark at enqueue here (model A) or every
-             * frame would look lost. */
-            if (!g_stats.tx_ts_supported) {
-                seq_mark_sent(seq);
-                uint64_t hi = atomic_load_explicit(&g_tx_transmitted_hi,
-                                                   memory_order_relaxed);
-                if (seq + 1 > hi)
-                    atomic_store_explicit(&g_tx_transmitted_hi, seq + 1,
-                                          memory_order_relaxed);
-                atomic_fetch_add_explicit(&g_stats.frames_transmitted, 1,
-                                          memory_order_relaxed);
-            }
+            /* Accounting is RX-driven; TX only counts what it enqueued (for the
+             * credit window and the pipeline display). It does NOT mark frames
+             * outstanding — loss is determined solely by the RX high-water mark. */
             atomic_fetch_add_explicit(&g_stats.frames_enqueued, 1, memory_order_relaxed);
             seq++;
             if (interval_ns) next_send_ns += interval_ns;
 
         } else if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS) {
-            /* TX ring full = bus saturation. This IS the intended backpressure.
-             * Sleep a very short, bounded time and retry the SAME seq —
-             * nothing is lost. A real (not yielding) sleep is used rather than
-             * sched_yield() so we never live-lock the supervisor/RX threads on
-             * a CPU-constrained host; at ~10us it is far shorter than the
-             * ~120us it takes the wire to drain one 1500-byte frame, so the
-             * TX ring is refilled the instant space appears. */
+            /* TX ring/qdisc full = backpressure. Sleep a short bounded time and
+             * retry the SAME seq — nothing is lost (the frame was not enqueued). */
             atomic_fetch_add_explicit(&g_stats.tx_backpressure, 1, memory_order_relaxed);
             sleep_ns(10000);   /* 10 microseconds */
         } else {
@@ -1218,11 +1126,8 @@ static void *tx_thread(void *arg) {
         }
     }
 
-    /* Publish the final ENQUEUED sequence count. The loss sweep at shutdown
-     * uses the highest TRANSMITTED seq (g_tx_transmitted_hi, owned by the
-     * errqueue thread), not this — because only transmitted frames can be
-     * wire-lost. The gap (enqueued - transmitted) is reported separately as
-     * "discarded, never transmitted". */
+    /* Publish the final enqueued seq count (for the termination logic, which
+     * waits for the RX high-water mark to reach it on a good frame). */
     atomic_store_explicit(&g_tx_final_seq, seq, memory_order_release);
     return NULL;
 }
@@ -1358,9 +1263,32 @@ static void *rx_thread(void *arg) {
         if (content_len < (int)(ETH_HDR_LEN + ECAT_HDR_LEN + ECAT_DG_HDR_LEN)) \
             atomic_fetch_add_explicit(&g_stats.rx_truncated, 1,                \
                                       memory_order_relaxed);                   \
+        int payload_ok = 0;                                                    \
         uint64_t rseq = parse_return_frame(bufs[idx], content_len,             \
-                                           ctx->num_slaves, ctx->loopback);    \
-        if (rseq != UINT64_MAX) seq_mark_returned(rseq);                       \
+                                           ctx->num_slaves, ctx->loopback,     \
+                                           &payload_ok);                       \
+        /* RX-driven accounting. A frame is GOOD iff its Ethernet FCS is valid \
+         * (!comp_bad) AND its payload CRC32C verified (payload_ok). A good     \
+         * frame's seq is trustworthy and advances the high-water mark,         \
+         * resolving (and back-calculating loss for) its whole span. A corrupt  \
+         * frame (bad FCS or bad payload) is recorded as a corrupt return so    \
+         * the high-water resolver counts it as corruption, not loss — but its  \
+         * seq may be unreliable, so we only record it if seq is legible and    \
+         * not absurdly far from the current mark. */                          \
+        int good = (!comp_bad) && payload_ok;                                  \
+        if (rseq != UINT64_MAX) {                                              \
+            if (good) {                                                        \
+                rx_record_return(rseq, 0);                                     \
+                rx_resolve_good(rseq);                                         \
+            } else {                                                           \
+                /* Corrupt: record only if the seq is plausibly within the     \
+                 * live window ahead of the mark (guards against garbage seq    \
+                 * from a badly corrupted frame). */                           \
+                uint64_t hw = g_rx.hw;                                         \
+                if (!g_rx.hw_valid || (rseq >= hw && rseq < hw + SEQ_WINDOW))  \
+                    rx_record_return(rseq, 1);                                 \
+            }                                                                  \
+        }                                                                     \
         iov[idx].iov_len = RX_BUF;                                             \
         msgs[idx].msg_hdr.msg_controllen = sizeof(ctrls[idx]);                 \
     } while (0)
@@ -1458,52 +1386,21 @@ static void *errq_thread(void *arg) {
     struct msghdr msg;
     struct pollfd pfd = { .fd = ctx->sock, .events = POLLERR };
 
-    uint32_t last_id32 = 0;     /* for 32->64 bit unwrap */
-    uint64_t id_hi     = 0;
-    int      have_prev = 0;
-
-    /* Process one drained completion: extract ee_data, widen, mark sent. */
+    /* Process one drained completion: count it as a driver-xmit confirmation.
+     * This is now DISPLAY-ONLY (TX pipeline diagnostic) — accounting is fully
+     * RX-driven and does not use TX timestamps. */
     #define HANDLE_COMPLETION(msgp) do {                                        \
-        uint32_t id32; int got_id = 0;                                         \
         for (struct cmsghdr *cm = CMSG_FIRSTHDR(msgp); cm;                     \
              cm = CMSG_NXTHDR(msgp, cm)) {                                     \
             if (cm->cmsg_level == SOL_SOCKET &&                               \
                 cm->cmsg_type  == SCM_TIMESTAMPING) {                         \
                 atomic_fetch_add_explicit(&g_stats.tx_ts_completions, 1,       \
                                           memory_order_relaxed);              \
+                atomic_fetch_add_explicit(&g_stats.frames_transmitted, 1,      \
+                                          memory_order_relaxed);              \
             }                                                                 \
-            /* sock_extended_err carries the OPT_ID value in ee_data. It may  \
-             * arrive at SOL_PACKET/PACKET_TX_TIMESTAMP or IP*_RECVERR level  \
-             * depending on family; match by origin instead of level/type. */ \
-            if (cm->cmsg_len >= CMSG_LEN(sizeof(struct sock_extended_err))) { \
-                struct sock_extended_err ee;                                  \
-                memcpy(&ee, CMSG_DATA(cm), sizeof(ee));                       \
-                if (ee.ee_origin == SO_EE_ORIGIN_TIMESTAMPING) {             \
-                    id32 = ee.ee_data; got_id = 1;                           \
-                }                                                             \
-            }                                                                 \
-        }                                                                     \
-        if (got_id) {                                                         \
-            /* 32->64 unwrap: detect wrap when id32 < last_id32 by a large    \
-             * margin. */                                                     \
-            if (have_prev && id32 < last_id32 &&                             \
-                (last_id32 - id32) > 0x80000000u)                            \
-                id_hi += 0x100000000ull;                                     \
-            last_id32 = id32; have_prev = 1;                                 \
-            uint64_t seq = id_hi + id32;                                     \
-            seq_mark_sent(seq);   /* inline slot-reuse retirement */         \
-            atomic_fetch_add_explicit(&g_stats.frames_transmitted, 1,         \
-                                      memory_order_relaxed);                 \
-            uint64_t hi = atomic_load_explicit(&g_tx_transmitted_hi,          \
-                                               memory_order_relaxed);        \
-            if (seq + 1 > hi)                                                 \
-                atomic_store_explicit(&g_tx_transmitted_hi, seq + 1,          \
-                                      memory_order_relaxed);                 \
         }                                                                     \
     } while (0)
-
-    uint64_t last_age_ns = now_ns();
-    uint64_t age_lo = 0;   /* low watermark of the aging scan */
 
     while (g_running) {
         int pr = poll(&pfd, 1, 100);
@@ -1516,30 +1413,6 @@ static void *errq_thread(void *arg) {
                 if (n < 0) break;
                 HANDLE_COMPLETION(&msg);
             }
-        }
-        /* Periodic aging sweep (every ~50ms). Retire frames outstanding longer
-         * than STALE_TIMEOUT_NS — these are stranded by a link outage and would
-         * otherwise pin the in-flight cap and stall TX after recovery. The real
-         * RTT is microseconds, so this only ever fires on genuinely dead frames.
-         * As allocator, the errqueue thread is the safe place to do this.
-         *
-         * Only outstanding frames can be aged, and outstanding frames live in a
-         * bounded window just behind the highest transmitted seq (at most a few
-         * thousand — the in-flight depth). Scanning a fixed window behind hi
-         * keeps the sweep O(window), independent of run length. */
-        uint64_t now = now_ns();
-        if (now - last_age_ns >= 50 * 1000000ULL) {
-            uint64_t hi = atomic_load_explicit(&g_tx_transmitted_hi, memory_order_relaxed);
-            /* Scan back far enough to cover any plausible outstanding backlog.
-             * MAX_INFLIGHT bounds normal in-flight; use a generous multiple so
-             * a burst of stranded frames during an outage is fully covered. */
-            uint64_t span = (uint64_t)MAX_INFLIGHT * 4;
-            uint64_t lo = (hi > span) ? (hi - span) : 0;
-            if (lo < age_lo) lo = age_lo;   /* don't rescan retired region */
-            if (hi > lo) seq_age_out(lo, hi, STALE_TIMEOUT_NS, now);
-            /* Frames older than hi-span can't still be outstanding; advance. */
-            if (hi > span) age_lo = hi - span;
-            last_age_ns = now;
         }
     }
 
@@ -2059,73 +1932,77 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    /* ── Drain barrier (model B) ────────────────────────────────────────────
-     * Ordered shutdown that makes the loss count wire-exact:
-     *   1. Stop TX, join it — no more sends.
-     *   2. Let the errqueue thread finish confirming transmissions (it marks
-     *      each transmitted seq outstanding). This settles how many frames
-     *      actually reached the wire.
-     *   3. Let RX drain returns for those transmitted frames.
-     *   4. Stop errq + RX, join.
-     *   5. Sweep only up to the highest TRANSMITTED seq — frames enqueued but
-     *      never transmitted are never swept, never counted as lost.
+    /* ── Termination barrier (good-frame-gated) ─────────────────────────────
+     * The test may only conclude on a GOOD received frame, because only a good
+     * frame resolves the accounting up to its seq (RX high-water mark). We:
+     *   1. Stop TX (no more new sends), join it. Note the final enqueued seq.
+     *   2. Wait for the RX high-water mark to reach the final enqueued seq —
+     *      i.e. for a good frame confirming the last transmitted frame. This
+     *      back-calculates loss across any final gap exactly.
+     *   3. If the link is DOWN and the mark can't advance, warn once per second
+     *      up to 10 times ("reestablish link to complete test"). If a good
+     *      frame arrives, it resolves everything and we conclude cleanly. If 10
+     *      attempts elapse with no progress, give up with an error — the test
+     *      is INCOMPLETE, not "concluded".
      */
     g_tx_running = 0;
     pthread_join(tx_tid, NULL);
 
     uint64_t enq_final = atomic_load_explicit(&g_tx_final_seq, memory_order_acquire);
-    printf("\nTX stopped: %lu enqueued. Draining transmissions + returns...\n",
-           enq_final);
+    printf("\nTX stopped: %lu frames enqueued. Waiting for a good frame to "
+           "resolve the final span...\n", enq_final);
 
-    /* Wait for the transmitted count to stop rising (errq caught up) AND the
-     * received count to reach transmitted (RX caught up), or a hard timeout. */
-    uint64_t drain_deadline = now_ns() + 3000ULL * 1000000ULL;  /* 3s max */
-    uint64_t prev_tx = 0, prev_rcvd = 0, stable = 0;
-    while (now_ns() < drain_deadline) {
-        sleep_ns(50 * 1000000);
-        uint64_t tx   = atomic_load_explicit(&g_stats.frames_transmitted, memory_order_relaxed);
-        uint64_t rcvd = atomic_load_explicit(&g_stats.frames_received, memory_order_relaxed);
-        /* Done when transmissions have settled and returns have caught up. */
-        if (tx == prev_tx && rcvd >= tx) break;
-        if (tx == prev_tx && rcvd == prev_rcvd) {
-            if (++stable >= 4) break;   /* 200ms with no progress on either */
-        } else {
-            stable = 0;
+    /* Target: the high-water mark must reach enq_final (all enqueued seqs
+     * resolved). enq_final is the next seq that would have been sent, so the
+     * last actually-sent seq is enq_final-1; hw reaches enq_final when a good
+     * frame with seq >= enq_final-1 is received and resolves the span. */
+    int incomplete = 0;
+    if (enq_final == 0) {
+        /* Nothing was ever sent — trivially complete. */
+    } else {
+        uint64_t target = enq_final;              /* hw must reach this */
+        uint64_t warn_deadline = now_ns() + 1000ULL * 1000000ULL;
+        int warns = 0;
+        uint64_t settle_deadline = now_ns() + 500ULL * 1000000ULL;
+        for (;;) {
+            uint64_t hw = atomic_load_explicit((_Atomic uint64_t *)&g_rx.hw,
+                                               memory_order_relaxed);
+            int hwv = g_rx.hw_valid;
+            if (hwv && hw >= target) break;        /* resolved — conclude */
+
+            /* If returns are still flowing (normal quick drain), keep waiting a
+             * short settle period without warnings. */
+            if (now_ns() < settle_deadline) {
+                sleep_ns(5 * 1000000);
+                continue;
+            }
+
+            /* Beyond the settle period with the mark not yet at target: the
+             * link is likely down. Warn once per second, up to 10 times. */
+            if (now_ns() >= warn_deadline) {
+                warns++;
+                int link_up = atomic_load_explicit(&g_stats.link_state_up,
+                                                   memory_order_relaxed);
+                fprintf(stderr, "reestablish link to complete test "
+                        "(%d/10)%s — hw=%lu target=%lu\n",
+                        warns, link_up ? " [link reports UP]" : "",
+                        hwv ? hw : 0, target);
+                if (warns >= 10) { incomplete = 1; break; }
+                warn_deadline = now_ns() + 1000ULL * 1000000ULL;
+            }
+            sleep_ns(20 * 1000000);
         }
-        prev_tx = tx; prev_rcvd = rcvd;
     }
 
-    /* Stop errq + RX and sweep. Sweep bound = highest transmitted seq, so only
-     * frames that actually reached the wire can be counted lost. */
+    /* Stop RX and errq. */
     g_running = 0;
     pthread_join(rx_tid, NULL);
     if (have_errq) pthread_join(errq_tid, NULL);
-    uint64_t tx_hi = atomic_load_explicit(&g_tx_transmitted_hi, memory_order_acquire);
-    seq_retire_final(tx_hi);   /* wire-exact loss: transmitted-but-not-returned */
 
-    /* Completion-accounting guard (model B integrity check). If the number of
-     * TX timestamp completions we counted diverges materially from the driver's
-     * own on-wire tx_packets count, some completions were dropped/coalesced —
-     * meaning some transmitted frames were never marked outstanding and could
-     * be wrongly counted as lost. Warn loudly rather than report a silently
-     * corrupted loss figure. A small difference (the last few frames whose
-     * completions are still in flight) is normal. */
-    if (have_errq) {
-        uint64_t txd  = atomic_load_explicit(&g_stats.frames_transmitted, memory_order_relaxed);
-        uint64_t wire = read_nic_tx_packets(iface) - g_stats.tx_wire_base;
-        int64_t  diff = (int64_t)wire - (int64_t)txd;
-        if (diff < 0) diff = -diff;
-        if (wire && diff > (int64_t)(wire / 1000 + 100)) {   /* >0.1% + 100 */
-            fprintf(stderr,
-                "\n*** WARNING: TX completion accounting mismatch ***\n"
-                "  ethtool wire tx_packets = %lu\n"
-                "  counted TX completions  = %lu  (diff %ld)\n"
-                "  Some TX timestamp completions were dropped/coalesced.\n"
-                "  The 'lost frames' figure may be OVERCOUNTED for this run.\n"
-                "  Cross-check against NIC CRC errors (which are independent).\n",
-                wire, txd, (long)diff);
-        }
-    }
+    if (incomplete)
+        fprintf(stderr, "\n*** TEST INCOMPLETE: link did not recover; the final "
+                        "span could not be resolved from a good frame. Loss/BER "
+                        "figures below are NOT final. ***\n");
 
     /* Final kernel-drop poll, wire count, sysfs carrier counters, and stats. */
     poll_kernel_drops(sock);
@@ -2148,6 +2025,10 @@ int main(int argc, char *argv[]) {
     fclose(csv);
     close(sock);
 
+    if (incomplete) {
+        printf("\nTEST INCOMPLETE — results in %s are not final.\n", csv_path);
+        return 2;
+    }
     printf("\nDone. Results written to %s\n", csv_path);
     return 0;
 }

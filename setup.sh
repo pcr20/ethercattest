@@ -52,6 +52,14 @@ else
     echo "    counters, not delivered to the tool."
 fi
 
+# 4b. Raise txqueuelen so the qdisc can buffer the whole credit window during a
+#     brief link outage (frames are held, not dropped, until the link returns).
+#     Run qdisc_buffer_test.sh to confirm this NIC buffers rather than drops.
+echo "[4b] Raising txqueuelen to 16000 (qdisc buffer depth for outages)..."
+ip link set "$IFACE" txqueuelen 16000 2>/dev/null && \
+    echo "    txqueuelen=$(cat /sys/class/net/$IFACE/tx_queue_len)" || \
+    echo "    WARNING: could not set txqueuelen"
+
 # 4b. Raise kernel socket buffer ceilings so the tool's 64MB RX buffer request
 #     is honoured (the drain thread relies on this headroom to never overflow).
 echo "[4b] Raising kernel socket buffer limits..."
