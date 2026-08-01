@@ -4,7 +4,50 @@ Tests EtherCAT physical layer bit error rate by saturating a slave chain
 with NOP frames and logging CRC errors from both the host NIC PHY and
 ESC slave registers.
 
+## Receiving corrupt frames (rx-all + rx-fcs)
+
+By default the NIC checks the Ethernet FCS in hardware and **drops** any frame
+that fails — so a frame corrupted mid-flight (e.g. by a cable fault) never
+reaches the host and silently becomes a "lost" frame rather than a visible
+corruption. To receive corrupt frames instead, `setup.sh` enables two ethtool
+features on the RTL8125 (both supported):
+
+- **`rx-all on`** — deliver frames that fail the FCS check instead of dropping.
+- **`rx-fcs on`** — deliver the 4-byte FCS trailer so it can be verified in
+  software.
+
+The tool detects these at startup (via `ETHTOOL_GFEATURES`) and reports their
+state. With them on, corrupt frames are received and flagged two independent
+ways:
+
+- **Bad FCS (computed)** — the tool recomputes the Ethernet FCS (standard
+  CRC32, poly 0xEDB88320 — distinct from the CRC32C payload check) over each
+  frame and compares to the delivered trailer. Authoritative.
+- **Bad FCS (kernel)** — from the `PACKET_AUXDATA` `tp_status` the kernel
+  attaches to each frame. On the first few self-detected bad frames the tool
+  prints the raw `tp_status` so the exact FCS-fail bit for this driver can be
+  confirmed.
+
+Both are shown side by side (`Bad FCS (computed/kernel): N / M`) to cross-check,
+and appear in the CSV as `rx_bad_fcs_computed`, `rx_bad_fcs_auxdata`, plus
+`rx_truncated` for frames too short to parse (e.g. cut off by a mid-frame
+fault).
+
+A **corrupt-but-returned** frame whose sequence number still matches an
+outstanding frame counts as *returned* (not lost) and separately as bad-FCS —
+so a mid-frame cable short now surfaces as corruption rather than inflating the
+loss count. This directly addresses the case where a pin-short during a
+saturated run produced zero visible CRC errors: the corrupt frames were being
+dropped by the NIC before the socket; now they are delivered and counted.
+
+**Self-check:** if the tool ever flags >50% of frames as bad-FCS early in a
+run, it prints a warning — that indicates the FCS trailer offset/byte-order
+assumption needs adjustment for the driver, not that the link is bad. (The
+standard-CRC32 algorithm itself is verified against the `0xCBF43926` check
+value at build/test time.)
+
 ## Link-loss monitoring (host NIC)
+
 
 Link-loss (carrier down/up) events on the host interface are counted two
 independent ways, which cross-check each other:

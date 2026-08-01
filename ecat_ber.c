@@ -140,7 +140,31 @@ static void crc32c_init_table(void) {
         g_crc32c_tab[i] = c;
     }
 }
-static void crc32c_init(void) { crc32c_detect(); crc32c_init_table(); }
+static void crc32_init_table(void);   /* defined below */
+static void crc32c_init(void) { crc32c_detect(); crc32c_init_table(); crc32_init_table(); }
+
+/* ── Standard Ethernet CRC32 (FCS) ──────────────────────────────────────────
+ * Reflected CRC32, polynomial 0xEDB88320 — the Ethernet FCS algorithm. This is
+ * DISTINCT from the CRC32C (Castagnoli) used for the payload check. Used to
+ * independently verify the trailing FCS delivered when rx-fcs is enabled.
+ * Table-driven (computed per received frame, ~8k/s — negligible). */
+static uint32_t g_crc32_tab[256];
+static void crc32_init_table(void) {
+    for (uint32_t i = 0; i < 256; i++) {
+        uint32_t c = i;
+        for (int k = 0; k < 8; k++)
+            c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+        g_crc32_tab[i] = c;
+    }
+}
+/* Ethernet FCS over p[0..n). Standard init/xor (0xFFFFFFFF / final XOR). The
+ * on-wire FCS equals this computed over the frame (DA..last data byte). */
+static inline uint32_t eth_crc32(const uint8_t *p, size_t n) {
+    uint32_t crc = 0xFFFFFFFFu;
+    for (size_t i = 0; i < n; i++)
+        crc = g_crc32_tab[(crc ^ p[i]) & 0xFF] ^ (crc >> 8);
+    return crc ^ 0xFFFFFFFFu;
+}
 
 static inline uint32_t crc32c_sw(uint32_t crc, const uint8_t *p, size_t n) {
     crc = ~crc;
@@ -258,6 +282,9 @@ typedef struct {
     _Atomic uint64_t brd_wkc_mismatches;/* RX thread                           */
     _Atomic uint64_t kernel_drops;     /* main thread, from PACKET_STATISTICS  */
     _Atomic uint64_t payload_crc_errors;/* RX thread — CRC32C mismatch         */
+    _Atomic uint64_t rx_bad_fcs_auxdata;/* RX thread — kernel PACKET_AUXDATA    */
+    _Atomic uint64_t rx_bad_fcs_computed;/* RX thread — self-computed Eth FCS   */
+    _Atomic uint64_t rx_truncated;     /* RX thread — frame too short to parse  */
     _Atomic uint64_t tx_ts_completions;/* errqueue thread — sw TX timestamps   */
     /* On-wire TX packet count (ethtool tx_packets). Owned by supervisor. */
     uint64_t tx_wire_packets;          /* cumulative, from ethtool             */
@@ -502,6 +529,62 @@ static uint64_t read_sysfs_u64(const char *iface, const char *name, int *ok) {
     fclose(f);
     if (ok) *ok = (n == 1);
     return (n == 1) ? v : 0;
+}
+
+/* Query whether an ethtool feature (by name, e.g. "rx-fcs", "rx-all") is
+ * active. Uses ETHTOOL_GSSET_INFO + ETHTOOL_GSTRINGS(ETH_SS_FEATURES) to find
+ * the bit index, then ETHTOOL_GFEATURES to read it. Returns 1 if on, 0 if off
+ * or unknown, and sets *known=0 if the feature name wasn't found. */
+static int ethtool_feature_on(const char *iface, const char *feat, int *known) {
+    if (known) *known = 0;
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) return 0;
+    struct ifreq ifr; memset(&ifr, 0, sizeof(ifr));
+    strncpy(ifr.ifr_name, iface, IFNAMSIZ - 1);
+
+    /* Number of feature strings. */
+    struct { struct ethtool_sset_info hdr; uint32_t buf; } si;
+    memset(&si, 0, sizeof(si));
+    si.hdr.cmd = ETHTOOL_GSSET_INFO;
+    si.hdr.sset_mask = 1ULL << ETH_SS_FEATURES;
+    ifr.ifr_data = (void *)&si;
+    if (ioctl(fd, SIOCETHTOOL, &ifr) < 0 || si.hdr.sset_mask == 0) { close(fd); return 0; }
+    uint32_t nfeat = si.buf;
+    if (!nfeat) { close(fd); return 0; }
+
+    size_t gs_sz = sizeof(struct ethtool_gstrings) + (size_t)nfeat * ETH_GSTRING_LEN;
+    struct ethtool_gstrings *gs = calloc(1, gs_sz);
+    if (!gs) { close(fd); return 0; }
+    gs->cmd = ETHTOOL_GSTRINGS; gs->string_set = ETH_SS_FEATURES; gs->len = nfeat;
+    ifr.ifr_data = (void *)gs;
+    if (ioctl(fd, SIOCETHTOOL, &ifr) < 0) { free(gs); close(fd); return 0; }
+
+    int idx = -1;
+    for (uint32_t i = 0; i < nfeat; i++) {
+        char name[ETH_GSTRING_LEN + 1];
+        memcpy(name, gs->data + i * ETH_GSTRING_LEN, ETH_GSTRING_LEN);
+        name[ETH_GSTRING_LEN] = '\0';
+        if (strcmp(name, feat) == 0) { idx = (int)i; break; }
+    }
+    free(gs);
+    if (idx < 0) { close(fd); return 0; }   /* feature name not present */
+
+    uint32_t nblocks = (nfeat + 31) / 32;
+    size_t gf_sz = sizeof(struct ethtool_gfeatures)
+                 + (size_t)nblocks * sizeof(struct ethtool_get_features_block);
+    struct ethtool_gfeatures *gf = calloc(1, gf_sz);
+    if (!gf) { close(fd); return 0; }
+    gf->cmd = ETHTOOL_GFEATURES; gf->size = nblocks;
+    ifr.ifr_data = (void *)gf;
+    int on = 0;
+    if (ioctl(fd, SIOCETHTOOL, &ifr) == 0) {
+        uint32_t blk = idx / 32, bit = idx % 32;
+        on = (gf->features[blk].active >> bit) & 1;
+        if (known) *known = 1;
+    }
+    free(gf);
+    close(fd);
+    return on;
 }
 
 /* ── Build EtherCAT frame ───────────────────────────────────────────────── */
@@ -793,6 +876,14 @@ static void print_stats(FILE *csv, uint64_t elapsed_ns, uint64_t new_nic_crc) {
     printf("  Unknown/dup seq:%lu\n",    bad);
     printf("  Payload CRC err:%lu  %s\n", plcrc,
            plcrc ? "*** PAYLOAD CORRUPTION (FCS-independent) ***" : "(clean)");
+    { uint64_t bfc = atomic_load_explicit(&g_stats.rx_bad_fcs_computed, memory_order_relaxed);
+      uint64_t bfa = atomic_load_explicit(&g_stats.rx_bad_fcs_auxdata, memory_order_relaxed);
+      uint64_t trunc = atomic_load_explicit(&g_stats.rx_truncated, memory_order_relaxed);
+      printf("  Bad FCS (computed/kernel): %lu / %lu  %s\n", bfc, bfa,
+             bfc ? "*** CORRUPT FRAMES RECEIVED ***" : "(none)");
+      if (trunc)
+          printf("  Truncated frames: %lu  (too short to parse)\n", trunc);
+    }
     printf("  TX backpressure:%lu  (EAGAIN/in-flight cap, normal)\n", backp);
     printf("  Kernel RX drops:%lu  %s\n", kdrops,
            kdrops ? "*** DRAIN SATURATED — BER INVALID ***" : "(none, drain healthy)");
@@ -843,11 +934,14 @@ static void print_stats(FILE *csv, uint64_t elapsed_ns, uint64_t new_nic_crc) {
     if (csv) {
         uint64_t nl_d = atomic_load_explicit(&g_stats.link_down_nl, memory_order_relaxed);
         uint64_t nl_u = atomic_load_explicit(&g_stats.link_up_nl, memory_order_relaxed);
-        fprintf(csv, "%.3f,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu",
+        uint64_t bfc  = atomic_load_explicit(&g_stats.rx_bad_fcs_computed, memory_order_relaxed);
+        uint64_t bfa  = atomic_load_explicit(&g_stats.rx_bad_fcs_auxdata, memory_order_relaxed);
+        uint64_t trunc= atomic_load_explicit(&g_stats.rx_truncated, memory_order_relaxed);
+        fprintf(csv, "%.3f,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu",
                 elapsed_s, sent, wire, tsc, txd, rcvd, lost,
                 g_stats.nic_crc_errors, plcrc, wkcmm, kdrops, bad,
                 g_stats.carrier_down, g_stats.carrier_up, g_stats.carrier_changes,
-                nl_d, nl_u);
+                nl_d, nl_u, bfc, bfa, trunc);
         for (int s = 0; s < g_num_slaves && s < MAX_SLAVES; s++)
             fprintf(csv, ",%lu,%lu,%lu,%lu",
                     g_stats.esc_crc[s][0], g_stats.esc_crc[s][1],
@@ -862,7 +956,8 @@ static void write_csv_header(FILE *csv, int num_slaves) {
     fprintf(csv, "elapsed_s,tx_enqueued,tx_wire,tx_driver_xmit,tx_confirmed,"
                  "frames_rcvd,frames_lost,nic_crc_errors,payload_crc_errors,"
                  "brd_wkc_mismatches,kernel_rx_drops,unknown_dup_seq,"
-                 "carrier_down,carrier_up,carrier_changes,link_down_nl,link_up_nl");
+                 "carrier_down,carrier_up,carrier_changes,link_down_nl,link_up_nl,"
+                 "rx_bad_fcs_computed,rx_bad_fcs_auxdata,rx_truncated");
     for (int s = 0; s < num_slaves; s++)
         fprintf(csv, ",slave%d_p0_crc,slave%d_p1_crc,slave%d_p2_crc,slave%d_p3_crc",
                 s, s, s, s);
@@ -896,6 +991,8 @@ typedef struct {
     uint8_t         src_mac[6];
     int             num_slaves;
     int             loopback;
+    int             rx_fcs_on;    /* rx-fcs enabled: frames carry 4B FCS trailer */
+    int             rx_all_on;    /* rx-all enabled: bad-FCS frames delivered   */
     long            rate_hz;      /* 0 = saturate */
     int             tx_core;      /* CPU to pin TX thread (-1 = no pin) */
     int             rx_core;      /* CPU to pin RX thread (-1 = no pin) */
@@ -1023,6 +1120,11 @@ static void *tx_thread(void *arg) {
 
 /* ── RX thread ──────────────────────────────────────────────────────────── */
 #define RX_BATCH 256
+/* Received frames can carry a 4-byte trailing FCS (rx-fcs on) and, with
+ * rx-all on, may be corrupt/oversized. Give the RX buffer headroom. */
+#define RX_BUF   (MAX_FRAME + 8)
+/* Ethernet FCS length appended when rx-fcs is enabled. */
+#define FCS_LEN  4
 static void *rx_thread(void *arg) {
     ThreadCtx *ctx = (ThreadCtx *)arg;
     pin_to_core(ctx->rx_core);
@@ -1037,35 +1139,103 @@ static void *rx_thread(void *arg) {
     int flags = fcntl(ctx->sock, F_GETFL, 0);
     fcntl(ctx->sock, F_SETFL, flags | O_NONBLOCK);
 
-    static uint8_t bufs[RX_BATCH][MAX_FRAME];
+    static uint8_t bufs[RX_BATCH][RX_BUF];
+    static char    ctrls[RX_BATCH][CMSG_SPACE(sizeof(struct tpacket_auxdata))];
     struct mmsghdr msgs[RX_BATCH];
     struct iovec   iov[RX_BATCH];
 
     memset(msgs, 0, sizeof(msgs));
     for (int i = 0; i < RX_BATCH; i++) {
         iov[i].iov_base = bufs[i];
-        iov[i].iov_len  = MAX_FRAME;
-        msgs[i].msg_hdr.msg_iov    = &iov[i];
-        msgs[i].msg_hdr.msg_iovlen = 1;
+        iov[i].iov_len  = RX_BUF;
+        msgs[i].msg_hdr.msg_iov        = &iov[i];
+        msgs[i].msg_hdr.msg_iovlen     = 1;
+        msgs[i].msg_hdr.msg_control    = ctrls[i];
+        msgs[i].msg_hdr.msg_controllen = sizeof(ctrls[i]);
     }
 
     struct pollfd pfd = { .fd = ctx->sock, .events = POLLIN };
 
-    /* Drain helper: pull every available batch, non-blocking. Returns frames
-     * processed. */
+    /* Per-frame handler: strip/verify FCS, check auxdata FCS-fail, parse.
+     * rx_fcs_on / rx_all_on come from ctx (set from ethtool state at startup). */
+    #define HANDLE_FRAME(idx) do {                                              \
+        int raw_len = msgs[idx].msg_len;                                        \
+        atomic_fetch_add_explicit(&g_stats.frames_received, 1,                  \
+                                  memory_order_relaxed);                       \
+        /* Grab PACKET_AUXDATA tp_status (detector 1 source). */               \
+        uint32_t tp_status = 0; int have_aux = 0;                              \
+        for (struct cmsghdr *cm = CMSG_FIRSTHDR(&msgs[idx].msg_hdr); cm;       \
+             cm = CMSG_NXTHDR(&msgs[idx].msg_hdr, cm)) {                       \
+            if (cm->cmsg_level == SOL_PACKET &&                               \
+                cm->cmsg_type  == PACKET_AUXDATA) {                           \
+                struct tpacket_auxdata aux;                                    \
+                memcpy(&aux, CMSG_DATA(cm), sizeof(aux));                     \
+                tp_status = aux.tp_status; have_aux = 1;                       \
+            }                                                                 \
+        }                                                                     \
+        int content_len = raw_len;                                             \
+        /* Detector 2: self-computed Ethernet FCS (authoritative). */          \
+        int comp_bad = 0;                                                      \
+        if (ctx->rx_fcs_on && raw_len >= (int)(ETH_HDR_LEN + FCS_LEN)) {       \
+            content_len = raw_len - FCS_LEN;                                    \
+            uint32_t rx_fcs;                                                    \
+            memcpy(&rx_fcs, bufs[idx] + content_len, FCS_LEN);                 \
+            uint32_t calc = eth_crc32(bufs[idx], content_len);                 \
+            if (calc != rx_fcs) comp_bad = 1;                                   \
+        }                                                                     \
+        if (comp_bad) {                                                        \
+            atomic_fetch_add_explicit(&g_stats.rx_bad_fcs_computed, 1,         \
+                                      memory_order_relaxed);                   \
+            /* Sanity: if nearly every frame reads bad early on, our FCS       \
+             * offset/byte-order assumption is wrong, not the link. Warn once. */\
+            static _Atomic int warned = 0;                                    \
+            uint64_t rc = atomic_load_explicit(&g_stats.frames_received,       \
+                                               memory_order_relaxed);         \
+            uint64_t bc = atomic_load_explicit(&g_stats.rx_bad_fcs_computed,   \
+                                               memory_order_relaxed);         \
+            if (rc > 2000 && bc > rc / 2 &&                                   \
+                !atomic_exchange_explicit(&warned, 1, memory_order_relaxed)) { \
+                uint32_t rxf; memcpy(&rxf, bufs[idx] + content_len, FCS_LEN);  \
+                fprintf(stderr,                                               \
+                  "\n*** WARNING: >50%% of frames fail the self-computed FCS " \
+                  "check ***\n  This almost certainly means the FCS trailer "  \
+                  "offset or byte order\n  differs from assumption, NOT that "  \
+                  "the link is bad.\n  Sample: computed=0x%08x trailer=0x%08x " \
+                  "content_len=%d raw_len=%d\n  (Detector 2 may need a byte-"   \
+                  "order flip; detector 1/payload CRC unaffected.)\n",          \
+                  eth_crc32(bufs[idx], content_len), rxf, content_len, raw_len);\
+            }                                                                 \
+            /* Detector 1 calibration: print kernel tp_status on first few. */ \
+            static _Atomic uint64_t badseen = 0;                              \
+            uint64_t b = atomic_fetch_add_explicit(&badseen, 1,               \
+                                                   memory_order_relaxed);     \
+            if (have_aux && b < 8)                                            \
+                fprintf(stderr, "[bad-FCS frame] tp_status=0x%08x len=%d\n",   \
+                        tp_status, raw_len);                                   \
+        }                                                                     \
+        /* Detector 1: count frames the kernel flags via auxdata. We treat a   \
+         * frame as auxdata-bad if it lacks CSUM_VALID AND our own check also  \
+         * failed — until calibrated, detector 2 is authoritative and this     \
+         * mirrors it. Once we know the exact bit from the calibration prints  \
+         * above, this can be tightened to a pure kernel signal. */            \
+        if (have_aux && comp_bad)                                             \
+            atomic_fetch_add_explicit(&g_stats.rx_bad_fcs_auxdata, 1,          \
+                                      memory_order_relaxed);                   \
+        if (content_len < (int)(ETH_HDR_LEN + ECAT_HDR_LEN + ECAT_DG_HDR_LEN)) \
+            atomic_fetch_add_explicit(&g_stats.rx_truncated, 1,                \
+                                      memory_order_relaxed);                   \
+        uint64_t rseq = parse_return_frame(bufs[idx], content_len,             \
+                                           ctx->num_slaves, ctx->loopback);    \
+        if (rseq != UINT64_MAX) seq_mark_returned(rseq);                       \
+        iov[idx].iov_len = RX_BUF;                                             \
+        msgs[idx].msg_hdr.msg_controllen = sizeof(ctrls[idx]);                 \
+    } while (0)
+
     #define DRAIN_ONCE() do {                                                  \
         for (;;) {                                                             \
             int n = recvmmsg(ctx->sock, msgs, RX_BATCH, MSG_DONTWAIT, NULL);   \
             if (n <= 0) break;                                                 \
-            for (int i = 0; i < n; i++) {                                      \
-                atomic_fetch_add_explicit(&g_stats.frames_received, 1,         \
-                                          memory_order_relaxed);              \
-                uint64_t rseq = parse_return_frame(bufs[i], msgs[i].msg_len,   \
-                                                   ctx->num_slaves,            \
-                                                   ctx->loopback);             \
-                if (rseq != UINT64_MAX) seq_mark_returned(rseq);              \
-                iov[i].iov_len = MAX_FRAME;                                    \
-            }                                                                 \
+            for (int i = 0; i < n; i++) HANDLE_FRAME(i);                        \
         }                                                                     \
     } while (0)
 
@@ -1091,6 +1261,7 @@ static void *rx_thread(void *arg) {
             DRAIN_ONCE();
     }
     #undef DRAIN_ONCE
+    #undef HANDLE_FRAME
     return NULL;
 }
 
@@ -1444,6 +1615,29 @@ int main(int argc, char *argv[]) {
     poll_kernel_drops(sock);
     atomic_store_explicit(&g_stats.kernel_drops, 0, memory_order_relaxed);
 
+    /* Enable PACKET_AUXDATA so each received frame carries a tpacket_auxdata
+     * cmsg (tp_status) — detector 1 for bad-FCS frames. */
+    { int one = 1;
+      if (setsockopt(sock, SOL_PACKET, PACKET_AUXDATA, &one, sizeof(one)) < 0)
+          fprintf(stderr, "warning: PACKET_AUXDATA enable failed: %s\n",
+                  strerror(errno));
+    }
+
+    /* Detect rx-fcs / rx-all state (set externally by setup.sh). */
+    int rxfcs_known = 0, rxall_known = 0;
+    int rx_fcs_on = ethtool_feature_on(iface, "rx-fcs", &rxfcs_known);
+    int rx_all_on = ethtool_feature_on(iface, "rx-all", &rxall_known);
+    printf("RX frame capture: rx-fcs=%s rx-all=%s\n",
+           rxfcs_known ? (rx_fcs_on ? "on" : "off") : "unknown",
+           rxall_known ? (rx_all_on ? "on" : "off") : "unknown");
+    if (rx_all_on)
+        printf("  -> corrupt (bad-FCS) frames WILL be delivered and counted.\n");
+    else
+        printf("  -> corrupt frames are dropped by the NIC (enable rx-all to "
+               "receive them: setup.sh does this).\n");
+    if (rx_fcs_on)
+        printf("  -> frames carry a 4-byte FCS trailer; FCS verified in software.\n");
+
     /* Initialise CRC32C (detect SSE4.2, build table). */
     crc32c_init();
     printf("Payload check: CRC32C over seq+payload, %s; payload = xorshift64\n",
@@ -1518,6 +1712,8 @@ int main(int argc, char *argv[]) {
     memcpy(ctx.src_mac, src_mac, 6);
     ctx.num_slaves = num_slaves;
     ctx.loopback   = g_loopback;
+    ctx.rx_fcs_on  = rx_fcs_on;
+    ctx.rx_all_on  = rx_all_on;
     ctx.rate_hz    = rate_hz;
     ctx.tx_core    = tx_core;
     ctx.rx_core    = rx_core;

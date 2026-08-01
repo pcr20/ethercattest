@@ -38,6 +38,20 @@ for feature in rx tx gso gro tso ufo lro; do
     ethtool -K "$IFACE" "$feature" off 2>/dev/null || true
 done
 
+# 4a. Enable reception of ALL frames including bad-FCS, and keep the FCS
+#     trailer, so corrupt frames (e.g. from a mid-frame cable fault) are
+#     DELIVERED and can be counted rather than silently dropped by the NIC.
+#     rx-fcs: frames arrive with their 4-byte FCS trailer (verified in sw).
+#     rx-all: frames failing the FCS check are still delivered.
+echo "[4a] Enabling rx-all + rx-fcs (deliver corrupt frames)..."
+if ethtool -K "$IFACE" rx-all on rx-fcs on 2>/dev/null; then
+    echo "    rx-all=on rx-fcs=on"
+else
+    echo "    WARNING: this NIC does not support rx-all/rx-fcs; corrupt frames"
+    echo "    will be dropped by hardware and counted only via ethtool error"
+    echo "    counters, not delivered to the tool."
+fi
+
 # 4b. Raise kernel socket buffer ceilings so the tool's 64MB RX buffer request
 #     is honoured (the drain thread relies on this headroom to never overflow).
 echo "[4b] Raising kernel socket buffer limits..."
@@ -106,3 +120,4 @@ echo ""
 echo "To restore normal NIC settings after testing:"
 echo "  ethtool -s $IFACE autoneg on"
 echo "  ethtool -K $IFACE rx on tx on gso on gro on"
+echo "  ethtool -K $IFACE rx-all off rx-fcs off"
