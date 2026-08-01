@@ -30,7 +30,8 @@
  *   Each frame carries a 1342-byte NOP payload (max EtherCAT payload with
  *   room for 4 APRD slave-poll datagrams). At 100BASE-TX (100 Mbit/s) with
  *   ~1500-byte frames, maximum frame rate ≈ 8100 frames/s.
- *   Bits per frame ≈ 12000.  To accumulate 10^13 bits: ~10^13/12000 ≈ 8.3×10^8
+ *   Bits per frame = (frame+FCS)×8, measured at runtime (1518×8 = 12144 for a
+ *   full-size frame). To accumulate 10^13 bits: ~10^13/12144 ≈ 8.2×10^8
  *   frames ≈ 28 hours at saturation. Plan accordingly.
  *
  * Loopback cable wiring (100BASE-TX only, prevents 1000BASE-T negotiation):
@@ -393,6 +394,14 @@ static _Atomic uint64_t g_txok       = 0;  /* per-run TxOk (frames on wire)     
 static _Atomic uint64_t g_txer       = 0;  /* per-run TxER (carrier-lost etc.)  */
 static _Atomic uint64_t g_qdisc_drop = 0;  /* per-run qdisc tx_dropped (kernel) */
 
+/* Actual on-wire bits per frame, published by the TX thread after the first
+ * build_frame(): (frame_len + 4-byte FCS) * 8. These are exactly the
+ * CRC-protected bits — the bits whose corruption the FCS/payload detectors can
+ * observe — which is the principled BER denominator (preamble/SFD/IFG line
+ * symbols are excluded: an error there cannot produce a CRC count). 0 until
+ * the first frame is built. */
+static _Atomic uint64_t g_wire_bits_per_frame = 0;
+
 
 /* ── Globals ────────────────────────────────────────────────────────────── */
 static volatile int g_running   = 1;  /* master run flag (RX honours this)   */
@@ -623,8 +632,12 @@ static int build_frame(uint8_t *buf, int buflen,
     memcpy(buf + 6, src_mac, 6);
     buf[12] = 0x88; buf[13] = 0xA4;   /* EtherType */
 
-    /* Calculate payload sizes */
-    int aprd_bytes   = loopback ? 0 : (num_slaves * (ECAT_DG_OVERHEAD + 8));
+    /* Calculate payload sizes. NOTE: the APRD data size here MUST match the
+     * writer below (16 bytes: registers 0x0300-0x030F — port CRC/RX-error
+     * counters; lost-link 0x0310+ is NOT in this read). A mismatch makes
+     * nop_payload too large and the APRD loop writes past buflen — this exact
+     * mismatch (budget 8 vs writer 16) caused a stack overflow. */
+    int aprd_bytes   = loopback ? 0 : (num_slaves * (ECAT_DG_OVERHEAD + 16));
     int brd_bytes    = loopback ? 0 : (ECAT_DG_OVERHEAD + 1);
     int overhead     = ETH_HDR_LEN + ECAT_HDR_LEN + ECAT_DG_OVERHEAD
                        + brd_bytes + aprd_bytes;
@@ -675,13 +688,10 @@ static int build_frame(uint8_t *buf, int buflen,
         buf[pos++] = 0;                   /* 1 byte data */
         buf[pos++] = 0; buf[pos++] = 0;  /* WKC */
 
-        /* Datagrams 2..N+1: APRD per slave, reading 8 bytes at 0x0300
-         * (CRC counters 0x0300-0x0307 and lost-link 0x0310-0x0313 don't
-         *  fit in one contiguous read; we read 0x0300 block, 8 bytes,
-         *  which covers 0x0300-0x0307. Lost-link at 0x0310 needs a
-         *  second pass — we send a second set of APRD datagrams for that.
-         *  For simplicity here we read 16 bytes starting at 0x0300 which
-         *  covers both blocks since they're within the same 256-byte page.) */
+        /* Datagrams 2..N+1: APRD per slave, reading 16 bytes at 0x0300 —
+         * registers 0x0300-0x030F (port invalid-frame + RX-error counters).
+         * Lost-link counters live at 0x0310-0x0313 and are NOT covered by
+         * this read; they would need a second APRD set (see parse side). */
         for (int s = 0; s < num_slaves; s++) {
             int is_last = (s == num_slaves - 1);
             uint16_t aprd_lf = htons(16 | (is_last ? 0 : 0x8000));
@@ -710,6 +720,16 @@ static int build_frame(uint8_t *buf, int buflen,
     int ecat_payload_len = pos - ETH_HDR_LEN - ECAT_HDR_LEN;
     uint16_t ecat_hdr = htons((uint16_t)(ecat_payload_len & 0x07FF) | (0x1 << 12));
     memcpy(buf + ETH_HDR_LEN, &ecat_hdr, 2);
+
+    /* Self-check: pos must never exceed buflen. If it does, the overhead
+     * budget above disagrees with what was actually written (exactly the class
+     * of bug that caused a stack overflow when the APRD data size changed
+     * without the budget). Fail loudly rather than corrupt memory further. */
+    if (pos > buflen) {
+        fprintf(stderr, "FATAL: build_frame wrote %d bytes into a %d-byte "
+                "buffer (overhead accounting mismatch)\n", pos, buflen);
+        abort();
+    }
 
     return pos;  /* actual frame length */
 }
@@ -847,7 +867,10 @@ static void print_stats(FILE *csv, uint64_t elapsed_ns) {
     uint64_t lost = (lost_signed > 0) ? (uint64_t)lost_signed : 0;
 
     /* BER denominator = frames that actually reached the wire (TxOk). */
-    uint64_t total_bits = txok * 12000ULL;
+    /* BER denominator: TxOk × the ACTUAL on-wire bits per frame (frame + FCS,
+     * published by TX after the first build) — not a hard-coded approximation. */
+    uint64_t bits_per_frame = atomic_load_explicit(&g_wire_bits_per_frame, memory_order_relaxed);
+    uint64_t total_bits = txok * bits_per_frame;
 
     /* Effective WIRE throughput since last call. Computed from TxOk (frames
      * actually clocked onto the wire), NOT from enqueued — during an outage TX
@@ -879,7 +902,7 @@ static void print_stats(FILE *csv, uint64_t elapsed_ns) {
     printf("  Frames rcvd (raw):      %lu\n", rcvd);
     printf("  Good distinct returns:  %lu  (FCS+payload valid, deduped)\n", distinct);
     printf("  Wire throughput:%.0f fps  (%.1f Mbit/s)  [from TxOk]\n",
-           fps, fps * 12000.0 / 1e6);
+           fps, fps * (double)bits_per_frame / 1e6);
     printf("  Lost frames:    %lu  (TxOk − good returns; includes corrupt)\n", lost);
     printf("  Payload CRC err:%lu  %s\n", plcrc,
            plcrc ? "*** PAYLOAD CORRUPTION (FCS-independent) ***" : "(clean)");
@@ -925,7 +948,8 @@ static void print_stats(FILE *csv, uint64_t elapsed_ns) {
                    nl_ovf);
     }
     printf("  BRD WKC mismatches: %lu\n", wkcmm);
-    printf("  Total wire bits:%.3e\n", (double)total_bits);
+    printf("  Total wire bits:%.3e  (%lu bits/frame, frame+FCS, measured)\n",
+           (double)total_bits, bits_per_frame);
     if (total_bits > 0) {
         /* BER upper-bound estimator: (errors + 0.5) / N. The +0.5 gives a
          * conservative upper bound even when zero errors have been observed
@@ -1098,6 +1122,14 @@ static void *tx_thread(void *arg) {
         int frame_len = build_frame(tx_buf, sizeof(tx_buf), ctx->src_mac,
                                     ctx->loopback ? 0 : ctx->num_slaves,
                                     seq, ctx->loopback);
+
+        /* Publish the actual on-wire bits per frame once (constant for the
+         * run: only seq/payload contents vary, not the size). frame_len + the
+         * 4-byte FCS appended by the NIC = the CRC-protected on-wire bytes. */
+        if (atomic_load_explicit(&g_wire_bits_per_frame, memory_order_relaxed) == 0)
+            atomic_store_explicit(&g_wire_bits_per_frame,
+                                  ((uint64_t)frame_len + 4) * 8,
+                                  memory_order_relaxed);
 
         int sent = send(ctx->sock, tx_buf, frame_len, 0);
         if (sent > 0) {
