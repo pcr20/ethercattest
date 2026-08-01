@@ -241,7 +241,30 @@ sudo ./ecat_ber -i enp2s0 -l -d 30
 
 
 
+### High "In flight" and a loss spike at shutdown on the passive loopback plug
+
+On a passive TX→RX loopback plug you will see two things that are **not**
+real losses:
+
+1. **"In flight" grows steadily** (e.g. 15k → 60k over 30s) and the sent
+   rate reads ~10,600 fps / 127 Mbit/s — above the 100BASE-TX wire limit.
+   The passive plug adds latency, so the NIC's TX ring buffers frames ahead
+   of the wire and the send counter runs ahead of returns. On a real
+   EtherCAT chain the round-trip is microseconds and in-flight stays tiny
+   (dozens), so this inflation does not occur.
+
+2. **A loss spike only appeared in older builds.** The tool now runs a
+   **drain barrier** at shutdown: it stops TX, waits (up to 2s, or until
+   returns catch up) for in-flight frames to come back, and only then sweeps
+   the sequence window for genuine losses. In-flight frames at stop time are
+   no longer miscounted as lost.
+
+The remaining lost/`Unknown-dup seq` counts you may see on `lo` specifically
+are the loopback double-delivery artifact described below — not present on a
+real wire.
+
 ### Testing against the `lo` interface shows inflated lost/dup counts
+
 
 Don't validate against `lo`. The Linux loopback interface can deliver a raw
 frame to the socket more than once and reflects sent frames back

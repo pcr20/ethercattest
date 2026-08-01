@@ -210,13 +210,21 @@ static inline void seq_retire_final(uint64_t next_seq) {
 }
 
 /* ── Globals ────────────────────────────────────────────────────────────── */
-static volatile int g_running = 1;
-static int          g_verbose  = 0;
+static volatile int g_running   = 1;  /* master run flag (RX honours this)   */
+static volatile int g_tx_running = 1;  /* TX-only stop flag for drain barrier */
+static _Atomic uint64_t g_tx_final_seq = 0; /* seq count at TX stop */
+static int          g_verbose   = 0;
 static int          g_num_slaves = 0;
 static int          g_loopback   = 0;
 
 /* ── Signal handler ─────────────────────────────────────────────────────── */
-static void sig_handler(int sig) { (void)sig; g_running = 0; }
+/* Stop TX first; the main thread performs the drain barrier and then clears
+ * g_running to stop RX. A second signal forces immediate exit. */
+static void sig_handler(int sig) {
+    (void)sig;
+    if (g_tx_running) g_tx_running = 0;   /* first: stop sending, drain */
+    else              g_running    = 0;   /* second: hard stop          */
+}
 
 /* ── Timing helpers ─────────────────────────────────────────────────────── */
 static inline uint64_t now_ns(void) {
@@ -646,7 +654,7 @@ static void *tx_thread(void *arg) {
     uint64_t interval_ns  = (ctx->rate_hz > 0) ? (1000000000ULL / ctx->rate_hz) : 0;
     uint64_t next_send_ns = now_ns();
 
-    while (g_running) {
+    while (g_tx_running) {
         if (interval_ns) {
             uint64_t now = now_ns();
             if (now < next_send_ns) {
@@ -689,8 +697,11 @@ static void *tx_thread(void *arg) {
         }
     }
 
-    /* Sweep the final in-flight tail so the loss count is complete. */
-    seq_retire_final(seq);
+    /* Publish the final sequence number so the main thread can run the loss
+     * sweep AFTER the post-TX drain barrier — NOT here. Sweeping now would
+     * count every still-in-flight frame as lost, which is wrong: those frames
+     * are still legitimately returning and RX is still draining them. */
+    atomic_store_explicit(&g_tx_final_seq, seq, memory_order_release);
     return NULL;
 }
 
@@ -940,14 +951,16 @@ int main(int argc, char *argv[]) {
     }
 
     /* Main thread = supervisor: prints stats, polls kernel drops, enforces
-     * duration. It touches no hot-path state except reading atomics. */
-    while (g_running) {
+     * duration. It touches no hot-path state except reading atomics.
+     * g_tx_running is what the supervisor and signal handler clear; g_running
+     * stays set until after the drain barrier. */
+    while (g_tx_running) {
         sleep_ns(200 * 1000000);   /* 200 ms tick */
         uint64_t now = now_ns();
 
         if (duration_s > 0 &&
             (now - start_ns) >= (uint64_t)duration_s * 1000000000ULL) {
-            g_running = 0;
+            g_tx_running = 0;
             break;
         }
 
@@ -960,10 +973,39 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    /* Signal threads to stop and wait for them. */
-    g_running = 0;
+    /* ── Drain barrier ──────────────────────────────────────────────────────
+     * TX has stopped (or is about to). Wait for the TX thread to finish, then
+     * let RX keep draining so every frame still legitimately in flight has
+     * time to return. Only after this quiet period do we sweep the sequence
+     * window for genuine losses. This is what prevents the ~60k in-flight
+     * frames at shutdown from being miscounted as lost. */
+    g_tx_running = 0;
     pthread_join(tx_tid, NULL);
+
+    uint64_t tx_final = atomic_load_explicit(&g_tx_final_seq, memory_order_acquire);
+
+    /* Wait until the in-flight count stops falling (RX has caught up) or a
+     * hard timeout elapses. In-flight = sent - received - lost(=0 so far). */
+    printf("\nTX stopped at seq %lu. Draining in-flight frames...\n", tx_final);
+    uint64_t drain_deadline = now_ns() + 2000ULL * 1000000ULL;  /* 2s max */
+    uint64_t prev_rcvd = 0, stable_ticks = 0;
+    while (now_ns() < drain_deadline) {
+        sleep_ns(50 * 1000000);   /* 50 ms */
+        uint64_t rcvd = atomic_load_explicit(&g_stats.frames_received, memory_order_relaxed);
+        uint64_t sent = atomic_load_explicit(&g_stats.frames_sent, memory_order_relaxed);
+        if (rcvd >= sent) break;             /* everything came back */
+        if (rcvd == prev_rcvd) {
+            if (++stable_ticks >= 4) break;  /* 200ms with no new returns */
+        } else {
+            stable_ticks = 0;
+        }
+        prev_rcvd = rcvd;
+    }
+
+    /* Now stop RX and sweep the window for anything that never returned. */
+    g_running = 0;
     pthread_join(rx_tid, NULL);
+    seq_retire_final(tx_final);   /* count genuine losses only */
 
     /* Final kernel-drop poll and stats. */
     poll_kernel_drops(sock);
