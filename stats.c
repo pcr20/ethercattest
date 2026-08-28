@@ -7,6 +7,11 @@ RxAccount g_rx;
 _Atomic uint64_t g_txok = 0;
 _Atomic uint64_t g_txer = 0;
 _Atomic uint64_t g_qdisc_drop = 0;
+_Atomic uint64_t g_rx_missed  = 0;
+_Atomic uint64_t g_rx_dropped = 0;
+_Atomic uint64_t g_rx_fifo    = 0;
+_Atomic uint64_t g_rx_nic_err = 0;
+_Atomic uint64_t g_rx_nic_crc = 0;
 _Atomic uint64_t g_wire_bits_per_frame = 0;
 BadFcsEv g_bfe[BADFCS_RING];
 _Atomic uint64_t g_bfe_head = 0;
@@ -124,7 +129,26 @@ void print_stats(FILE *csv, uint64_t elapsed_ns) {
     printf("  TX backpressure:%lu  (EAGAIN ring-full, normal)\n", backp);
     printf("  Kernel RX drops:%lu  %s\n", kdrops,
            kdrops ? "*** DRAIN SATURATED — BER INVALID ***" : "(none, drain healthy)");
-    /* ── Link (host NIC) — three independent sources ───────────── */
+
+    /* HOST-SIDE RX. Above the wire: a frame dropped here was transmitted and
+     * may have returned, but never reached us, so it lands in "lost" without
+     * any wire-side error. If any of these are nonzero the loss figure is
+     * contaminated and the BER bound is not valid. */
+    {
+        uint64_t rmiss = atomic_load_explicit(&g_rx_missed,  memory_order_relaxed);
+        uint64_t rdrop = atomic_load_explicit(&g_rx_dropped, memory_order_relaxed);
+        uint64_t rfifo = atomic_load_explicit(&g_rx_fifo,    memory_order_relaxed);
+        uint64_t rerr  = atomic_load_explicit(&g_rx_nic_err, memory_order_relaxed);
+        uint64_t rcrc  = atomic_load_explicit(&g_rx_nic_crc, memory_order_relaxed);
+        printf("  \u2500\u2500 Host-side RX (above the wire) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n");
+        printf("  NIC ring overflow (rx_missed): %lu\n", rmiss);
+        printf("  netdev rx_dropped: %lu   rx_fifo: %lu\n", rdrop, rfifo);
+        printf("  NIC rx_errors: %lu   rx_crc_errors: %lu\n", rerr, rcrc);
+        if (rmiss || rfifo || kdrops)
+            printf("  *** WARNING: frames were lost ABOVE the wire. The loss\n"
+                   "  *** figure below includes host-side drops and the BER\n"
+                   "  *** bound is NOT valid for this run. ***\n");
+    }    /* ── Link (host NIC) — three independent sources ───────────── */
     uint64_t nl_down = atomic_load_explicit(&g_stats.link_down_nl, memory_order_relaxed);
     uint64_t nl_up   = atomic_load_explicit(&g_stats.link_up_nl, memory_order_relaxed);
     uint64_t nl_ovf  = atomic_load_explicit(&g_stats.netlink_overflows, memory_order_relaxed);
@@ -206,11 +230,18 @@ void print_stats(FILE *csv, uint64_t elapsed_ns) {
         uint64_t trunc= atomic_load_explicit(&g_stats.rx_truncated, memory_order_relaxed);
         uint64_t lerr = atomic_load_explicit(&g_stats.rx_len_errors, memory_order_relaxed);
         fprintf(csv, "%.3f,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,"
-                     "%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu",
+                     "%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,"
+                     "%lu,%lu,%lu,%lu,%lu,%ld",
                 elapsed_s, sent, wire, txok, txer, qdrop, distinct, rcvd, lost,
                 plcrc, wkcmm, kdrops,
                 g_stats.carrier_down, g_stats.carrier_up, g_stats.carrier_changes,
-                cp_d, cp_u, nl_d, nl_u, nl_o, bfc, bfa, trunc, lerr);
+                cp_d, cp_u, nl_d, nl_u, nl_o, bfc, bfa, trunc, lerr,
+                atomic_load_explicit(&g_rx_missed,  memory_order_relaxed),
+                atomic_load_explicit(&g_rx_dropped, memory_order_relaxed),
+                atomic_load_explicit(&g_rx_fifo,    memory_order_relaxed),
+                atomic_load_explicit(&g_rx_nic_err, memory_order_relaxed),
+                atomic_load_explicit(&g_rx_nic_crc, memory_order_relaxed),
+                (long)lost_signed);
         for (int s = 0; s < g_num_slaves && s < MAX_SLAVES; s++)
             fprintf(csv, ",%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu",
                     g_stats.esc_crc[s][0], g_stats.esc_crc[s][1],
@@ -230,7 +261,9 @@ void write_csv_header(FILE *csv, int num_slaves) {
                  "brd_wkc_mismatches,kernel_rx_drops,"
                  "carrier_down,carrier_up,carrier_changes,"
                  "link_down_cp,link_up_cp,link_down_nl,link_up_nl,netlink_overflows,"
-                 "rx_bad_fcs_computed,rx_bad_fcs_auxdata,rx_truncated,rx_len_errors");
+                 "rx_bad_fcs_computed,rx_bad_fcs_auxdata,rx_truncated,rx_len_errors,"
+                 "host_rx_missed,host_rx_dropped,host_rx_fifo,host_rx_errors,"
+                 "host_rx_crc,txok_minus_returns_signed");
     for (int s = 0; s < num_slaves; s++)
         fprintf(csv, ",slave%d_p0_crc,slave%d_p1_crc,slave%d_p2_crc,slave%d_p3_crc"
                      ",slave%d_p0_lost,slave%d_p1_lost,slave%d_p2_lost,slave%d_p3_lost",

@@ -165,6 +165,14 @@ int main(int argc, char *argv[]) {
     /* TxER (carrier-lost etc.) and qdisc-drop baselines for the boundary split. */
     g_stats.tx_err_base = read_nic_tx_errors(iface);
     { int ok=0; g_stats.qdisc_drop_base = read_sysfs_u64(iface, "statistics/tx_dropped", &ok);
+    /* Host-side RX baselines — see stats.h. Any rise during the run means
+     * frames were lost above the wire, not on it. */
+    { int o;
+      g_stats.rx_missed_base  = read_sysfs_u64(iface, "statistics/rx_missed_errors", &o);
+      g_stats.rx_dropped_base = read_sysfs_u64(iface, "statistics/rx_dropped", &o);
+      g_stats.rx_fifo_base    = read_sysfs_u64(iface, "statistics/rx_fifo_errors", &o);
+      g_stats.rx_nic_err_base = read_sysfs_u64(iface, "statistics/rx_errors", &o);
+      g_stats.rx_nic_crc_base = read_sysfs_u64(iface, "statistics/rx_crc_errors", &o); }
       if (!ok) g_stats.qdisc_drop_base = 0; }
 
     /* Link-loss baselines (sysfs). All three exist on this kernel. */

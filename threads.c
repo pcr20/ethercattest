@@ -419,6 +419,26 @@ void *errq_thread(void *arg) {
  * smoothly (~per-frame under saturation), so 20ms sampling gives a sharp
  * boundary with at most ~a few hundred frames of edge fuzz during an outage
  * transition. Runs unpinned; the ioctl is cheap. */
+/* Host-side RX counters, base-subtracted. These live ABOVE the wire: a frame
+ * dropped here was transmitted (counted in TxOk) and may even have returned,
+ * but never reached us — so without these it is indistinguishable from
+ * physical-layer loss. Read from sysfs alongside the TX tallies. */
+static void sample_host_rx(const char *iface) {
+    struct { const char *name; uint64_t base; _Atomic uint64_t *out; } m[] = {
+        { "statistics/rx_missed_errors", g_stats.rx_missed_base,  &g_rx_missed  },
+        { "statistics/rx_dropped",       g_stats.rx_dropped_base, &g_rx_dropped },
+        { "statistics/rx_fifo_errors",   g_stats.rx_fifo_base,    &g_rx_fifo    },
+        { "statistics/rx_errors",        g_stats.rx_nic_err_base, &g_rx_nic_err },
+        { "statistics/rx_crc_errors",    g_stats.rx_nic_crc_base, &g_rx_nic_crc },
+    };
+    for (size_t i = 0; i < sizeof(m)/sizeof(m[0]); i++) {
+        int ok = 0;
+        uint64_t v = read_sysfs_u64(iface, m[i].name, &ok);
+        if (ok && v >= m[i].base)
+            atomic_store_explicit(m[i].out, v - m[i].base, memory_order_relaxed);
+    }
+}
+
 void *sampler_thread(void *arg) {
     ThreadCtx *ctx = (ThreadCtx *)arg;
     while (g_running) {
@@ -432,9 +452,11 @@ void *sampler_thread(void *arg) {
             atomic_store_explicit(&g_txer, txer - g_stats.tx_err_base, memory_order_relaxed);
         if (ok && qd >= g_stats.qdisc_drop_base)
             atomic_store_explicit(&g_qdisc_drop, qd - g_stats.qdisc_drop_base, memory_order_relaxed);
+        sample_host_rx(ctx->iface_name);
         sleep_ns(20 * 1000000ULL);   /* 20ms */
     }
     /* Final sample so the last stats/termination see current values. */
+    sample_host_rx(ctx->iface_name);
     uint64_t txok = read_nic_tx_packets(ctx->iface_name);
     uint64_t txer = read_nic_tx_errors(ctx->iface_name);
     if (txok >= g_stats.tx_wire_base)

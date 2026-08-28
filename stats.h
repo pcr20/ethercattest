@@ -43,6 +43,16 @@ typedef struct {
     uint64_t tx_wire_base;             /* baseline at start                    */
     uint64_t tx_err_base;              /* TxER baseline                        */
     uint64_t qdisc_drop_base;          /* qdisc tx_dropped baseline            */
+    /* HOST-SIDE RX baselines. The wire-truth model was asymmetric: TX had
+     * TxOk/TxER/qdisc-drop each separated with a documented rationale, while
+     * RX had only the AF_PACKET socket's tp_drops. A frame dropped in the NIC
+     * ring or the netdev layer never reaches the socket, so tp_drops stays 0
+     * while the frame is counted as wire LOSS. These close that gap. */
+    uint64_t rx_missed_base;           /* NIC ring overflow (rx_missed_errors) */
+    uint64_t rx_dropped_base;          /* netdev rx_dropped                    */
+    uint64_t rx_fifo_base;             /* rx_fifo_errors                       */
+    uint64_t rx_nic_err_base;          /* rx_errors                            */
+    uint64_t rx_nic_crc_base;          /* rx_crc_errors                        */
     int      tx_ts_supported;          /* 1 if sw TX timestamping active       */
     /* Link-loss tracking. sysfs counter deltas owned by supervisor; nl_* by the
      * netlink cross-check thread; carrier-poll events + link_state_up by the
@@ -144,6 +154,13 @@ static inline int rx_new_good_return(uint64_t seq) {
 extern _Atomic uint64_t g_txok;  /* per-run TxOk (frames on wire)     */
 extern _Atomic uint64_t g_txer;  /* per-run TxER (carrier-lost etc.)  */
 extern _Atomic uint64_t g_qdisc_drop;  /* per-run qdisc tx_dropped (kernel) */
+/* Per-run host-side RX counters, base-subtracted. Any of these being nonzero
+ * means frames were lost ABOVE the wire and the loss figure is contaminated. */
+extern _Atomic uint64_t g_rx_missed;   /* NIC ring overflow                 */
+extern _Atomic uint64_t g_rx_dropped;  /* netdev rx_dropped                 */
+extern _Atomic uint64_t g_rx_fifo;     /* rx_fifo_errors                    */
+extern _Atomic uint64_t g_rx_nic_err;  /* rx_errors                         */
+extern _Atomic uint64_t g_rx_nic_crc;  /* rx_crc_errors                     */
 
 /* Actual on-wire bits per frame, published by the TX thread after the first
  * build_frame(): (frame_len + 4-byte FCS) * 8. These are exactly the
