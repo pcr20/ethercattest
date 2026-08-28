@@ -100,14 +100,22 @@ extern Stats g_stats;
  *
  * All seq values are uint64 — at 8127 fps a 32-bit counter would wrap in ~6
  * days; uint64 never wraps within any realistic run. The window is a
- * power-of-two ring indexed by (seq & MASK); at ~8127 fps the 1M-entry window
- * spans ~129 s of transmission, vastly exceeding any plausible in-flight depth
- * (microseconds of chain RTT), so a slot is never aliased before hw passes it.
+ * power-of-two ring indexed by (seq & MASK).
+ *
+ * SIZING: seq increments once per SUCCESSFUL send(), NOT once per frame on the
+ * wire. Those differ by a lot: TX never halts, so it offers frames far faster
+ * than the 8127 fps link drains them and the qdisc discards the excess. A
+ * measured 1857 s run enqueued 114.7M while TxOk was 15.1M — a peak send rate
+ * near 130k/s, so the 1M-entry window spans about 8 s of enqueueing, not the
+ * ~129 s a naive wire-rate calculation gives. Still enormous next to the
+ * in-flight depth (microseconds of chain RTT), so a slot is never aliased
+ * before hw passes it — but size this against the ENQUEUE rate, not the wire
+ * rate, if the window is ever reduced.
  *
  * THREADING: the RX thread is the SOLE owner of all accounting state (hw, the
  * returned records, loss/corruption counters). No other thread writes it, so no
  * locking is needed. TX reads no accounting state back. */
-#define SEQ_WINDOW (1u << 20)         /* 1,048,576 — ~129 s of wire at 8127 fps */
+#define SEQ_WINDOW (1u << 20)         /* 1,048,576 — ~8 s at peak enqueue rate */
 #define SEQ_MASK   (SEQ_WINDOW - 1)
 
 typedef struct {
