@@ -225,7 +225,31 @@ void print_stats(FILE *csv, uint64_t elapsed_ns) {
             printf("  Slave %2d lost: P0=%lu P1=%lu P2=%lu P3=%lu  (link-down events)\n", s,
                    g_stats.esc_lostlnk[s][0], g_stats.esc_lostlnk[s][1],
                    g_stats.esc_lostlnk[s][2], g_stats.esc_lostlnk[s][3]);
-        }
+
+            printf("  Slave %2d rxerr:P0=%lu P1=%lu P2=%lu P3=%lu  (0x0301+2y RX errors)\n", s,
+                   g_stats.esc_rxerr[s][0], g_stats.esc_rxerr[s][1],
+                   g_stats.esc_rxerr[s][2], g_stats.esc_rxerr[s][3]);
+            printf("  Slave %2d fwderr:P0=%lu P1=%lu P2=%lu P3=%lu (0x0308+y forwarded)\n", s,
+                   g_stats.esc_fwderr[s][0], g_stats.esc_fwderr[s][1],
+                   g_stats.esc_fwderr[s][2], g_stats.esc_fwderr[s][3]);
+            printf("  Slave %2d proc-unit err (0x030C): %lu   PDI err (0x030D): %lu\n",
+                   s, g_stats.esc_puerr[s], g_stats.esc_pdierr[s]);
+            /* All these counters STOP at 0xFF (ESC Sec II v3.3 §2.9). Once
+             * saturated the delta reads zero forever, which looks identical to
+             * "no errors" — so say so explicitly. */
+            {
+                int sat = 0;
+                for (int p = 0; p < 4; p++)
+                    if (g_stats.esc_raw_crc[s][p] == 0xFF ||
+                        g_stats.esc_raw_rxerr[s][p] == 0xFF ||
+                        g_stats.esc_raw_fwderr[s][p] == 0xFF) sat = 1;
+                if (g_stats.esc_raw_puerr[s] == 0xFF || g_stats.esc_raw_pdierr[s] == 0xFF)
+                    sat = 1;
+                if (sat)
+                    printf("  Slave %2d *** a counter reads 0xFF = SATURATED; it has\n"
+                           "           *** stopped counting and the total above is a\n"
+                           "           *** FLOOR. Clear with ecat_escreset. ***\n", s);
+            }        }
     }
     printf("──────────────────────────────────────────────────────────\n");
 
@@ -258,11 +282,17 @@ void print_stats(FILE *csv, uint64_t elapsed_ns) {
                              ? g_stats.qdisc_real_end - g_stats.qdisc_real_start : 0)
                     : -1L);
         for (int s = 0; s < g_num_slaves && s < MAX_SLAVES; s++)
-            fprintf(csv, ",%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu",
+            fprintf(csv, ",%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu"
+                         ",%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu",
                     g_stats.esc_crc[s][0], g_stats.esc_crc[s][1],
                     g_stats.esc_crc[s][2], g_stats.esc_crc[s][3],
                     g_stats.esc_lostlnk[s][0], g_stats.esc_lostlnk[s][1],
-                    g_stats.esc_lostlnk[s][2], g_stats.esc_lostlnk[s][3]);
+                    g_stats.esc_lostlnk[s][2], g_stats.esc_lostlnk[s][3],
+                    g_stats.esc_rxerr[s][0], g_stats.esc_rxerr[s][1],
+                    g_stats.esc_rxerr[s][2], g_stats.esc_rxerr[s][3],
+                    g_stats.esc_fwderr[s][0], g_stats.esc_fwderr[s][1],
+                    g_stats.esc_fwderr[s][2], g_stats.esc_fwderr[s][3],
+                    g_stats.esc_puerr[s], g_stats.esc_pdierr[s]);
         fprintf(csv, "\n");
         fflush(csv);
     }
@@ -281,8 +311,12 @@ void write_csv_header(FILE *csv, int num_slaves) {
                  "host_rx_crc,txok_minus_returns_signed,qdisc_drops_real");
     for (int s = 0; s < num_slaves; s++)
         fprintf(csv, ",slave%d_p0_crc,slave%d_p1_crc,slave%d_p2_crc,slave%d_p3_crc"
-                     ",slave%d_p0_lost,slave%d_p1_lost,slave%d_p2_lost,slave%d_p3_lost",
-                s, s, s, s, s, s, s, s);
+                     ",slave%d_p0_lost,slave%d_p1_lost,slave%d_p2_lost,slave%d_p3_lost"
+                     ",slave%d_p0_rxerr,slave%d_p1_rxerr,slave%d_p2_rxerr,slave%d_p3_rxerr"
+                     ",slave%d_p0_fwderr,slave%d_p1_fwderr,slave%d_p2_fwderr,slave%d_p3_fwderr"
+                     ",slave%d_puerr,slave%d_pdierr",
+                s, s, s, s, s, s, s, s,
+                s, s, s, s, s, s, s, s, s, s);
     fprintf(csv, "\n");
     fflush(csv);
 }

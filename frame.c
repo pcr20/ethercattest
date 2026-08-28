@@ -278,11 +278,36 @@ uint64_t parse_return_frame(const uint8_t *buf, int len,
              * Lost link at 0x0310-0x0313 NOT in this read (we'd need another APRD)
              * For now we track the 4 invalid-frame counters */
             for (int p = 0; p < 4; p++) {
-                uint8_t cur = buf[pos + p * 2];  /* invalid frame counter for port p */
-                uint8_t prev = g_stats.esc_crc_prev[s][p];
-                uint8_t delta = (uint8_t)(cur - prev);  /* handles 8-bit wrap */
-                g_stats.esc_crc[s][p] += delta;
+                /* byte 2p   = 0x0300+2p invalid frame counter, port p
+                 * byte 2p+1 = 0x0301+2p RX error counter,      port p
+                 * byte 8+p  = 0x0308+p  forwarded RX error,    port p */
+                uint8_t cur = buf[pos + p * 2];
+                g_stats.esc_crc[s][p] += (uint8_t)(cur - g_stats.esc_crc_prev[s][p]);
                 g_stats.esc_crc_prev[s][p] = cur;
+                g_stats.esc_raw_crc[s][p]  = cur;
+
+                uint8_t rx = buf[pos + p * 2 + 1];
+                g_stats.esc_rxerr[s][p] += (uint8_t)(rx - g_stats.esc_rxerr_prev[s][p]);
+                g_stats.esc_rxerr_prev[s][p] = rx;
+                g_stats.esc_raw_rxerr[s][p]  = rx;
+
+                uint8_t fw = buf[pos + 8 + p];
+                g_stats.esc_fwderr[s][p] += (uint8_t)(fw - g_stats.esc_fwderr_prev[s][p]);
+                g_stats.esc_fwderr_prev[s][p] = fw;
+                g_stats.esc_raw_fwderr[s][p]  = fw;
+            }
+            /* 0x030C ECAT processing unit error counter — counts errors of
+             * frames passing the processing unit. 0x030D PDI0 error counter. */
+            {
+                uint8_t pu = buf[pos + 12];
+                g_stats.esc_puerr[s] += (uint8_t)(pu - g_stats.esc_puerr_prev[s]);
+                g_stats.esc_puerr_prev[s] = pu;
+                g_stats.esc_raw_puerr[s]  = pu;
+
+                uint8_t pd = buf[pos + 13];
+                g_stats.esc_pdierr[s] += (uint8_t)(pd - g_stats.esc_pdierr_prev[s]);
+                g_stats.esc_pdierr_prev[s] = pd;
+                g_stats.esc_raw_pdierr[s]  = pd;
             }
         }
 

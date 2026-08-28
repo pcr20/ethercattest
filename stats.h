@@ -20,6 +20,31 @@ typedef struct {
     uint64_t esc_lostlnk[MAX_SLAVES][4]; /* ports 0-3 */
     uint8_t  esc_crc_prev[MAX_SLAVES][4];
     uint8_t  esc_lostlnk_prev[MAX_SLAVES][4];
+    /* The APRD at 0x0300 already fetches 16 bytes every frame; only the four
+     * invalid-frame counters were ever used. These are the rest of that same
+     * datagram — no extra frames, no extra bandwidth. Layout per Beckhoff ESC
+     * Section II Register Description v3.3 §2.9:
+     *   0x0300+y*2 invalid frame counter port y   (was already tracked)
+     *   0x0301+y*2 RX error counter port y        <- esc_rxerr
+     *   0x0308+y   forwarded RX error counter     <- esc_fwderr
+     *   0x030C     ECAT processing unit errors    <- esc_puerr
+     *   0x030D     PDI0 error counter             <- esc_pdierr
+     * All are 8-bit and STOP at 0xFF. Once saturated the delta accumulation
+     * reads zero forever, so the last raw value is kept alongside to make
+     * saturation visible instead of looking like "no more errors". */
+    uint64_t esc_rxerr[MAX_SLAVES][4];
+    uint64_t esc_fwderr[MAX_SLAVES][4];
+    uint64_t esc_puerr[MAX_SLAVES];
+    uint64_t esc_pdierr[MAX_SLAVES];
+    uint8_t  esc_rxerr_prev[MAX_SLAVES][4];
+    uint8_t  esc_fwderr_prev[MAX_SLAVES][4];
+    uint8_t  esc_puerr_prev[MAX_SLAVES];
+    uint8_t  esc_pdierr_prev[MAX_SLAVES];
+    uint8_t  esc_raw_crc[MAX_SLAVES][4];    /* last raw value, for saturation */
+    uint8_t  esc_raw_rxerr[MAX_SLAVES][4];
+    uint8_t  esc_raw_fwderr[MAX_SLAVES][4];
+    uint8_t  esc_raw_puerr[MAX_SLAVES];
+    uint8_t  esc_raw_pdierr[MAX_SLAVES];
     uint32_t brd_wkc_expected;   /* = num_slaves */
     /* Cross-thread counters — atomic. Owner in comment. */
     _Atomic uint64_t frames_enqueued;  /* TX thread — send() accepted (ring)   */
