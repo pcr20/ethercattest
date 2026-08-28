@@ -2,139 +2,294 @@
  *
  * *** THIS TOOL WRITES TO THE SLAVE. It is NOT ecat_regdump. ***
  *
- * Even a PHY *read* writes ESC registers: MII management is an indirect
- * interface, so the PHY address/register selector (0x0512) and a command
- * (0x0510) must be written before the result appears in the data register
- * (0x0514). Those writes target the ESC's MII block, not the drive
- * application — but if the drive firmware holds MII via PDI they contend.
+ * Even a PHY *read* writes ESC registers: MII management is indirect, so the
+ * PHY address/register selector (0x0512) and a command (0x0510) must be
+ * written before the result appears in the data register (0x0514). Those
+ * writes target the ESC's MII block, not the drive application.
  *
- * Writing a PHY REGISTER (which changes DUT behaviour) additionally requires
- * the explicit --allow-phy-write flag. There is no way to write a PHY register
- * by accident.
+ * Reading EXTENDED registers additionally writes the PHY itself (REGCR/ADDAR
+ * are a shared indirect pointer), and so requires --allow-phy-write.
  *
- * DECODE CAVEAT: every value is printed RAW first. Decodes are a convenience
- * and are marked UNVERIFIED where they are not confirmed from the DP83822
- * datasheet (SNLS505H) or ETG.1000.6. The raw value is authoritative. */
+ * All register addresses, bit positions and encodings come from SNLS505H
+ * Rev H section 8 and SNLA265. See phy_regs.h. */
 #include "ecat_common.h"
 #include "escmii.h"
+#include "phy_regs.h"
 
-/* ── DP83822 register map (confirmed from SNLS505H, see README §6.3) ────── */
-typedef struct { uint8_t reg; const char *name; int clear_on_read; } PhyReg;
+static FILE *g_csv = NULL;
 
-static const PhyReg phy_direct[] = {
-    { 0x00, "BMCR   basic mode control",              0 },
-    { 0x01, "BMSR   basic mode status (latched low)", 1 },
-    { 0x06, "ANER   autoneg expansion (latched)",     1 },
-    { 0x09, "CR1    control 1 (TDR auto-run bit 8)",  0 },
-    { 0x0B, "CR3    control 3 (FLD criteria enable)", 0 },
-    { 0x0F, "FLDS   fast link drop status",           0 },
-    { 0x10, "PHYSTS phy status",                      0 },
-    { 0x12, "MISR1  interrupt status 1",              1 },
-    { 0x13, "MISR2  interrupt status 2",              1 },
-    { 0x19, "PHYCR  phy control (auto-MDIX)",         0 },
-};
-
-static void print_bits(uint16_t v) {
-    for (int b = 15; b >= 0; b--) {
-        putchar((v >> b) & 1 ? '1' : '0');
-        if (b % 4 == 0 && b) putchar(' ');
-    }
+static void csv_row(int phy, const char *space, unsigned addr,
+                    const char *name, int ok, uint16_t v)
+{
+    if (!g_csv) return;
+    char clean[64]; size_t j = 0;
+    for (const char *p = name; *p && j < sizeof(clean) - 1; p++)
+        if (*p != ',') clean[j++] = (*p == ' ' && j && clean[j-1] == ' ') ? *p : *p;
+    clean[j] = '\0';
+    if (ok) fprintf(g_csv, "%d,%s,0x%04X,%s,0x%04X,%u\n", phy, space, addr, clean, v, v);
+    else    fprintf(g_csv, "%d,%s,0x%04X,%s,,\n", phy, space, addr, clean);
 }
 
-static void decode_bmcr(uint16_t v) {
-    printf("      speed=%s duplex=%s autoneg=%s power-down=%s isolate=%s loopback=%s\n",
-           (v & 0x2000) ? "100M" : "10M", (v & 0x0100) ? "full" : "half",
-           (v & 0x1000) ? "on" : "off",   (v & 0x0800) ? "YES" : "no",
-           (v & 0x0400) ? "YES" : "no",   (v & 0x4000) ? "YES" : "no");
+static void bits16(uint16_t v) {
+    for (int b = 15; b >= 0; b--) { putchar((v >> b) & 1 ? '1' : '0');
+                                    if (b % 4 == 0 && b) putchar(' '); }
+}
+
+/* ── Decoders. Every claim below cites SNLS505H Rev H section 8. ─────────── */
+static void d_bmcr(uint16_t v) {
+    printf("        reset=%d loopback=%d speed=%s autoneg=%s pwrdn=%d isolate=%d "
+           "restart_an=%d duplex=%s\n",
+           (v>>15)&1, (v>>14)&1, (v&0x2000)?"100M":"10M", (v&0x1000)?"on":"off",
+           (v>>11)&1, (v>>10)&1, (v>>9)&1, (v&0x0100)?"full":"half");
     if (v & 0x0800)
-        printf("      NOTE bit11 set: reads the INT/PWDN_N pin state "
-               "(mechanism B indicator) as well as commanded power-down\n");
+        printf("        bit11 set: IEEE power-down — this bit READS THE "
+               "INT/PWDN_N PIN (Table 8-1)\n");
+}
+static void d_bmsr(uint16_t v) {
+    printf("        autoneg_complete=%d remote_fault=%d autoneg_able=%d "
+           "LINK=%d jabber=%d\n",
+           (v>>5)&1, (v>>4)&1, (v>>3)&1, (v>>2)&1, (v>>1)&1);
+    printf("        [bit2 link status is LATCH-LOW: reads 0 if the link "
+           "dropped since the previous read]\n");
+}
+static void d_aner(uint16_t v) {
+    printf("        LP_autoneg_able=%d page_received=%d local_next_page=%d "
+           "LP_next_page=%d parallel_detect_FAULT=%d\n",
+           v&1, (v>>1)&1, (v>>2)&1, (v>>3)&1, (v>>4)&1);
+    if (!(v & 1))
+        printf("        *** bit0=0: link partner is NOT autonegotiating — the "
+               "link came up by PARALLEL DETECTION,\n"
+               "        *** which cannot resolve duplex (IEEE 802.3 defaults "
+               "to HALF). Check PHYSTS bit2.\n");
+}
+static void d_anar(const char *tag, uint16_t v) {
+    printf("        %s: 100FD=%d 100HD=%d 10FD=%d 10HD=%d selector=0x%02X\n",
+           tag, (v>>8)&1, (v>>7)&1, (v>>6)&1, (v>>5)&1, v & 0x1F);
+}
+static void d_cr1(uint16_t v) {
+    printf("        TDR_auto_run(bit8)=%d  (0 = TDR does NOT run on link drop)\n",
+           (v>>8)&1);
+}
+static void d_cr3(uint16_t v) {
+    printf("        bypass_deq_error(bit12)=%d [DEFAULT 1, Table 8-12]  "
+           "descrambler_FLD(bit10)=%d\n", (v>>12)&1, (v>>10)&1);
+    printf("        FLD criteria bits[3:0]: RX_err(b3)=%d MLT3(b2)=%d "
+           "low_SNR(b1)=%d signal_loss(b0)=%d\n",
+           (v>>3)&1, (v>>2)&1, (v>>1)&1, v&1);
+    int any = ((v>>10)&1) || (v & 0x0F);
+    printf("        Fast Link Down is the OR of bit10 and bits[3:0] -> %s\n",
+           any ? "ENABLED" : "DISABLED (no FLD criterion active)");
+}
+static void d_flds(uint16_t v) {
+    unsigned f = (v >> 4) & 0x1F;
+    printf("        status field bits[8:4] = 0x%02X   [R, RC — CLEARED BY "
+           "THIS READ, Table 8-15]\n", f);
+    if (!f) { printf("        no fast-link-down event latched since last read\n");
+              return; }
+    if (f & 0x10) printf("        - Descrambler Loss Sync\n");
+    if (f & 0x08) printf("        - RX Errors (32 RX_ER in 10us)\n");
+    if (f & 0x04) printf("        - MLT3 Errors (20 in 10us)\n");
+    if (f & 0x02) printf("        - SNR Level (20 threshold crossings in 10us)\n");
+    if (f & 0x01) printf("        - Signal/Energy Lost\n");
+}
+static void d_physts(uint16_t v) {
+    printf("        LINK=%d speed=%s DUPLEX=%s autoneg_complete=%d "
+           "mdix=%d loopback=%d\n",
+           v&1, (v&0x0002)?"10M":"100M", (v&0x0004)?"FULL":"HALF",
+           (v>>4)&1, (v>>14)&1, (v>>3)&1);
+    printf("        latches: rx_err(b13)=%d polarity_inv(b12)=%d "
+           "false_carrier(b11)=%d sig_detect(b10)=%d descrambler_lock(b9)=%d\n",
+           (v>>13)&1, (v>>12)&1, (v>>11)&1, (v>>10)&1, (v>>9)&1);
+    printf("        [bit1 speed is INVERTED: 1=10Mbps, 0=100Mbps]\n");
+}
+static const char *misr1_names[8] = {
+    "rx_error_HF", "false_carrier_HF", "autoneg_complete", "duplex_changed",
+    "speed_changed", "link_status_changed", "energy_detect", "link_quality" };
+static const char *misr2_names[8] = {
+    "jabber_detect", "wol/polarity", "sleep_mode", "mdi_crossover_changed",
+    "fifo_over_underflow", "page_received", "autoneg_error", "eee_error" };
+static void d_misr(uint16_t v, const char **names) {
+    unsigned st = (v >> 8) & 0xFF;
+    printf("        status bits[15:8]=0x%02X  enables bits[7:0]=0x%02X   "
+           "[R, RC — CLEARED BY THIS READ]\n", st, v & 0xFF);
+    if (!st) { printf("        no interrupt events latched\n"); return; }
+    for (int b = 0; b < 8; b++)
+        if (st & (1u << b)) printf("        - %s\n", names[b]);
+}
+static void d_phyidr(uint16_t id1, uint16_t id2) {
+    /* SNLS505H Tables 8-3/8-4: OUI[21:6] in ID1, OUI[5:0] in ID2[15:10],
+     * model in ID2[9:4], revision in ID2[3:0]. */
+    uint32_t oui = ((uint32_t)id1 << 6) | ((id2 >> 10) & 0x3F);
+    printf("        OUI=0x%06X model=0x%02X revision=0x%X\n",
+           oui, (id2 >> 4) & 0x3F, id2 & 0xF);
+}
+static void d_fcscr(uint16_t v) {
+    printf("        false carrier events = %u  (8-bit, saturates at 255, "
+           "CLEARED BY THIS READ)\n", v & 0xFF);
+}
+static void d_recr(uint16_t v) {
+    printf("        RX_ER count = %u  (16-bit, saturates at 65535, "
+           "CLEARED BY THIS READ)\n", v);
+}
+static void d_sor1(uint16_t v) {
+    static const char *mode[4] = { "Mode 1", "Mode 2", "Mode 3", "Mode 4" };
+    unsigned rxd1 = (v >> 14) & 3;
+    printf("        RX_D1 strap = %s   (RX_D1 carries PHYAD_2 and EEE_EN)\n",
+           mode[rxd1]);
+    /* SNLA265 Tables 6/7/8: Mode1 = PHYAD_2 0, EEE disabled;
+     * Mode2 = PHYAD_2 0, EEE enabled; Mode3 = PHYAD_2 1, EEE enabled. */
+    if (rxd1 == 0) printf("        -> PHYAD_2=0, EEE DISABLED (SNLA265 Table 6)\n");
+    else if (rxd1 == 1) printf("        -> PHYAD_2=0, EEE ENABLED (SNLA265 Table 7)\n");
+    else if (rxd1 == 2) printf("        -> PHYAD_2=1, EEE ENABLED (SNLA265 Table 8)\n");
+    else printf("        -> Mode 4: not documented in SNLA265\n");
+    printf("        RX_D0=%u COL=%u RX_ER=%u strap modes\n",
+           (v >> 12) & 3, (v >> 10) & 3, (v >> 8) & 3);
 }
 
-static void decode_cr3(uint16_t v) {
-    printf("      FLD enable (bit10)=%d  criteria bits[3:0]=0x%X\n",
-           (v >> 10) & 1, v & 0xF);
-    printf("        bit0 energy/signal loss =%d  bit1 low SNR      =%d\n",
-           v & 1, (v >> 1) & 1);
-    printf("        bit2 MLT3 error count   =%d  bit3 RX error cnt =%d\n",
-           (v >> 2) & 1, (v >> 3) & 1);
-    printf("      [bit->criterion mapping UNVERIFIED: SNLS505H confirms "
-           "bits[3:0]+bit10 enable FLD, not the per-bit order]\n");
-    uint16_t other = v & (uint16_t)~0x043Fu;
-    if (other)
-        printf("      [bits outside {3:0,10} set: 0x%04X — NOT explained by "
-               "the confirmed datasheet facts]\n", other);
-}
-
-static void decode_flds(uint16_t v) {
-    printf("      byte 0x0514(lo)=0x%02X  byte 0x0515(hi)=0x%02X\n",
-           v & 0xFF, (v >> 8) & 0xFF);
-    printf("      candidate status field bits[8:4] = 0x%02X  "
-           "[UNVERIFIED — see README §6.4]\n", (v >> 4) & 0x1F);
-    printf("      NOTE the vendor procedure reads only 0x0515 (the high byte);\n"
-           "      if the status really is bits[8:4] that read LOSES bits 7:4.\n"
-           "      This tool reads the full 16-bit register at 0x0514.\n");
+static void decode_direct(uint8_t reg, const uint16_t *val, const int *ok) {
+    uint16_t v = val[reg];
+    switch (reg) {
+    case 0x00: d_bmcr(v); break;
+    case 0x01: d_bmsr(v); break;
+    case 0x03: if (ok[0x02]) d_phyidr(val[0x02], v); break;
+    case 0x04: d_anar("advertised", v); break;
+    case 0x05: d_anar("link partner", v); break;
+    case 0x06: d_aner(v); break;
+    case 0x09: d_cr1(v); break;
+    case 0x0B: d_cr3(v); break;
+    case 0x0F: d_flds(v); break;
+    case 0x10: d_physts(v); break;
+    case 0x12: d_misr(v, misr1_names); break;
+    case 0x13: d_misr(v, misr2_names); break;
+    case 0x14: d_fcscr(v); break;
+    case 0x15: d_recr(v); break;
+    default: break;
+    }
 }
 
 static void decode_mii_status(uint16_t st) {
     printf("      0x0510 raw=0x%04X  busy(15)=%d cmd-err(14)=%d read-err(13)=%d "
-           "pdi-may-control(1)=%d  [bits 14/13/1 UNVERIFIED]\n",
-           st, (st & MII_STAT_BUSY) ? 1 : 0, (st & MII_STAT_CMD_ERR) ? 1 : 0,
-           (st & MII_STAT_READ_ERR) ? 1 : 0, (st & MII_CTRL_PDI_CTRL) ? 1 : 0);
+           "pdi-may-control(1)=%d  [bits 14/13/1 UNVERIFIED vs ETG.1000.6]\n",
+           st, !!(st & MII_STAT_BUSY), !!(st & MII_STAT_CMD_ERR),
+           !!(st & MII_STAT_READ_ERR), !!(st & MII_CTRL_PDI_CTRL));
 }
 
-/* ── MII ownership check, run before anything else ──────────────────────── */
 static int check_mii_owner(EscCtx *ctx) {
-    uint8_t ecat_acc = 0, pdi_acc = 0;
-    uint16_t ctrl = 0;
-    if (esc_read8(ctx, ESC_MII_ECAT_ACC, &ecat_acc) != 0 ||
-        esc_read8(ctx, ESC_MII_PDI_ACC,  &pdi_acc)  != 0 ||
-        esc_read16(ctx, ESC_MII_CTRL,    &ctrl)     != 0) {
-        fprintf(stderr, "ERROR: cannot read the MII block (0x0510-0x0517).\n");
+    uint8_t ea = 0, pa = 0; uint16_t ctrl = 0;
+    if (esc_read8(ctx, ESC_MII_ECAT_ACC, &ea) != 0 ||
+        esc_read8(ctx, ESC_MII_PDI_ACC, &pa) != 0 ||
+        esc_read16(ctx, ESC_MII_CTRL, &ctrl) != 0) {
+        fprintf(stderr, "ERROR: cannot read the ESC MII block (0x0510-0x0517)\n");
         return -1;
     }
     printf("── MII management arbitration ─────────────────────────────\n");
-    printf("  0x0516 ECAT access state = 0x%02X\n", ecat_acc);
-    printf("  0x0517 PDI  access state = 0x%02X\n", pdi_acc);
+    printf("  0x0516 ECAT access state = 0x%02X\n  0x0517 PDI  access state = 0x%02X\n",
+           ea, pa);
     decode_mii_status(ctrl);
     if (ctrl & MII_CTRL_PDI_CTRL)
-        printf("  WARNING: 0x0510 bit1 set — the PDI (drive firmware) is\n"
-               "  permitted to control MII management. Master access may\n"
-               "  contend with the drive. [decode UNVERIFIED]\n");
-    printf("  [polarity of 0x0516/0x0517 is UNVERIFIED — confirm against "
-           "ETG.1000.6]\n\n");
+        printf("  WARNING: 0x0510 bit1 set — the PDI (drive firmware) is permitted\n"
+               "  to control MII management. Extended (REGCR/ADDAR) reads share an\n"
+               "  indirect pointer with it and can collide in both directions.\n");
+    printf("  [polarity of 0x0516/0x0517 UNVERIFIED — confirm vs ETG.1000.6]\n\n");
     return 0;
+}
+
+/* ── The sweep ──────────────────────────────────────────────────────────── */
+static int sweep_phy(EscCtx *ctx, int phy, int do_ext) {
+    uint16_t val[32]; int ok[32];
+    memset(val, 0, sizeof(val)); memset(ok, 0, sizeof(ok));
+
+    printf("══ PHY %d ═════════════════════════════════════════════════\n", phy);
+    printf("  Acquisition order is NOT address order: PHYSTS (0x10) is read\n"
+           "  first because its latch bits are cleared by reading BMSR, ANER,\n"
+           "  MISR1, FCSCR, RECR and 10BTSCR (SNLS505H Table 8-16). Values are\n"
+           "  displayed below in address order.\n");
+    printf("  This snapshot CONSUMES the clear-on-read registers: 0x01 0x06\n"
+           "  0x0F 0x10 0x12 0x13 0x14 0x15 0x1A.\n\n");
+
+    int failed = 0;
+    for (int i = 0; i < 32; i++) {
+        uint8_t r = phy_read_order[i];
+        uint16_t v = 0, st = 0;
+        if (mii_read_phy(ctx, (uint8_t)phy, r, &v, &st) == 0) {
+            val[r] = v; ok[r] = 1;
+        } else {
+            failed++;
+            if (failed == 1) { printf("  read failure at reg 0x%02X:\n", r);
+                               decode_mii_status(st); }
+        }
+    }
+
+    for (int r = 0; r < 32; r++) {
+        const char *name = phy_direct[r].name ? phy_direct[r].name : "(unknown)";
+        if (!ok[r]) { printf("  0x%02X %-42s  READ FAILED\n", r, name);
+                      csv_row(phy, "direct", (unsigned)r, name, 0, 0); continue; }
+        printf("  0x%02X %-42s 0x%04X  ", r, name, val[r]);
+        bits16(val[r]);
+        printf("%s\n", phy_direct[r].perishable ? "  [RC]" : "");
+        csv_row(phy, "direct", (unsigned)r, name, 1, val[r]);
+        decode_direct((uint8_t)r, val, ok);
+    }
+
+    if (do_ext) {
+        printf("\n  ── Extended registers (via REGCR/ADDAR — WRITES THE PHY) ──\n");
+        for (int e = 0; e < PHY_EXT_COUNT; e++) {
+            const PhyExt *x = &phy_ext[e];
+            uint16_t buf[16];
+            int n = x->count > 16 ? 16 : x->count;
+            int rc = (n > 1)
+                ? mii_mmd_read_block(ctx, (uint8_t)phy, x->devad, x->reg, n, buf)
+                : mii_mmd_read(ctx, (uint8_t)phy, x->devad, x->reg, buf);
+            if (rc != 0) {
+                printf("  MMD%02X 0x%04X %-38s READ FAILED\n",
+                       x->devad, x->reg, x->name);
+                csv_row(phy, "ext", x->reg, x->name, 0, 0);
+                continue;
+            }
+            for (int k = 0; k < n; k++) {
+                printf("  MMD%02X 0x%04X %-38s 0x%04X  ", x->devad,
+                       (unsigned)(x->reg + k), k ? "" : x->name, buf[k]);
+                bits16(buf[k]); printf("\n");
+                csv_row(phy, "ext", (unsigned)(x->reg + k), x->name, 1, buf[k]);
+            }
+            if (x->reg == 0x0467) d_sor1(buf[0]);
+        }
+    }
+    printf("\n");
+    return failed ? 1 : 0;
 }
 
 static void usage(const char *p) {
     printf("Usage: %s -i <iface> [options]\n"
-           "  -i <iface>        interface (required)\n"
-           "  -p <position>     chain position of the slave (default 0)\n"
-           "  -a <phy_addr>     PHY address (default 0; the vendor FLD\n"
-           "                    procedure uses PHY 0)\n"
-           "  -t <ms>           transaction timeout, default 10\n"
-           "  -d                dump the diagnostic PHY register set\n"
-           "  -r <reg>          read one PHY register, e.g. -r 0x0F\n"
-           "  -w <reg>=<val>    WRITE one PHY register, e.g. -w 0x0B=0x140F\n"
-           "  --allow-phy-write required alongside -w; without it -w refuses\n"
-           "  --fld-enable      write CR3 = 0x140F (the vendor FLD-enable\n"
-           "                    value); needs --allow-phy-write\n"
-           "  --fld-status      read FLDS (0x0F) and decode\n"
-           "  -h                help\n\n"
+           "  -i <iface>         interface (required)\n"
+           "  -p <position>      chain position of the slave (default 0)\n"
+           "  -a <phy|both>      PHY address, or 'both' (default: both 0 and 1)\n"
+           "  -t <ms>            transaction timeout (default 10)\n"
+           "  -d                 sweep all 32 direct registers (default action)\n"
+           "  --ext              also read extended registers (needs --allow-phy-write)\n"
+           "  --csv <file>       write a machine-readable snapshot\n"
+           "  -r <reg>           read one direct register, e.g. -r 0x0F\n"
+           "  -w <reg>=<val>     WRITE one PHY register (needs --allow-phy-write)\n"
+           "  --allow-phy-write  permit writes to the PHY\n"
+           "  --fld-enable       write CR3=0x140F (all five FLD criteria)\n"
+           "  --fld-status       read FLDS and decode\n\n"
            "This tool WRITES ESC registers even to READ a PHY register.\n"
-           "Writing a PHY register needs --allow-phy-write.\n", p);
+           "Extended reads and PHY writes need --allow-phy-write.\n", p);
 }
 
 int main(int argc, char *argv[]) {
-    const char *iface = NULL;
-    int position = 0, phy_addr = 0, timeout_ms = 10;
-    int do_dump = 0, do_fld_status = 0, do_fld_enable = 0, allow_write = 0;
+    const char *iface = NULL, *csv_path = NULL;
+    int position = 0, timeout_ms = 10, phy_sel = -1;   /* -1 = both */
+    int do_sweep = 0, do_ext = 0, allow_write = 0;
+    int do_fld_status = 0, do_fld_enable = 0;
     int rd_reg = -1, wr_reg = -1; long wr_val = -1;
 
     static struct option lo[] = {
-        { "allow-phy-write", no_argument, 0, 1000 },
-        { "fld-enable",      no_argument, 0, 1001 },
-        { "fld-status",      no_argument, 0, 1002 },
+        { "allow-phy-write", no_argument,       0, 1000 },
+        { "fld-enable",      no_argument,       0, 1001 },
+        { "fld-status",      no_argument,       0, 1002 },
+        { "ext",             no_argument,       0, 1003 },
+        { "csv",             required_argument, 0, 1004 },
         { 0, 0, 0, 0 }
     };
     int opt;
@@ -142,9 +297,10 @@ int main(int argc, char *argv[]) {
         switch (opt) {
         case 'i': iface = optarg; break;
         case 'p': position = atoi(optarg); break;
-        case 'a': phy_addr = (int)strtol(optarg, NULL, 0); break;
+        case 'a': phy_sel = (strcmp(optarg, "both") == 0)
+                            ? -1 : (int)strtol(optarg, NULL, 0); break;
         case 't': timeout_ms = atoi(optarg); break;
-        case 'd': do_dump = 1; break;
+        case 'd': do_sweep = 1; break;
         case 'r': rd_reg = (int)strtol(optarg, NULL, 0); break;
         case 'w': {
             char *eq = strchr(optarg, '=');
@@ -152,86 +308,82 @@ int main(int argc, char *argv[]) {
             *eq = '\0';
             wr_reg = (int)strtol(optarg, NULL, 0);
             wr_val = strtol(eq + 1, NULL, 0);
-            break;
-        }
+            break; }
         case 1000: allow_write = 1; break;
         case 1001: do_fld_enable = 1; break;
         case 1002: do_fld_status = 1; break;
+        case 1003: do_ext = 1; break;
+        case 1004: csv_path = optarg; break;
         default: usage(argv[0]); return opt == 'h' ? 0 : 1;
         }
     }
     if (!iface) { usage(argv[0]); return 1; }
-    if (!do_dump && !do_fld_status && !do_fld_enable && rd_reg < 0 && wr_reg < 0)
-        do_dump = 1;
+    if (!do_sweep && !do_ext && !do_fld_status && !do_fld_enable &&
+        rd_reg < 0 && wr_reg < 0) do_sweep = 1;
+    if (do_ext) do_sweep = 1;
 
     if ((wr_reg >= 0 || do_fld_enable) && !allow_write) {
-        fprintf(stderr,
-            "REFUSED: writing a PHY register changes DUT behaviour.\n"
-            "Re-run with --allow-phy-write if that is what you intend.\n");
+        fprintf(stderr, "REFUSED: writing a PHY register changes DUT behaviour.\n"
+                        "Re-run with --allow-phy-write if that is intended.\n");
         return 1;
     }
-    if (phy_addr < 0 || phy_addr > 31) {
-        fprintf(stderr, "PHY address must be 0..31\n"); return 1; }
+    if (do_ext && !allow_write) {
+        fprintf(stderr, "REFUSED: extended (REGCR/ADDAR) reads WRITE the PHY's\n"
+                        "indirect pointer registers, which the drive firmware may\n"
+                        "also be using. Re-run with --allow-phy-write if intended.\n");
+        return 1;
+    }
+    if (phy_sel > 31) { fprintf(stderr, "PHY address must be 0..31\n"); return 1; }
 
     EscCtx ctx;
     if (esc_open(&ctx, iface, (uint16_t)position, timeout_ms) != 0) return 1;
 
+    if (csv_path) {
+        g_csv = fopen(csv_path, "w");
+        if (!g_csv) { perror("csv"); esc_close(&ctx); return 1; }
+        fprintf(g_csv, "phy,space,addr,name,value_hex,value_dec\n");
+    }
+
     printf("EtherCAT PHY register access over ESC MII  (THIS TOOL WRITES)\n");
-    printf("Interface:  %s\nPosition:   %d\nPHY addr:   %d\nTimeout:    %d ms\n",
-           iface, position, phy_addr, timeout_ms);
-    printf("MAC:        %02x:%02x:%02x:%02x:%02x:%02x\n\n",
+    printf("Interface:  %s\nPosition:   %d\nTimeout:    %d ms\n",
+           iface, position, timeout_ms);
+    printf("MAC:        %02x:%02x:%02x:%02x:%02x:%02x\n",
            ctx.src_mac[0], ctx.src_mac[1], ctx.src_mac[2],
            ctx.src_mac[3], ctx.src_mac[4], ctx.src_mac[5]);
+    printf("Registers decoded per SNLS505H Rev H section 8 and SNLA265.\n\n");
 
     if (check_mii_owner(&ctx) != 0) { esc_close(&ctx); return 1; }
 
     int rc = 0;
-
-    if (do_dump) {
-        printf("── PHY %d register snapshot ────────────────────────────────\n",
-               phy_addr);
-        printf("  CAUTION: BMSR/ANER/MISR1/MISR2 are latching or clear-on-read.\n"
-               "  Reading them CLEARS the latched state. They are read FIRST.\n\n");
-        for (size_t i = 0; i < sizeof(phy_direct)/sizeof(phy_direct[0]); i++) {
-            uint16_t v = 0, st = 0;
-            int r = mii_read_phy(&ctx, (uint8_t)phy_addr, phy_direct[i].reg, &v, &st);
-            if (r != 0) {
-                printf("  0x%02X %-38s READ FAILED (rc=%d)\n",
-                       phy_direct[i].reg, phy_direct[i].name, r);
-                decode_mii_status(st);
-                rc = 1; continue;
-            }
-            printf("  0x%02X %-38s 0x%04X  ", phy_direct[i].reg,
-                   phy_direct[i].name, v);
-            print_bits(v);
-            printf("%s\n", phy_direct[i].clear_on_read ? "  [CLEARED BY THIS READ]" : "");
-            if (phy_direct[i].reg == 0x00) decode_bmcr(v);
-            if (phy_direct[i].reg == 0x0B) decode_cr3(v);
-            if (phy_direct[i].reg == 0x0F) decode_flds(v);
-        }
-        printf("\n");
+    if (do_sweep) {
+        if (phy_sel < 0) { rc |= sweep_phy(&ctx, 0, do_ext);
+                           rc |= sweep_phy(&ctx, 1, do_ext); }
+        else               rc |= sweep_phy(&ctx, phy_sel, do_ext);
     }
 
+    int one = phy_sel < 0 ? 0 : phy_sel;
     if (rd_reg >= 0) {
         uint16_t v = 0, st = 0;
-        int r = mii_read_phy(&ctx, (uint8_t)phy_addr, (uint8_t)rd_reg, &v, &st);
-        if (r != 0) { printf("READ FAILED (rc=%d)\n", r); decode_mii_status(st); rc = 1; }
-        else {
-            printf("PHY %d reg 0x%02X = 0x%04X  ", phy_addr, rd_reg, v); print_bits(v);
-            printf("\n");
-            printf("  bytes: 0x0514(lo)=0x%02X 0x0515(hi)=0x%02X\n", v & 0xFF, v >> 8);
-            if (rd_reg == 0x00) decode_bmcr(v);
-            if (rd_reg == 0x0B) decode_cr3(v);
-            if (rd_reg == 0x0F) decode_flds(v);
+        if (mii_read_phy(&ctx, (uint8_t)one, (uint8_t)rd_reg, &v, &st) != 0) {
+            printf("READ FAILED\n"); decode_mii_status(st); rc = 1;
+        } else {
+            const char *nm = (rd_reg < 32 && phy_direct[rd_reg].name)
+                             ? phy_direct[rd_reg].name : "(unknown)";
+            printf("PHY %d 0x%02X %-42s 0x%04X  ", one, rd_reg, nm, v);
+            bits16(v); printf("\n");
+            uint16_t val[32]; int ok[32];
+            memset(val,0,sizeof val); memset(ok,0,sizeof ok);
+            val[rd_reg] = v; ok[rd_reg] = 1;
+            if (rd_reg < 32) decode_direct((uint8_t)rd_reg, val, ok);
         }
     }
 
     if (do_fld_status) {
         uint16_t v = 0, st = 0;
-        int r = mii_read_phy(&ctx, (uint8_t)phy_addr, 0x0F, &v, &st);
-        if (r != 0) { printf("FLDS READ FAILED (rc=%d)\n", r); decode_mii_status(st); rc = 1; }
-        else { printf("FLDS (PHY %d reg 0x0F) = 0x%04X  ", phy_addr, v);
-               print_bits(v); printf("\n"); decode_flds(v); }
+        if (mii_read_phy(&ctx, (uint8_t)one, 0x0F, &v, &st) != 0) {
+            printf("FLDS READ FAILED\n"); decode_mii_status(st); rc = 1;
+        } else { printf("PHY %d FLDS (0x0F) = 0x%04X  ", one, v);
+                 bits16(v); printf("\n"); d_flds(v); }
     }
 
     if (do_fld_enable) { wr_reg = 0x0B; wr_val = 0x140F; }
@@ -239,24 +391,21 @@ int main(int argc, char *argv[]) {
     if (wr_reg >= 0) {
         uint16_t before = 0, rb = 0, st = 0;
         printf("── PHY WRITE ──────────────────────────────────────────────\n");
-        if (mii_read_phy(&ctx, (uint8_t)phy_addr, (uint8_t)wr_reg, &before, &st) == 0)
-            printf("  before: PHY %d reg 0x%02X = 0x%04X\n", phy_addr, wr_reg, before);
-        else
-            printf("  before: read failed — proceeding anyway\n");
-        printf("  writing PHY %d reg 0x%02X <- 0x%04X\n",
-               phy_addr, wr_reg, (uint16_t)wr_val);
-        if (wr_reg == 0x0B) decode_cr3((uint16_t)wr_val);
-
-        int r = mii_write_phy(&ctx, (uint8_t)phy_addr, (uint8_t)wr_reg,
+        if (mii_read_phy(&ctx, (uint8_t)one, (uint8_t)wr_reg, &before, &st) == 0)
+            printf("  before: PHY %d 0x%02X = 0x%04X\n", one, wr_reg, before);
+        printf("  writing PHY %d 0x%02X <- 0x%04X\n", one, wr_reg, (uint16_t)wr_val);
+        if (wr_reg == 0x0B) d_cr3((uint16_t)wr_val);
+        int r = mii_write_phy(&ctx, (uint8_t)one, (uint8_t)wr_reg,
                               (uint16_t)wr_val, 1, &rb);
-        if (r == 0)      printf("  OK: read-back = 0x%04X (matches)\n", rb);
-        else if (r == -3){ printf("  MISMATCH: wrote 0x%04X, read back 0x%04X\n",
-                                  (uint16_t)wr_val, rb); rc = 1; }
-        else             { printf("  WRITE FAILED (rc=%d)\n", r); rc = 1; }
+        if (r == 0)       printf("  OK: read-back = 0x%04X (matches)\n", rb);
+        else if (r == -3) { printf("  MISMATCH: wrote 0x%04X, read 0x%04X\n",
+                                   (uint16_t)wr_val, rb); rc = 1; }
+        else              { printf("  WRITE FAILED (rc=%d)\n", r); rc = 1; }
     }
 
     printf("\nTransactions: %lu sent, %lu matched, %lu retries, %lu timeouts\n",
            ctx.frames_sent, ctx.frames_matched, ctx.retries, ctx.timeouts);
+    if (g_csv) { fclose(g_csv); printf("CSV written to %s\n", csv_path); }
     esc_close(&ctx);
     return rc;
 }

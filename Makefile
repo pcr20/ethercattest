@@ -23,15 +23,15 @@ ecat_regdump: $(DUMP_OBJS) stats.o crc.o
 ecat_phy: $(PHY_OBJS) stats.o crc.o
 	$(CC) -o $@ $(PHY_OBJS) stats.o crc.o $(LDFLAGS)
 
-%.o: %.c ecat_common.h crc.h stats.h frame.h nic.h threads.h escreg.h escmii.h
+%.o: %.c ecat_common.h crc.h stats.h frame.h nic.h threads.h escreg.h escmii.h phy_regs.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
-TESTS = t_escframe t_miiframe t_wirefmt t_framesz t_txok t_crc t_resid3 t_escgate t_plsem t_ring
+TESTS = t_escframe t_miiframe t_physweep t_wirefmt t_framesz t_txok t_crc t_resid3 t_escgate t_plsem t_ring
 test: $(TESTS:%=tests/%)
 	@for t in $(TESTS); do ./tests/$$t || exit 1; done
 	@echo "ALL TEST SUITES PASS"
 
-tests/%: tests/%.c crc.c stats.c frame.c nic.c escreg.c escmii.c ecat_common.h crc.h stats.h frame.h escreg.h escmii.h
+tests/%: tests/%.c crc.c stats.c frame.c nic.c escreg.c escmii.c ecat_common.h crc.h stats.h frame.h escreg.h escmii.h phy_regs.h
 	$(CC) -D_GNU_SOURCE -O2 -Wall -std=c11 -msse4.2 -I. -o $@ $< -lm -lpthread
 
 clean:

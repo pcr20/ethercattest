@@ -189,3 +189,41 @@ int mii_write_phy(EscCtx *ctx, uint8_t phy_addr, uint8_t phy_reg,
     }
     return 0;
 }
+
+/* ── Extended / MMD access ──────────────────────────────────────────────────
+ * Sequence (SNLS505H Table 8-13, SNLA265 Table 9):
+ *   1. REGCR <- DEVAD                (command 00 = address)
+ *   2. ADDAR <- register address
+ *   3. REGCR <- 0x4000|DEVAD         (command 01 = data, no post-increment)
+ *   4. read ADDAR                    -> the register value
+ * The block variant uses command 10 (post-increment on read and write) so
+ * step 4 can be repeated, each read advancing the internal pointer. */
+static int mmd_set_pointer(EscCtx *ctx, uint8_t phy_addr, uint8_t devad,
+                           uint16_t reg, uint16_t data_cmd)
+{
+    if (mii_write_phy(ctx, phy_addr, PHY_REG_REGCR,
+                      MMD_CMD_ADDR(devad), 0, NULL) != 0) return -1;
+    if (mii_write_phy(ctx, phy_addr, PHY_REG_ADDAR, reg, 0, NULL) != 0) return -1;
+    if (mii_write_phy(ctx, phy_addr, PHY_REG_REGCR, data_cmd, 0, NULL) != 0) return -1;
+    return 0;
+}
+
+int mii_mmd_read(EscCtx *ctx, uint8_t phy_addr, uint8_t devad,
+                 uint16_t reg, uint16_t *value)
+{
+    if (mmd_set_pointer(ctx, phy_addr, devad, reg, MMD_CMD_DATA(devad)) != 0)
+        return -1;
+    return mii_read_phy(ctx, phy_addr, PHY_REG_ADDAR, value, NULL);
+}
+
+int mii_mmd_read_block(EscCtx *ctx, uint8_t phy_addr, uint8_t devad,
+                       uint16_t start_reg, int n, uint16_t *out)
+{
+    if (n < 1) return -1;
+    if (mmd_set_pointer(ctx, phy_addr, devad, start_reg,
+                        MMD_CMD_DATA_INC(devad)) != 0) return -1;
+    for (int i = 0; i < n; i++)
+        if (mii_read_phy(ctx, phy_addr, PHY_REG_ADDAR, &out[i], NULL) != 0)
+            return -1;
+    return 0;
+}

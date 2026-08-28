@@ -91,4 +91,41 @@ int mii_read_phy(EscCtx *ctx, uint8_t phy_addr, uint8_t phy_reg,
 int mii_write_phy(EscCtx *ctx, uint8_t phy_addr, uint8_t phy_reg,
                   uint16_t value, int verify, uint16_t *readback);
 
+/* ── Extended / MMD register access (REGCR 0x0D + ADDAR 0x0E) ───────────────
+ * Direct clause-22 space is only 32 registers (0x00-0x1F). Everything else on
+ * the DP83822 — TDR results 0x0180-0x018A, ALCD, the strap latch-in registers
+ * 0x0467/0x0468, EEE config — lives in extended space reached through this
+ * indirection. Confirmed from SNLS505H Table 8-13 and SNLA265 section 2.2.2.
+ *
+ * REGCR (0x0D): bits[15:14] command, bits[4:0] DEVAD.
+ *   00 = Address, 01 = Data no post-increment,
+ *   10 = Data post-increment on read AND write, 11 = post-increment on write.
+ *
+ * DEVAD: 0x1F = vendor space (0x0000-0x04D6), 0x03 = MMD3, 0x07 = MMD7.
+ *
+ * *** THESE WRITE THE PHY. *** REGCR/ADDAR are a SHARED indirect pointer: if
+ * the drive firmware also performs MMD accesses over the PDI, its pointer
+ * writes and ours can interleave and corrupt each other in both directions.
+ * ESC register 0x0510 bit 1 indicates whether the PDI may drive MII at all. */
+#define MMD_DEVAD_VENDOR     0x1F
+#define MMD_DEVAD_MMD3       0x03
+#define MMD_DEVAD_MMD7       0x07
+
+#define MMD_CMD_ADDR(d)      ((uint16_t)(d))              /* 00 = address     */
+#define MMD_CMD_DATA(d)      ((uint16_t)(0x4000u | (d)))  /* 01 = data        */
+#define MMD_CMD_DATA_INC(d)  ((uint16_t)(0x8000u | (d)))  /* 10 = data, ++    */
+
+#define PHY_REG_REGCR        0x0D
+#define PHY_REG_ADDAR        0x0E
+
+/* Read one extended register. 4 PHY operations. Returns 0 on success. */
+int mii_mmd_read(EscCtx *ctx, uint8_t phy_addr, uint8_t devad,
+                 uint16_t reg, uint16_t *value);
+
+/* Read n consecutive extended registers using post-increment: 3 setup
+ * operations then one read each, instead of 4 per register. out[] holds n
+ * values. Returns 0 on success. */
+int mii_mmd_read_block(EscCtx *ctx, uint8_t phy_addr, uint8_t devad,
+                       uint16_t start_reg, int n, uint16_t *out);
+
 #endif /* ECAT_ESCMII_H */
