@@ -205,3 +205,44 @@ int enable_tx_timestamping(int sock) {
     return 1;
 }
 
+/* ── Real qdisc drop counter ────────────────────────────────────────────────
+ * NOT the same thing as /sys/class/net/<if>/statistics/tx_dropped. That sysfs
+ * file is the netdev-level counter the DRIVER populates (allocation failures
+ * and similar); the queueing discipline keeps its own statistics, which are
+ * reachable only through netlink or `tc`. On this rig the divergence is total:
+ * sysfs tx_dropped reads 0 while fq_codel reports 324M drops.
+ *
+ * That matters because "TX never halts" (README §3.5) deliberately offers
+ * frames far faster than the link drains them — a measured run enqueued 115.1M
+ * against TxOk 15.1M, so ~100M frames were absorbed by the qdisc and reported
+ * as zero. The BER is unaffected (those frames were never in TxOk, which is
+ * the loss basis and BER denominator), but the displayed figure was false.
+ *
+ * Read at session START and END only: this value is displayed and excluded
+ * from every computation, so per-interval resolution buys nothing, and forking
+ * has no place near the datapath (§4.4). Returns 0 with *ok=0 if tc is absent
+ * or the output cannot be parsed — a missing counter is reported as unknown,
+ * never as zero. */
+uint64_t read_qdisc_drops(const char *iface, int *ok) {
+    if (ok) *ok = 0;
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd),
+             "tc -s qdisc show dev %s 2>/dev/null", iface);
+    FILE *f = popen(cmd, "r");
+    if (!f) return 0;
+
+    char line[512];
+    uint64_t drops = 0;
+    int found = 0;
+    while (fgets(line, sizeof(line), f)) {
+        /* The root qdisc's stats line: " Sent N bytes N pkt (dropped N, ...)".
+         * Take the FIRST match — that is the root qdisc, which is what sits
+         * between us and the driver. */
+        const char *d = strstr(line, "dropped ");
+        if (d && sscanf(d, "dropped %lu", &drops) == 1) { found = 1; break; }
+    }
+    pclose(f);
+    if (!found) return 0;
+    if (ok) *ok = 1;
+    return drops;
+}

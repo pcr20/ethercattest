@@ -53,6 +53,13 @@ typedef struct {
     uint64_t rx_fifo_base;             /* rx_fifo_errors                       */
     uint64_t rx_nic_err_base;          /* rx_errors                            */
     uint64_t rx_nic_crc_base;          /* rx_crc_errors                        */
+    /* REAL qdisc drops, read via tc at session start and end only (nic.c).
+     * Distinct from qdisc_drop_base above, which is the netdev-level
+     * statistics/tx_dropped and reads 0 on this rig while fq_codel drops
+     * ~100M frames per run. Excluded from BER either way — never on wire. */
+    uint64_t qdisc_real_start;
+    uint64_t qdisc_real_end;
+    int      qdisc_real_ok;            /* 0 = tc unavailable / unparseable     */
     int      tx_ts_supported;          /* 1 if sw TX timestamping active       */
     /* Link-loss tracking. sysfs counter deltas owned by supervisor; nl_* by the
      * netlink cross-check thread; carrier-poll events + link_state_up by the

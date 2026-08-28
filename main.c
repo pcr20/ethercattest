@@ -173,6 +173,13 @@ int main(int argc, char *argv[]) {
       g_stats.rx_fifo_base    = read_sysfs_u64(iface, "statistics/rx_fifo_errors", &o);
       g_stats.rx_nic_err_base = read_sysfs_u64(iface, "statistics/rx_errors", &o);
       g_stats.rx_nic_crc_base = read_sysfs_u64(iface, "statistics/rx_crc_errors", &o); }
+    /* Real qdisc drops — start reading. See nic.c: statistics/tx_dropped is a
+     * different counter and reads 0 here while the qdisc discards ~100M. */
+    { int o = 0;
+      g_stats.qdisc_real_start = read_qdisc_drops(iface, &o);
+      g_stats.qdisc_real_ok = o;
+      if (!o) fprintf(stderr, "note: qdisc drop counter unavailable "
+                              "(tc missing?) — it will report as unknown\n"); }
       if (!ok) g_stats.qdisc_drop_base = 0; }
 
     /* Link-loss baselines (sysfs). All three exist on this kernel. */
@@ -394,6 +401,10 @@ int main(int argc, char *argv[]) {
 
     /* Final kernel-drop poll, wire count, sysfs carrier counters, and stats. */
     poll_kernel_drops(sock);
+    { int o = 0;
+      uint64_t q = read_qdisc_drops(iface, &o);
+      if (o && g_stats.qdisc_real_ok) g_stats.qdisc_real_end = q;
+      else g_stats.qdisc_real_ok = 0; }
     g_stats.tx_wire_packets = read_nic_tx_packets(iface) - g_stats.tx_wire_base;
     { int ok;
       uint64_t d = read_sysfs_u64(iface, "carrier_down_count", &ok);

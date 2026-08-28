@@ -412,7 +412,8 @@ void *errq_thread(void *arg) {
  * owns link_state_up because current-state is exactly what coalescing preserves. */
 /* ── Wire-truth sampler thread ──────────────────────────────────────────────
  * Periodically (every ~20ms) reads the hardware tally counters (TxOk via
- * ethtool GSTATS, TxER) and the kernel qdisc tx_dropped, base-subtracted into
+ * ethtool GSTATS, TxER) and the netdev-level statistics/tx_dropped (NOT the
+ * qdisc's own drop counter — see read_qdisc_drops() in nic.c), base-subtracted into
  * g_txok / g_txer / g_qdisc_drop. TxOk is the measurement boundary and drives
  * the loss figure (loss = TxOk − distinct returns). There is no TX credit
  * window — TX never pauses. The diagnostic confirmed TxOk updates

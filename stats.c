@@ -105,7 +105,18 @@ void print_stats(FILE *csv, uint64_t elapsed_ns) {
         printf("  TxOk  (on wire, BER denom): %lu\n", txok);
     }
     printf("  TxER  (r8169 rejected, carrier-lost etc.): %lu  (excluded from BER)\n", txer);
-    printf("  qdisc drop (kernel, above r8169): %lu  (excluded — never on wire)\n", qdrop);
+    /* Two DIFFERENT counters; the old panel conflated them. */
+    printf("  netdev tx_dropped (driver-level): %lu  (excluded — never on wire)\n", qdrop);
+    if (g_stats.qdisc_real_ok) {
+        uint64_t qreal = (g_stats.qdisc_real_end >= g_stats.qdisc_real_start)
+                       ? g_stats.qdisc_real_end - g_stats.qdisc_real_start : 0;
+        printf("  qdisc drops (root qdisc, real): %lu  (excluded — never on wire)\n",
+               qreal);
+        printf("    TX offers far faster than the link drains (§3.5 TX never\n"
+               "    halts); the qdisc absorbs the excess. Not an error.\n");
+    } else {
+        printf("  qdisc drops (root qdisc, real): unknown  (tc unavailable)\n");
+    }
     printf("  ── Accounting (wire-side) ──────────────────────────────\n");
     printf("  Frames rcvd (raw):      %lu\n", rcvd);
     printf("  Good distinct returns:  %lu  (FCS+payload valid, deduped)\n", distinct);
@@ -231,7 +242,7 @@ void print_stats(FILE *csv, uint64_t elapsed_ns) {
         uint64_t lerr = atomic_load_explicit(&g_stats.rx_len_errors, memory_order_relaxed);
         fprintf(csv, "%.3f,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,"
                      "%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,"
-                     "%lu,%lu,%lu,%lu,%lu,%ld",
+                     "%lu,%lu,%lu,%lu,%lu,%ld,%ld",
                 elapsed_s, sent, wire, txok, txer, qdrop, distinct, rcvd, lost,
                 plcrc, wkcmm, kdrops,
                 g_stats.carrier_down, g_stats.carrier_up, g_stats.carrier_changes,
@@ -241,7 +252,11 @@ void print_stats(FILE *csv, uint64_t elapsed_ns) {
                 atomic_load_explicit(&g_rx_fifo,    memory_order_relaxed),
                 atomic_load_explicit(&g_rx_nic_err, memory_order_relaxed),
                 atomic_load_explicit(&g_rx_nic_crc, memory_order_relaxed),
-                (long)lost_signed);
+                (long)lost_signed,
+                g_stats.qdisc_real_ok
+                    ? (long)(g_stats.qdisc_real_end >= g_stats.qdisc_real_start
+                             ? g_stats.qdisc_real_end - g_stats.qdisc_real_start : 0)
+                    : -1L);
         for (int s = 0; s < g_num_slaves && s < MAX_SLAVES; s++)
             fprintf(csv, ",%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu",
                     g_stats.esc_crc[s][0], g_stats.esc_crc[s][1],
@@ -263,7 +278,7 @@ void write_csv_header(FILE *csv, int num_slaves) {
                  "link_down_cp,link_up_cp,link_down_nl,link_up_nl,netlink_overflows,"
                  "rx_bad_fcs_computed,rx_bad_fcs_auxdata,rx_truncated,rx_len_errors,"
                  "host_rx_missed,host_rx_dropped,host_rx_fifo,host_rx_errors,"
-                 "host_rx_crc,txok_minus_returns_signed");
+                 "host_rx_crc,txok_minus_returns_signed,qdisc_drops_real");
     for (int s = 0; s < num_slaves; s++)
         fprintf(csv, ",slave%d_p0_crc,slave%d_p1_crc,slave%d_p2_crc,slave%d_p3_crc"
                      ",slave%d_p0_lost,slave%d_p1_lost,slave%d_p2_lost,slave%d_p3_lost",

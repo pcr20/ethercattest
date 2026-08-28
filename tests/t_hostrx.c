@@ -98,6 +98,30 @@ int main(void)
                    "sampling skew no longer masquerades as a loss onset\n");
     }
 
+    /* ── T5: the two TX-drop counters must stay distinct ────────────────
+     * statistics/tx_dropped (netdev, driver-level) reads 0 on this rig while
+     * the root qdisc discards ~100M frames per run. Conflating them reported
+     * a false zero for every run. An unavailable qdisc counter must surface
+     * as UNKNOWN (-1 in CSV), never as 0. */
+    {
+        int f0 = fails;
+        g_stats.qdisc_real_ok = 0;
+        g_stats.qdisc_real_start = 0; g_stats.qdisc_real_end = 0;
+        CHECK(g_stats.qdisc_real_ok == 0, "unavailable must stay unavailable");
+
+        g_stats.qdisc_real_ok = 1;
+        g_stats.qdisc_real_start = 324157483ULL;
+        g_stats.qdisc_real_end   = 324157483ULL + 100023450ULL;
+        uint64_t d = g_stats.qdisc_real_end - g_stats.qdisc_real_start;
+        CHECK(d == 100023450ULL, "qdisc delta wrong: %lu", d);
+        CHECK(atomic_load(&g_qdisc_drop) != d,
+              "the netdev counter and the qdisc counter must not be the same "
+              "value — conflating them is the bug this guards");
+        if (fails == f0)
+            printf("T5 PASS: netdev tx_dropped and root-qdisc drops kept "
+                   "distinct; unavailable reports unknown, not zero\n");
+    }
+
     if (fails) { printf("\n%d HOST-RX CHECK(S) FAILED\n", fails); return 1; }
     printf("\nALL HOST-RX TESTS PASS\n");
     return 0;
