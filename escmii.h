@@ -29,7 +29,11 @@
  * procedure exactly: 0x0B00 selects PHY 0 register 0x0B, 0x0F00 selects
  * PHY 0 register 0x0F (FLDS).
  *
- * Command word written to 0x0510 (from the vendor procedure):
+ * Command word written to 0x0510. Verified against Beckhoff ESC Section II
+ * Register Description v3.3 §2.12.1: bits[10:8] are a 3-bit command field
+ * (001=read, 010=write) and bit 0 is write-enable, which SELF-CLEARS at the
+ * SOF of the next frame — so write-enable and the command must go in the SAME
+ * write, which is what these values do:
  *   0x0100  read  = command field bit 8
  *   0x0201  write = write-enable bit 0 + command field bit 9
  * Busy is bit 15 of 0x0510; poll until it clears.
@@ -48,9 +52,9 @@
 #define MII_CMD_READ         0x0100
 #define MII_CMD_WRITE        0x0201
 #define MII_STAT_BUSY        0x8000   /* bit 15 */
-#define MII_STAT_CMD_ERR     0x4000   /* bit 14 — UNVERIFIED */
-#define MII_STAT_READ_ERR    0x2000   /* bit 13 — UNVERIFIED */
-#define MII_CTRL_PDI_CTRL    0x0002   /* bit  1 — UNVERIFIED: PDI may control */
+#define MII_STAT_CMD_ERR     0x4000   /* bit 14 — command error              */
+#define MII_STAT_READ_ERR    0x2000   /* bit 13 — read error                  */
+#define MII_CTRL_PDI_CTRL    0x0002   /* bit  1 — MI controllable by PDI      */
 
 #define ESC_MII_CTRL         0x0510
 #define ESC_MII_PHYADR       0x0512

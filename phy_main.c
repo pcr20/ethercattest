@@ -167,11 +167,22 @@ static void decode_direct(uint8_t reg, const uint16_t *val, const int *ok) {
     }
 }
 
+/* Bit layout verified against Beckhoff ESC Section II Register Description
+ * v3.3 §2.12.1: [0] write enable (self-clearing at SOF of the next frame),
+ * [1] MI controllable by PDI, [2] MI link detection, [7:3] PHY address of
+ * port 0, [10:8] command (001 read, 010 write), [12] clause-45 available,
+ * [13] read error, [14] command error, [15] busy. */
 static void decode_mii_status(uint16_t st) {
-    printf("      0x0510 raw=0x%04X  busy(15)=%d cmd-err(14)=%d read-err(13)=%d "
-           "pdi-may-control(1)=%d  [bits 14/13/1 UNVERIFIED vs ETG.1000.6]\n",
+    static const char *cmd[8] = { "idle", "READ", "WRITE", "reserved",
+                                  "c45 set-addr", "c45 read", "c45 write",
+                                  "c45 read++" };
+    printf("      0x0510 raw=0x%04X  busy(15)=%d cmd-err(14)=%d read-err(13)=%d\n",
            st, !!(st & MII_STAT_BUSY), !!(st & MII_STAT_CMD_ERR),
-           !!(st & MII_STAT_READ_ERR), !!(st & MII_CTRL_PDI_CTRL));
+           !!(st & MII_STAT_READ_ERR));
+    printf("      command[10:8]=%s  pdi-may-control(1)=%d  "
+           "port0 PHY address[7:3]=%u  clause45(12)=%d\n",
+           cmd[(st >> 8) & 7], !!(st & MII_CTRL_PDI_CTRL),
+           (st >> 3) & 0x1F, !!(st & 0x1000));
 }
 
 static int check_mii_owner(EscCtx *ctx) {
@@ -183,14 +194,24 @@ static int check_mii_owner(EscCtx *ctx) {
         return -1;
     }
     printf("── MII management arbitration ─────────────────────────────\n");
-    printf("  0x0516 ECAT access state = 0x%02X\n  0x0517 PDI  access state = 0x%02X\n",
-           ea, pa);
+    /* Polarity per Beckhoff ESC Sec II v3.3 §2.12.5/§2.12.6:
+     *   0x0516[0]  0 = ECAT permits PDI takeover, 1 = ECAT claims exclusive
+     *   0x0517[0]  0 = ECAT has access,           1 = PDI has access
+     *   0x0517[1]  ECAT-writable: 1 resets 0x0517[0] to 0 */
+    printf("  0x0516 ECAT access = 0x%02X -> %s\n", ea,
+           (ea & 1) ? "ECAT claims EXCLUSIVE access"
+                    : "ECAT permits PDI takeover");
+    printf("  0x0517 PDI  access = 0x%02X -> %s\n", pa,
+           (pa & 1) ? "*** PDI HAS ACCESS ***" : "ECAT has access");
     decode_mii_status(ctrl);
-    if (ctrl & MII_CTRL_PDI_CTRL)
-        printf("  WARNING: 0x0510 bit1 set — the PDI (drive firmware) is permitted\n"
-               "  to control MII management. Extended (REGCR/ADDAR) reads share an\n"
-               "  indirect pointer with it and can collide in both directions.\n");
-    printf("  [polarity of 0x0516/0x0517 UNVERIFIED — confirm vs ETG.1000.6]\n\n");
+    if (pa & 1)
+        printf("  *** The drive firmware currently OWNS the MII interface.\n"
+               "  *** Master access will contend. 0x0517[1] can reset this.\n");
+    else if ((ctrl & MII_CTRL_PDI_CTRL) && !(ea & 1))
+        printf("  NOTE: ECAT has access, but 0x0510[1]=1 and 0x0516[0]=0 mean the\n"
+               "  PDI may take over at any time. Writing 0x0516[0]=1 would claim\n"
+               "  exclusive access (permitted while 0x0517[0]=0).\n");
+    printf("\n");
     return 0;
 }
 

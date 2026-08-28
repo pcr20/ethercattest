@@ -49,6 +49,22 @@ int main(void)
     CHECK(MII_STAT_BUSY == 0x8000, "busy must be bit 15");
     if (fails == f0) printf("T2 PASS: 0x0510 read=0x0100 write=0x0201 busy=bit15\n");
 
+    /* ── T2b: command field is bits[10:8], per Beckhoff Sec II v3.3 ─────── */
+    f0 = fails;
+    CHECK(((MII_CMD_READ  >> 8) & 7) == 0x1, "read must encode 001 in bits[10:8]");
+    CHECK(((MII_CMD_WRITE >> 8) & 7) == 0x2, "write must encode 010 in bits[10:8]");
+    CHECK((MII_CMD_READ & 1) == 0, "read must not set write-enable bit 0");
+    CHECK(MII_STAT_CMD_ERR == (1u << 14) && MII_STAT_READ_ERR == (1u << 13),
+          "error bits must be 14 (command) and 13 (read)");
+    CHECK(MII_CTRL_PDI_CTRL == (1u << 1), "PDI-control indicator is bit 1");
+    /* Write-enable self-clears at the SOF of the next frame, so it must be set
+     * in the SAME write as the command — a two-step write would silently fail. */
+    CHECK((MII_CMD_WRITE & 1) == 1 && ((MII_CMD_WRITE >> 8) & 7) == 0x2,
+          "write-enable and command must be in one word");
+    if (fails == f0)
+        printf("T2b PASS: 0x0510 command field bits[10:8] and error bits match "
+               "Beckhoff ESC Sec II v3.3 §2.12.1\n");
+
     /* ── T3: APWR frame, walked exactly as an ESC reads it ──────────────── */
     f0 = fails;
     {
