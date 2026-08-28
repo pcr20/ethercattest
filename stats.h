@@ -27,7 +27,7 @@ typedef struct {
     _Atomic uint64_t frames_received;  /* RX thread                            */
     _Atomic uint64_t frames_lost;      /* TX thread (retire)                   */
     _Atomic uint64_t seq_bad;          /* RX thread                            */
-    _Atomic uint64_t tx_backpressure;  /* TX thread — EAGAIN/in-flight cap     */
+    _Atomic uint64_t tx_backpressure;  /* TX thread — EAGAIN/ENOBUFS retries   */
     _Atomic uint64_t credit_writeoff_events;/* TX thread — valve fired count    */
     _Atomic uint64_t brd_wkc_mismatches;/* RX thread                           */
     _Atomic uint64_t distinct_returns; /* RX thread — deduped returned seqs     */
@@ -90,13 +90,14 @@ extern Stats g_stats;
  *
  * All seq values are uint64 — at 8127 fps a 32-bit counter would wrap in ~6
  * days; uint64 never wraps within any realistic run. The window is a
- * power-of-two ring indexed by (seq & MASK); the window (1M) vastly exceeds the
- * credit depth (~4k), so a slot is never aliased before hw passes it.
+ * power-of-two ring indexed by (seq & MASK); at ~8127 fps the 1M-entry window
+ * spans ~129 s of transmission, vastly exceeding any plausible in-flight depth
+ * (microseconds of chain RTT), so a slot is never aliased before hw passes it.
  *
  * THREADING: the RX thread is the SOLE owner of all accounting state (hw, the
  * returned records, loss/corruption counters). No other thread writes it, so no
- * locking is needed. TX reads only the atomic credit counters. */
-#define SEQ_WINDOW (1u << 20)         /* 1,048,576 — vastly exceeds credit depth */
+ * locking is needed. TX reads no accounting state back. */
+#define SEQ_WINDOW (1u << 20)         /* 1,048,576 — ~129 s of wire at 8127 fps */
 #define SEQ_MASK   (SEQ_WINDOW - 1)
 
 typedef struct {

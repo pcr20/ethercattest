@@ -45,15 +45,17 @@ static void try_realtime(int prio) {
 }
 
 /* ── TX thread ──────────────────────────────────────────────────────────── */
-/* Maximum frames allowed outstanding (sent but not yet returned) before TX
- * pauses. This bounds the sent/received gap so backpressure reflects the WIRE
- * draining frames, not the kernel TX ring / socket buffer swallowing them.
- * Without this cap, large buffers + a high-latency link (e.g. a passive
- * loopback plug) let TX build a huge backlog that then shows up as spurious
- * "loss" at shutdown. On a real EtherCAT chain the RTT is microseconds so the
- * cap is essentially never hit; it only clamps pathological buffering.
- * ~4000 frames ≈ 0.5s of wire time at 8100 fps — ample in-flight headroom. */
-#define MAX_INFLIGHT 4000
+/* TX NEVER HALTS. There is deliberately no in-flight cap, no credit window,
+ * no backlog bound and no pause of any kind here — see README §"TX never
+ * halts". Five successive designs that paused TX all deadlocked (enqueued-cap
+ * wedge -> transmitted-cap stall -> resolved-credit deadlock -> credit valve ->
+ * TxOk backlog cap): frames dropped during a link outage pinned the completion
+ * gate, so TX could never resume. The kernel/PHY discards frames when there is
+ * no link and those frames are excluded from TxOk anyway, so there is nothing
+ * to protect against by pausing.
+ *
+ * A MAX_INFLIGHT cap of 4000 frames used to live here and is now removed; do
+ * not reintroduce it or any equivalent. */
 
 void *tx_thread(void *arg) {
     ThreadCtx *ctx = (ThreadCtx *)arg;
@@ -98,8 +100,8 @@ void *tx_thread(void *arg) {
 
         int sent = send(ctx->sock, tx_buf, frame_len, 0);
         if (sent > 0) {
-            /* Accounting is count-based and TxOk-anchored; TX only counts what
-             * it enqueued (for the backlog cap and pipeline display). Loss is
+            /* Accounting is count-based and TxOk-anchored; TX only counts
+             * what it enqueued (for the pipeline display). Loss is
              * TxOk − distinct returns, computed elsewhere. */
             atomic_fetch_add_explicit(&g_stats.frames_enqueued, 1, memory_order_relaxed);
             seq++;
@@ -412,8 +414,8 @@ void *errq_thread(void *arg) {
  * Periodically (every ~20ms) reads the hardware tally counters (TxOk via
  * ethtool GSTATS, TxER) and the kernel qdisc tx_dropped, base-subtracted into
  * g_txok / g_txer / g_qdisc_drop. TxOk is the measurement boundary and drives
- * both the loss figure (loss = TxOk − distinct returns) and the TX credit
- * window (credit = enqueued − TxOk). The diagnostic confirmed TxOk updates
+ * the loss figure (loss = TxOk − distinct returns). There is no TX credit
+ * window — TX never pauses. The diagnostic confirmed TxOk updates
  * smoothly (~per-frame under saturation), so 20ms sampling gives a sharp
  * boundary with at most ~a few hundred frames of edge fuzz during an outage
  * transition. Runs unpinned; the ioctl is cheap. */

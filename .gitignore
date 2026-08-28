@@ -1,0 +1,11 @@
+# Build artifacts
+*.o
+ecat_ber
+ecat_regdump
+ecat_phy
+tests/t_*
+!tests/t_*.c
+
+# Run output
+*.csv
+*.zip

@@ -234,8 +234,9 @@ int main(int argc, char *argv[]) {
     int      badfcs_budget = BADFCS_PRINT_CAP;   /* prints left this interval */
     uint64_t badfcs_suppressed = 0;
     g_start_ns = start_ns;   /* for netlink relative timestamps */
-    /* Assume link up until netlink seeds real state, so the in-flight cap is
-     * active from the start rather than disabled by a 0-initialised flag. */
+    /* Assume link up until netlink seeds real state, so the completion gate's
+     * link-state reporting is correct from the start rather than reading DOWN
+     * from a 0-initialised flag. */
     atomic_store_explicit(&g_stats.link_state_up, 1, memory_order_relaxed);
 
     printf("Running... (Ctrl-C to stop)\n");
