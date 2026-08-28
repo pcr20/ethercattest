@@ -23,14 +23,43 @@ echo "[2] Setting $IFACE up (promisc)..."
 ip link set "$IFACE" promisc on
 ip link set "$IFACE" up
 
-# 3. Force 100BASE-TX (prevents gigabit negotiation, matching EtherCAT slaves)
-echo "[3] Forcing 100BASE-TX full-duplex on $IFACE..."
-ethtool -s "$IFACE" speed 100 duplex full autoneg off 2>/dev/null || {
-    echo "    WARNING: ethtool speed force failed — your NIC may not support"
-    echo "    forced speed. This is OK if the slave forces 100Mbps anyway."
-    echo "    For the loopback cable test, add a 100BASE-TX-only SFP or"
-    echo "    ensure autoneg settles at 100Mbps."
+# 3. Negotiate 100BASE-TX full duplex — advertising ONLY 100baseT/Full.
+#
+#    Do NOT go back to "speed 100 duplex full autoneg off". Forcing the link
+#    disables autonegotiation on OUR side, and a slave PHY that still has
+#    autoneg enabled (the Novanta EVS-XCR-E's DP83822s do) then cannot
+#    negotiate — it falls back to PARALLEL DETECTION, which resolves speed but
+#    NOT duplex, so per IEEE 802.3 it defaults to HALF duplex while we run
+#    full. That duplex mismatch was measured on this rig: ~2e-5 frame loss
+#    with ZERO CRC, length, WKC and lost-link errors anywhere, because frames
+#    aborted on collision at the half-duplex end are never transmitted and so
+#    never return. Nothing records an error; the frames simply vanish.
+#
+#    Advertising only 100baseT/Full (mask 0x008) keeps gigabit off the table
+#    while letting both ends actually negotiate, so duplex is agreed properly.
+echo "[3] Negotiating 100BASE-TX full-duplex on $IFACE (autoneg on, 100FD only)..."
+ethtool -s "$IFACE" autoneg on advertise 0x008 2>/dev/null || {
+    echo "    WARNING: could not set the advertisement — your NIC may not"
+    echo "    support restricting autoneg. Check the negotiated result below."
 }
+
+#    Autoneg restarts the link, so wait for carrier before continuing.
+echo "    waiting for link to renegotiate..."
+for _ in $(seq 1 100); do
+    [ "$(cat /sys/class/net/"$IFACE"/carrier 2>/dev/null)" = "1" ] && break
+    sleep 0.1
+done
+
+#    Verify what actually came up. A half-duplex result here is the exact
+#    fault described above and will silently corrupt any BER measurement.
+_speed=$(cat /sys/class/net/"$IFACE"/speed 2>/dev/null || echo "?")
+_duplex=$(cat /sys/class/net/"$IFACE"/duplex 2>/dev/null || echo "?")
+echo "    negotiated: ${_speed}Mb/s ${_duplex}-duplex"
+if [ "$_duplex" != "full" ] || [ "$_speed" != "100" ]; then
+    echo "    *** WARNING: expected 100Mb/s full-duplex. A half-duplex or"
+    echo "    *** gigabit link will invalidate the BER measurement. Check the"
+    echo "    *** slave PHY's autoneg configuration before running any test."
+fi
 
 # 4. Disable NIC offloads that can interfere with raw frame handling
 echo "[4] Disabling NIC offloads..."
@@ -126,6 +155,6 @@ echo "To check NIC CRC counters manually at any time:"
 echo "  ethtool -S $IFACE | grep -i crc"
 echo ""
 echo "To restore normal NIC settings after testing:"
-echo "  ethtool -s $IFACE autoneg on"
+echo "  ethtool -s $IFACE autoneg on advertise 0x03f   # re-advertise 10/100/1000"
 echo "  ethtool -K $IFACE rx on tx on gso on gro on"
 echo "  ethtool -K $IFACE rx-all off rx-fcs off"
