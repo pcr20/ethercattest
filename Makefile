@@ -32,7 +32,7 @@ ecat_escreset: $(RESET_OBJS) stats.o crc.o
 %.o: %.c ecat_common.h crc.h stats.h frame.h nic.h threads.h escreg.h escmii.h phy_regs.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
-TESTS = t_escframe t_miiframe t_physweep t_hostrx t_escclear t_wirefmt t_framesz t_txok t_crc t_resid3 t_escgate t_plsem t_ring
+TESTS = t_escframe t_miiframe t_physweep t_hostrx t_escclear t_pause t_wirefmt t_framesz t_txok t_crc t_resid3 t_escgate t_plsem t_ring
 test: $(TESTS:%=tests/%)
 	@for t in $(TESTS); do ./tests/$$t || exit 1; done
 	@echo "ALL TEST SUITES PASS"

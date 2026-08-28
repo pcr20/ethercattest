@@ -280,6 +280,94 @@ static int sweep_phy(EscCtx *ctx, int phy, int do_ext) {
     return failed ? 1 : 0;
 }
 
+/* ── Reset canary (Task 3) ──────────────────────────────────────────────────
+ * The DP83822 has no brownout detector, no power-on-reset flag and no
+ * reset-reason register (searched SNLS505H Rev H), so "was this PHY reset?"
+ * can only be answered by leaving a mark and seeing whether it survives.
+ *
+ * Two tiers, chosen from the datasheet's reset semantics:
+ *
+ *   TIER 1  BICSR1 0x001B bits[7:0] "BIST IPG Length", R/W, default 0x7D.
+ *           Standard space, so cleared by ANY reset. Only affects the gap
+ *           between packets the BIST generator emits, and BIST is off.
+ *           Bits[15:8] are READ-ONLY (BIST error count) and bit 15 locks and
+ *           clears that counter — so the write must keep bit 15 CLEAR.
+ *
+ *   TIER 2  MMD 0x1F (vendor) 0x04A5 "Receive Secure-ON Password #1", R/W,
+ *           default 0. Holds a Wake-on-LAN Secure-ON password, which an
+ *           EtherCAT drive never uses, so it is inert storage. Per Table 8-1,
+ *           a BMCR bit-15 soft reset does NOT clear MMD 0x1F registers, and
+ *           straps are re-latched only on power-up or RESET_N — and PHYRCR
+ *           0x001F bit 15 "has the same effect as Hardware reset pin".
+ *
+ * With the ESC lost-link counter (already read in-band by ecat_ber, free)
+ * that gives four distinguishable outcomes:
+ *
+ *   both marks present ................ no reset
+ *   tier 1 gone, tier 2 present ....... BMCR soft reset
+ *   both gone, ESC counter preserved .. PHYRCR / RESET_N hard reset
+ *   both gone, ESC counters zeroed .... drive power cycle
+ */
+#define CANARY_T1_REG   0x1B
+#define CANARY_T1_VAL   0x00A5   /* bit15 CLEAR; IPG = 0xA5 (default 0x7D)  */
+#define CANARY_T1_DFLT  0x7D
+#define CANARY_T2_DEVAD MMD_DEVAD_VENDOR
+#define CANARY_T2_REG   0x04A5
+#define CANARY_T2_VAL   0xC0DE
+
+static int canary_write(EscCtx *ctx, int phy) {
+    uint16_t rb = 0;
+    int rc = 0;
+    printf("── Reset canary: writing PHY %d ─────────────────────────────\n", phy);
+    int r = mii_write_phy(ctx, (uint8_t)phy, CANARY_T1_REG, CANARY_T1_VAL, 1, &rb);
+    if (r == 0) printf("  tier1 BICSR1 0x1B    <- 0x%04X  (read-back 0x%04X)\n",
+                       CANARY_T1_VAL, rb);
+    else { printf("  tier1 BICSR1 0x1B    WRITE FAILED (rc=%d)\n", r); rc = 1; }
+
+    /* Tier 2 is in extended space: set the pointer, then write ADDAR. */
+    if (mii_write_phy(ctx, (uint8_t)phy, PHY_REG_REGCR,
+                      MMD_CMD_ADDR(CANARY_T2_DEVAD), 0, NULL) != 0 ||
+        mii_write_phy(ctx, (uint8_t)phy, PHY_REG_ADDAR, CANARY_T2_REG, 0, NULL) != 0 ||
+        mii_write_phy(ctx, (uint8_t)phy, PHY_REG_REGCR,
+                      MMD_CMD_DATA(CANARY_T2_DEVAD), 0, NULL) != 0 ||
+        mii_write_phy(ctx, (uint8_t)phy, PHY_REG_ADDAR, CANARY_T2_VAL, 0, NULL) != 0) {
+        printf("  tier2 MMD1F 0x%04X   WRITE FAILED\n", CANARY_T2_REG); return 1;
+    }
+    uint16_t v = 0;
+    if (mii_mmd_read(ctx, (uint8_t)phy, CANARY_T2_DEVAD, CANARY_T2_REG, &v) == 0)
+        printf("  tier2 MMD1F 0x%04X   <- 0x%04X  (read-back 0x%04X)%s\n",
+               CANARY_T2_REG, CANARY_T2_VAL, v,
+               v == CANARY_T2_VAL ? "" : "  *** MISMATCH ***");
+    else { printf("  tier2 read-back FAILED\n"); rc = 1; }
+    return rc;
+}
+
+static int canary_check(EscCtx *ctx, int phy) {
+    uint16_t t1 = 0, t2 = 0;
+    int ok1 = mii_read_phy(ctx, (uint8_t)phy, CANARY_T1_REG, &t1, NULL) == 0;
+    int ok2 = mii_mmd_read(ctx, (uint8_t)phy, CANARY_T2_DEVAD,
+                           CANARY_T2_REG, &t2) == 0;
+    if (!ok1 || !ok2) { printf("  PHY %d canary read FAILED\n", phy); return 1; }
+
+    int t1_ok = (t1 & 0x00FF) == (CANARY_T1_VAL & 0x00FF);
+    int t2_ok = t2 == CANARY_T2_VAL;
+    printf("  PHY %d  tier1 0x1B=0x%04X %s   tier2 0x%04X=0x%04X %s\n",
+           phy, t1, t1_ok ? "intact" : "GONE",
+           CANARY_T2_REG, t2, t2_ok ? "intact" : "GONE");
+    if (t1_ok && t2_ok)   printf("         -> no PHY reset since the canary was written\n");
+    else if (!t1_ok && t2_ok)
+        printf("         -> *** BMCR soft reset detected *** (standard space\n"
+               "            cleared, MMD 0x1F survived)\n");
+    else if (!t1_ok && !t2_ok)
+        printf("         -> *** HARD reset detected *** (PHYRCR 0x1F bit15,\n"
+               "            RESET_N, or power cycle). Check the ESC lost-link\n"
+               "            counter: preserved = PHY reset, zeroed = drive power cycle.\n");
+    else
+        printf("         -> tier1 intact but tier2 GONE — unexpected; the MMD\n"
+               "            write may not have taken. Treat as inconclusive.\n");
+    return (t1_ok && t2_ok) ? 0 : 2;
+}
+
 static void usage(const char *p) {
     printf("Usage: %s -i <iface> [options]\n"
            "  -i <iface>         interface (required)\n"
@@ -293,7 +381,10 @@ static void usage(const char *p) {
            "  -w <reg>=<val>     WRITE one PHY register (needs --allow-phy-write)\n"
            "  --allow-phy-write  permit writes to the PHY\n"
            "  --fld-enable       write CR3=0x140F (all five FLD criteria)\n"
-           "  --fld-status       read FLDS and decode\n\n"
+           "  --fld-status       read FLDS and decode\n"
+           "  --canary-write     write the two-tier reset canary (needs\n"
+           "                     --allow-phy-write)\n"
+           "  --canary-check     read it back and classify any reset\n\n"
            "This tool WRITES ESC registers even to READ a PHY register.\n"
            "Extended reads and PHY writes need --allow-phy-write.\n", p);
 }
@@ -302,7 +393,7 @@ int main(int argc, char *argv[]) {
     const char *iface = NULL, *csv_path = NULL;
     int position = 0, timeout_ms = 10, phy_sel = -1;   /* -1 = both */
     int do_sweep = 0, do_ext = 0, allow_write = 0;
-    int do_fld_status = 0, do_fld_enable = 0;
+    int do_fld_status = 0, do_fld_enable = 0, cw = 0, cc = 0;
     int rd_reg = -1, wr_reg = -1; long wr_val = -1;
 
     static struct option lo[] = {
@@ -311,6 +402,8 @@ int main(int argc, char *argv[]) {
         { "fld-status",      no_argument,       0, 1002 },
         { "ext",             no_argument,       0, 1003 },
         { "csv",             required_argument, 0, 1004 },
+        { "canary-write",    no_argument,       0, 1005 },
+        { "canary-check",    no_argument,       0, 1006 },
         { 0, 0, 0, 0 }
     };
     int opt;
@@ -335,15 +428,17 @@ int main(int argc, char *argv[]) {
         case 1002: do_fld_status = 1; break;
         case 1003: do_ext = 1; break;
         case 1004: csv_path = optarg; break;
+        case 1005: cw = 1; break;
+        case 1006: cc = 1; break;
         default: usage(argv[0]); return opt == 'h' ? 0 : 1;
         }
     }
     if (!iface) { usage(argv[0]); return 1; }
     if (!do_sweep && !do_ext && !do_fld_status && !do_fld_enable &&
-        rd_reg < 0 && wr_reg < 0) do_sweep = 1;
+        !cw && !cc && rd_reg < 0 && wr_reg < 0) do_sweep = 1;
     if (do_ext) do_sweep = 1;
 
-    if ((wr_reg >= 0 || do_fld_enable) && !allow_write) {
+    if ((wr_reg >= 0 || do_fld_enable || cw) && !allow_write) {
         fprintf(stderr, "REFUSED: writing a PHY register changes DUT behaviour.\n"
                         "Re-run with --allow-phy-write if that is intended.\n");
         return 1;
@@ -376,6 +471,15 @@ int main(int argc, char *argv[]) {
     if (check_mii_owner(&ctx) != 0) { esc_close(&ctx); return 1; }
 
     int rc = 0;
+    if (cw) { if (phy_sel < 0) { rc |= canary_write(&ctx, 0);
+                                 rc |= canary_write(&ctx, 1); }
+              else               rc |= canary_write(&ctx, phy_sel);
+              printf("\n"); }
+    if (cc) { printf("── Reset canary: check ────────────────────────────────────\n");
+              if (phy_sel < 0) { rc |= canary_check(&ctx, 0);
+                                 rc |= canary_check(&ctx, 1); }
+              else               rc |= canary_check(&ctx, phy_sel);
+              printf("\n"); }
     if (do_sweep) {
         if (phy_sel < 0) { rc |= sweep_phy(&ctx, 0, do_ext);
                            rc |= sweep_phy(&ctx, 1, do_ext); }

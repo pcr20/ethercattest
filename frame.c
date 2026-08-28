@@ -205,6 +205,22 @@ uint64_t parse_return_frame(const uint8_t *buf, int len,
 
     /* Datagram 0: NOP — extract sequence number from payload */
     if (pos + ECAT_DG_HDR_LEN > len) return pl_fail();
+
+    /* FOREIGN-FRAME REJECTION. Our socket is bound to ETH_P_ECAT on a
+     * promiscuous interface, so it sees EVERY EtherCAT frame on the wire —
+     * including a register probe sharing the link. Every frame we build leads
+     * with a NOP datagram (build_frame); a probe leads with APRD. Without this
+     * check a probe reply falls through to the payload-CRC path and inflates
+     * the BER numerator.
+     *
+     * This makes the §3.4 partition THREE-way rather than two: valid payload
+     * CRC / counted in payload_crc_errors / foreign. A corrupted frame of OURS
+     * is still counted correctly, because corruption is caught by the FCS
+     * residual check before this point and counted in rx_bad_fcs_computed. */
+    if (buf[pos] != ECAT_CMD_NOP) {
+        atomic_fetch_add_explicit(&g_rx_foreign, 1, memory_order_relaxed);
+        return UINT64_MAX;
+    }
     uint16_t lf = le16get(buf + pos + 6);   /* LE per ETG.1000.4 */
     uint16_t dg_len = lf & 0x07FF;
     pos += ECAT_DG_HDR_LEN;

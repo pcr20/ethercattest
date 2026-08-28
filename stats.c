@@ -12,6 +12,14 @@ _Atomic uint64_t g_rx_dropped = 0;
 _Atomic uint64_t g_rx_fifo    = 0;
 _Atomic uint64_t g_rx_nic_err = 0;
 _Atomic uint64_t g_rx_nic_crc = 0;
+_Atomic int      g_tx_paused    = 0;
+_Atomic int      g_rx_discard   = 0;
+_Atomic int      g_pause_req    = 0;
+_Atomic int      g_resume_req   = 0;
+_Atomic uint64_t g_foreign_txok = 0;
+_Atomic uint64_t g_pause_count  = 0;
+_Atomic uint64_t g_pause_forced = 0;
+_Atomic uint64_t g_rx_foreign   = 0;
 _Atomic uint64_t g_wire_bits_per_frame = 0;
 BadFcsEv g_bfe[BADFCS_RING];
 _Atomic uint64_t g_bfe_head = 0;
@@ -63,7 +71,14 @@ void print_stats(FILE *csv, uint64_t elapsed_ns) {
     uint64_t wire     = g_stats.tx_wire_packets;
 
     /* Wire-truth boundary. */
-    uint64_t txok  = atomic_load_explicit(&g_txok, memory_order_relaxed);
+    /* TxOk is an INTERFACE-wide hardware counter, so it also counts frames put
+     * on the wire by an external probe while we were paused. We transmit
+     * nothing while paused, so that delta is foreign by definition and is
+     * subtracted here — otherwise each probe frame becomes a phantom loss and
+     * inflates the BER denominator. */
+    uint64_t txok_raw = atomic_load_explicit(&g_txok, memory_order_relaxed);
+    uint64_t foreign  = atomic_load_explicit(&g_foreign_txok, memory_order_relaxed);
+    uint64_t txok     = (txok_raw >= foreign) ? txok_raw - foreign : 0;
     uint64_t txer  = atomic_load_explicit(&g_txer, memory_order_relaxed);
     uint64_t qdrop = atomic_load_explicit(&g_qdisc_drop, memory_order_relaxed);
 
@@ -107,7 +122,22 @@ void print_stats(FILE *csv, uint64_t elapsed_ns) {
     printf("  TxER  (r8169 rejected, carrier-lost etc.): %lu  (excluded from BER)\n", txer);
     /* Two DIFFERENT counters; the old panel conflated them. */
     printf("  netdev tx_dropped (driver-level): %lu  (excluded — never on wire)\n", qdrop);
-    if (g_stats.qdisc_real_ok) {
+
+    {
+        uint64_t np = atomic_load_explicit(&g_pause_count,  memory_order_relaxed);
+        uint64_t nf = atomic_load_explicit(&g_pause_forced, memory_order_relaxed);
+        uint64_t rf = atomic_load_explicit(&g_rx_foreign,   memory_order_relaxed);
+        if (np || foreign || rf) {
+            printf("  \u2500\u2500 External probe pauses \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n");
+            printf("  Pauses: %lu   TxOk raw %lu - foreign %lu = %lu used\n",
+                   np, txok_raw, foreign, txok);
+            if (nf) printf("  *** %lu pause(s) needed the WATCHDOG to resume — the\n"
+                           "  *** probe died mid-pause; check the orchestration. ***\n", nf);
+            if (rf) printf("  *** %lu foreign EtherCAT frame(s) seen WHILE COUNTING.\n"
+                           "  *** Another master is on the wire outside the pause\n"
+                           "  *** windows; this run is not isolated. ***\n", rf);
+        }
+    }    if (g_stats.qdisc_real_ok) {
         uint64_t qreal = (g_stats.qdisc_real_end >= g_stats.qdisc_real_start)
                        ? g_stats.qdisc_real_end - g_stats.qdisc_real_start : 0;
         printf("  qdisc drops (root qdisc, real): %lu  (excluded — never on wire)\n",

@@ -68,6 +68,14 @@ void *tx_thread(void *arg) {
     uint64_t next_send_ns = now_ns();
 
     while (g_tx_running) {
+        /* External pause (SIGUSR1). Not the §3.5 banned pause: the resume
+         * condition is external and watchdog-backed, so there is no feedback
+         * loop to deadlock on. While paused we transmit NOTHING, which is what
+         * makes the foreign-TxOk subtraction exact. */
+        if (atomic_load_explicit(&g_tx_paused, memory_order_relaxed)) {
+            sleep_ns(1000 * 1000);          /* 1 ms */
+            continue;
+        }
         if (interval_ns) {
             uint64_t now = now_ns();
             if (now < next_send_ns) {
@@ -182,6 +190,10 @@ void *rx_thread(void *arg) {
      * rx_fcs_on / rx_all_on come from ctx (set from ethtool state at startup). */
     #define HANDLE_FRAME(idx) do {                                              \
         int raw_len = msgs[idx].msg_len;                                        \
+        /* Paused for an external probe: keep DRAINING the socket so it cannot  \
+         * fill, but count nothing — the probe's frames are on this wire and    \
+         * would otherwise be parsed as corrupt on resume. */                   \
+        if (atomic_load_explicit(&g_rx_discard, memory_order_relaxed)) break;   \
         atomic_fetch_add_explicit(&g_stats.frames_received, 1,                  \
                                   memory_order_relaxed);                       \
         rx_check_len(raw_len, ctx->rx_fcs_on);                                 \

@@ -14,6 +14,21 @@ static void sig_handler(int sig) {
     else              g_running    = 0;   /* second: hard stop          */
 }
 
+/* SIGUSR1 = pause TX, SIGUSR2 = resume, for an out-of-process register probe
+ * sharing this interface. Handlers only set atomics (async-signal-safe); the
+ * supervisor thread performs the transitions. */
+static void pause_handler(int sig)  { (void)sig;
+    atomic_store_explicit(&g_pause_req, 1, memory_order_relaxed); }
+static void resume_handler(int sig) { (void)sig;
+    atomic_store_explicit(&g_resume_req, 1, memory_order_relaxed); }
+
+/* Force-resume if the probe dies mid-pause. Without this a crashed script
+ * would leave TX stopped for the rest of an overnight run. */
+#define PAUSE_WATCHDOG_NS (30ULL * 1000000000ULL)
+/* In-flight returns settle in microseconds; 5 ms is generous. Counting them
+ * normally before muting RX avoids charging them as loss on every pause. */
+#define PAUSE_SETTLE_NS   (5ULL * 1000000ULL)
+
 /* ── Main ───────────────────────────────────────────────────────────────── */
 int main(int argc, char *argv[]) {
     const char *iface     = NULL;
@@ -213,6 +228,8 @@ int main(int argc, char *argv[]) {
     /* Signal handlers */
     signal(SIGINT,  sig_handler);
     signal(SIGTERM, sig_handler);
+    signal(SIGUSR1, pause_handler);
+    signal(SIGUSR2, resume_handler);
 
     /* Initial NIC CRC baseline */
 
@@ -304,9 +321,53 @@ int main(int argc, char *argv[]) {
      * duration. It touches no hot-path state except reading atomics.
      * g_tx_running is what the supervisor and signal handler clear; g_running
      * stays set until after the drain barrier. */
+    /* Pause/resume state, owned by this supervisor thread. */
+    uint64_t pause_txok_raw = 0, pause_began_ns = 0;
+    int      paused = 0;
+
     while (g_tx_running) {
         sleep_ns(200 * 1000000);   /* 200 ms tick */
         uint64_t now = now_ns();
+
+        /* ── External pause/resume ──────────────────────────────────────── */
+        if (!paused && atomic_exchange_explicit(&g_pause_req, 0,
+                                                memory_order_relaxed)) {
+            atomic_store_explicit(&g_tx_paused, 1, memory_order_relaxed);
+            sleep_ns(PAUSE_SETTLE_NS);        /* let in-flight returns land */
+            atomic_store_explicit(&g_rx_discard, 1, memory_order_relaxed);
+            /* Read the RAW hardware counter, not the 20 ms sample, so the
+             * foreign-frame subtraction is exact. */
+            pause_txok_raw = read_nic_tx_packets(iface);
+            pause_began_ns = now_ns();
+            paused = 1;
+            atomic_fetch_add_explicit(&g_pause_count, 1, memory_order_relaxed);
+            fprintf(stderr, "[pause] TX stopped for external probe\n");
+        }
+        if (paused) {
+            int forced = (now_ns() - pause_began_ns) > PAUSE_WATCHDOG_NS;
+            if (atomic_exchange_explicit(&g_resume_req, 0,
+                                         memory_order_relaxed) || forced) {
+                /* We transmitted nothing while paused, so every frame the NIC
+                 * put on the wire in this window belongs to someone else. */
+                uint64_t f = read_nic_tx_packets(iface) - pause_txok_raw;
+                atomic_fetch_add_explicit(&g_foreign_txok, f,
+                                          memory_order_relaxed);
+                atomic_store_explicit(&g_rx_discard, 0, memory_order_relaxed);
+                atomic_store_explicit(&g_tx_paused, 0, memory_order_relaxed);
+                paused = 0;
+                if (forced) {
+                    atomic_fetch_add_explicit(&g_pause_forced, 1,
+                                              memory_order_relaxed);
+                    fprintf(stderr, "[pause] WATCHDOG: no resume within %llus "
+                            "— forcing TX back on\n",
+                            (unsigned long long)(PAUSE_WATCHDOG_NS / 1000000000ULL));
+                }
+                fprintf(stderr, "[pause] resumed; %lu foreign frame(s) on the "
+                        "wire excluded from TxOk\n", f);
+            } else {
+                continue;    /* stay paused; skip sampling this tick */
+            }
+        }
 
         if (duration_s > 0 &&
             (now - start_ns) >= (uint64_t)duration_s * 1000000000ULL) {

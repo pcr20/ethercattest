@@ -202,6 +202,30 @@ extern _Atomic uint64_t g_rx_fifo;     /* rx_fifo_errors                    */
 extern _Atomic uint64_t g_rx_nic_err;  /* rx_errors                         */
 extern _Atomic uint64_t g_rx_nic_crc;  /* rx_crc_errors                     */
 
+/* ── External pause/resume, for out-of-process register probing ─────────────
+ * A probe tool (ecat_phy) shares the interface, and its frames would corrupt
+ * this measurement three ways: they inflate TxOk (an interface-wide hardware
+ * counter) creating phantom loss; their replies reach our promiscuous
+ * ETH_P_ECAT socket and are parsed as corrupt frames; and they queue in the
+ * socket buffer if we simply stop.
+ *
+ * SIGUSR1 pauses TX, SIGUSR2 resumes. While paused this process transmits
+ * NOTHING, so any TxOk increase in that window is foreign BY DEFINITION and is
+ * subtracted exactly — no IPC and no cooperation from the probe is needed.
+ *
+ * This is NOT the banned TX pause of README §3.5. Those five designs deadlocked
+ * because TX waited on a condition its own stalling prevented from clearing.
+ * Here the resume condition is external, and a watchdog force-resumes if the
+ * probe dies, so no feedback loop exists and no deadlock is possible. */
+extern _Atomic int      g_tx_paused;    /* TX thread: stop sending while set  */
+extern _Atomic int      g_rx_discard;   /* RX thread: drain but do not count  */
+extern _Atomic int      g_pause_req;    /* set by SIGUSR1 handler             */
+extern _Atomic int      g_resume_req;   /* set by SIGUSR2 handler             */
+extern _Atomic uint64_t g_foreign_txok; /* frames other processes put on wire */
+extern _Atomic uint64_t g_pause_count;
+extern _Atomic uint64_t g_pause_forced; /* watchdog had to resume us          */
+extern _Atomic uint64_t g_rx_foreign;   /* non-NOP frames seen while counting */
+
 /* Actual on-wire bits per frame, published by the TX thread after the first
  * build_frame(): (frame_len + 4-byte FCS) * 8. These are exactly the
  * CRC-protected bits — the bits whose corruption the FCS/payload detectors can
