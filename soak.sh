@@ -61,10 +61,15 @@ while kill -0 "$BER_PID" 2>/dev/null; do
     TS=$(date +%Y%m%d_%H%M%S)
 
     kill -USR1 "$BER_PID"
-    sleep 0.3                                  # let the pause take effect
+    # ecat_ber must stop TX, drain the qdisc backlog (~300 ms, polled
+    # adaptively) and mute RX before the wire is quiet enough to probe. With
+    # only 0.3 s here, 43% of probes in the first overnight run failed with
+    # "cannot read the ESC MII block" — they were started while the wire was
+    # still saturated and burned their 10 ms timeouts on BER frames.
+    sleep 1.0
     # Direct registers only: no --ext, so the probe does NOT write the PHY.
     # The canary check is read-only too.
-    ./ecat_phy -i "$IFACE" --csv "$OUT/phy_${TS}.csv" --canary-check \
+    ./ecat_phy -i "$IFACE" -d --csv "$OUT/phy_${TS}.csv" --canary-check \
                > "$OUT/phy_${TS}.txt" 2>&1
     kill -USR2 "$BER_PID"
 

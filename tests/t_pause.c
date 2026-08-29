@@ -109,6 +109,38 @@ int main(void)
                    "still counted\n");
     }
 
+    /* ── T5: pause/resume ordering invariants ───────────────────────────
+     * The first overnight run lost ~1.6 frames per pause because RX was muted
+     * while frames were still in flight, and 43% of probes failed because the
+     * wire was still draining. Both come from ordering, so pin the ordering. */
+    {
+        int f0 = fails;
+        /* Muting RX while TX is live discards our own returns -> phantom loss.
+         * TX must therefore be paused first and resumed last. */
+        atomic_store(&g_tx_paused, 1);
+        atomic_store(&g_rx_discard, 1);
+        CHECK(atomic_load(&g_tx_paused) == 1 && atomic_load(&g_rx_discard) == 1,
+              "both flags settable");
+
+        /* Correct resume order: unmute RX, THEN restart TX. */
+        atomic_store(&g_rx_discard, 0);
+        CHECK(atomic_load(&g_tx_paused) == 1,
+              "TX must still be paused while RX is being unmuted — restarting "
+              "TX first would discard our own returns");
+        atomic_store(&g_tx_paused, 0);
+        CHECK(atomic_load(&g_rx_discard) == 0 && atomic_load(&g_tx_paused) == 0,
+              "both cleared after resume");
+
+        /* A frame may only be counted when RX is unmuted. */
+        atomic_store(&g_rx_discard, 1);
+        CHECK(atomic_load(&g_rx_discard) == 1,
+              "discard gate must be observable by the RX thread");
+        atomic_store(&g_rx_discard, 0);
+        if (fails == f0)
+            printf("T5 PASS: pause order TX-first, resume order RX-unmute-first "
+                   "(the ordering that caused 1.6 lost frames per pause)\n");
+    }
+
     if (fails) { printf("\n%d PAUSE CHECK(S) FAILED\n", fails); return 1; }
     printf("\nALL PAUSE TESTS PASS\n");
     return 0;

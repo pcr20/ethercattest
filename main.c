@@ -25,9 +25,51 @@ static void resume_handler(int sig) { (void)sig;
 /* Force-resume if the probe dies mid-pause. Without this a crashed script
  * would leave TX stopped for the rest of an overnight run. */
 #define PAUSE_WATCHDOG_NS (30ULL * 1000000000ULL)
-/* In-flight returns settle in microseconds; 5 ms is generous. Counting them
- * normally before muting RX avoids charging them as loss on every pause. */
-#define PAUSE_SETTLE_NS   (5ULL * 1000000ULL)
+
+/* Settling the pause is NOT just about in-flight returns. TX offers ~181k/s
+ * into an 8127/s wire, so when TX stops the qdisc still holds a backlog that
+ * keeps the MAC transmitting. A measured run showed ~2490 frames draining per
+ * pause — about 306 ms. The original 5 ms settle was far too short, and caused
+ * all three defects seen in the first overnight run: frames transmitted after
+ * the TxOk snapshot were misattributed as foreign; frames whose returns landed
+ * just after RX was muted became phantom loss (~1.6 per pause); and the wire
+ * was still busy when the probe started, failing 43% of probes on timeout.
+ *
+ * The backlog is bounded by the qdisc limit (fq_codel default 10240p ~ 1.26 s
+ * here), so a fixed delay is a guess. Instead poll until TxOk stops advancing:
+ * TX is already stopped, so once the hardware counter is static the queue has
+ * drained. Self-adapting and correct whatever the queue depth. */
+#define PAUSE_DRAIN_POLL_NS  (20ULL  * 1000000ULL)
+#define PAUSE_DRAIN_MAX_NS   (2000ULL * 1000000ULL)
+/* After the queue is empty, a moment for the last returns to land and be
+ * counted normally before RX is muted. */
+#define PAUSE_SETTLE_NS      (10ULL  * 1000000ULL)
+/* On resume, keep RX muted briefly so trailing probe replies are discarded
+ * rather than counted as length errors / foreign frames. TX must stay paused
+ * throughout — restarting it while RX is muted would discard our own returns
+ * and create exactly the loss this is fixing. */
+#define RESUME_SETTLE_NS     (200ULL * 1000000ULL)
+
+/* Block until the TX queue has drained. Caller must already have set
+ * g_tx_paused. Returns the number of frames that drained. */
+static uint64_t wait_tx_drained(const char *iface) {
+    uint64_t prev = read_nic_tx_packets(iface);
+    uint64_t start = prev;
+    uint64_t deadline = now_ns() + PAUSE_DRAIN_MAX_NS;
+    for (;;) {
+        sleep_ns(PAUSE_DRAIN_POLL_NS);
+        uint64_t cur = read_nic_tx_packets(iface);
+        if (cur == prev) break;              /* counter static: queue empty */
+        prev = cur;
+        if (now_ns() >= deadline) {
+            fprintf(stderr, "[pause] WARNING: TX queue still draining after "
+                            "%llu ms\n",
+                    (unsigned long long)(PAUSE_DRAIN_MAX_NS / 1000000ULL));
+            break;
+        }
+    }
+    return prev - start;
+}
 
 /* ── Main ───────────────────────────────────────────────────────────────── */
 int main(int argc, char *argv[]) {
@@ -333,8 +375,12 @@ int main(int argc, char *argv[]) {
         if (!paused && atomic_exchange_explicit(&g_pause_req, 0,
                                                 memory_order_relaxed)) {
             atomic_store_explicit(&g_tx_paused, 1, memory_order_relaxed);
+            uint64_t drained = wait_tx_drained(iface);   /* qdisc backlog out */
             sleep_ns(PAUSE_SETTLE_NS);        /* let in-flight returns land */
             atomic_store_explicit(&g_rx_discard, 1, memory_order_relaxed);
+            if (drained)
+                fprintf(stderr, "[pause] %lu queued frame(s) drained before "
+                                "snapshot\n", drained);
             /* Read the RAW hardware counter, not the 20 ms sample, so the
              * foreign-frame subtraction is exact. */
             pause_txok_raw = read_nic_tx_packets(iface);
@@ -349,6 +395,11 @@ int main(int argc, char *argv[]) {
                                          memory_order_relaxed) || forced) {
                 /* We transmitted nothing while paused, so every frame the NIC
                  * put on the wire in this window belongs to someone else. */
+                /* Hold RX muted a moment longer so trailing probe replies are
+                 * discarded, THEN read TxOk, THEN unmute RX, and only then
+                 * restart TX. Restarting TX before RX is unmuted would throw
+                 * away our own returns. */
+                sleep_ns(RESUME_SETTLE_NS);
                 uint64_t f = read_nic_tx_packets(iface) - pause_txok_raw;
                 atomic_fetch_add_explicit(&g_foreign_txok, f,
                                           memory_order_relaxed);
