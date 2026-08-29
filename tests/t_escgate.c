@@ -40,13 +40,16 @@ int main(void){
     int slaves=2;
     memset((void*)&g_stats,0,sizeof(g_stats));
     int len=build_frame(buf,MAX_FRAME,src,slaves,7,0);
-    /* datagrams: 0=NOP 1=BRD 2=crcAPRD(s0) 3=crcAPRD(s1) 4=llAPRD(s0) 5=llAPRD(s1) */
-    int crc_s0=walk_to_dg(buf,len,2), ll_s0=walk_to_dg(buf,len,4);
-    if(crc_s0<0||ll_s0<0){printf("FAIL: walk\n");return 1;}
+    /* datagrams: 0=NOP 1=BRD 2=diagAPRD(s0) 3=diagAPRD(s1).
+     * The per-port CRC counters and the lost-link counters used to live in two
+     * separate datagrams; they are now one ESC_DIAG_LEN block per slave, so
+     * both offsets are inside the SAME datagram: 0x0300 at +0, 0x0310 at +16. */
+    int crc_s0=walk_to_dg(buf,len,2);
+    if(crc_s0<0){printf("FAIL: walk\n");return 1;}
+    int ll_s0 = crc_s0 + 16;                 /* 0x0310 within the same block */
     /* BRD wkc = 2 (matches slaves) so no mismatch noise */
     set_wkc(buf,len,1,2);
     set_wkc(buf,len,2,1); set_wkc(buf,len,3,1);
-    set_wkc(buf,len,4,1); set_wkc(buf,len,5,1);
 
     /* Step 1: good frame, s0 port1 crc=5 (reg 0x0302 = byte offset 2), s0 port1 lost=3 (0x0311 = byte 1) */
     buf[crc_s0+2]=5; buf[ll_s0+1]=3;

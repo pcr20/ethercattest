@@ -55,9 +55,12 @@ int build_frame(uint8_t *buf, int buflen,
      * counters; lost-link 0x0310+ is NOT in this read). A mismatch makes
      * nop_payload too large and the APRD loop writes past buflen — this exact
      * mismatch (budget 8 vs writer 16) caused a stack overflow. */
-    int aprd_bytes   = loopback ? 0 : (num_slaves * (ECAT_DG_OVERHEAD + 16));
-    /* Second APRD set (Option C): lost-link counters 0x0310-0x0313, 4 bytes. */
-    int aprd2_bytes  = loopback ? 0 : (num_slaves * (ECAT_DG_OVERHEAD + 4));
+    /* ONE APRD per slave covering 0x0300-0x0327 (ESC_DIAG_LEN). This replaced
+     * the previous two-datagram scheme (16 B at 0x0300 + 4 B at 0x0310) and
+     * must stay in step with the writer below — a budget/writer mismatch of
+     * exactly this kind caused the stack overflow described in README §4.2. */
+    int aprd_bytes   = loopback ? 0 : (num_slaves * (ECAT_DG_OVERHEAD + ESC_DIAG_LEN));
+    int aprd2_bytes  = 0;
     int brd_bytes    = loopback ? 0 : (ECAT_DG_OVERHEAD + 1);
     int overhead     = ETH_HDR_LEN + ECAT_HDR_LEN + ECAT_DG_OVERHEAD
                        + brd_bytes + aprd_bytes + aprd2_bytes;
@@ -93,6 +96,9 @@ int build_frame(uint8_t *buf, int buflen,
                                     pl + PL_DATA_OFF, (size_t)rnd_len);
         memcpy(pl + PL_CRC_OFF, &crc, PL_CRC_LEN);
     }
+    atomic_store_explicit(&g_payload_crc_bytes,
+                          (uint64_t)(PL_SEQ_LEN + (nop_payload - PL_DATA_OFF)),
+                          memory_order_relaxed);
     pos += nop_payload;
     buf[pos++] = 0; buf[pos++] = 0;  /* WKC */
 
@@ -113,47 +119,21 @@ int build_frame(uint8_t *buf, int buflen,
          * Lost-link counters live at 0x0310-0x0313 and are NOT covered by
          * this read; they would need a second APRD set (see parse side). */
         for (int s = 0; s < num_slaves; s++) {
-            /* more=1 always: the lost-link APRD set follows. */
-            uint16_t aprd_lf = (uint16_t)(16 | 0x8000);
-            /* APRD address: upper 16 bits = auto-increment position (negated),
-             * lower 16 bits = register offset.
-             * Auto-increment: slave 0 sees address 0, slave 1 sees -1, etc.
-             * We encode as: addr[31:16] = (uint16_t)(-(s)), addr[15:0] = 0x0300 */
-            /* APRD address: auto-increment node (negated s), register 0x0300 */
+            int is_last = (s == num_slaves - 1);
+            uint16_t aprd_lf = (uint16_t)(ESC_DIAG_LEN | (is_last ? 0 : 0x8000));
+            /* Auto-increment addressing: we write ADP = -s, each slave
+             * increments it as the frame passes, so slave s sees 0. */
             uint16_t node_le = (uint16_t)(-(int16_t)s);
             buf[pos++] = ECAT_CMD_APRD;
-            buf[pos++] = (uint8_t)s;   /* idx = slave number for easy demux */
-            /* addr in little-endian: node_addr (16-bit LE), then reg (16-bit LE) */
+            buf[pos++] = (uint8_t)s;   /* idx = slave number, for demux */
             buf[pos++] = (node_le) & 0xFF;
             buf[pos++] = (node_le >> 8) & 0xFF;
-            buf[pos++] = 0x00;   /* reg 0x0300 low byte */
-            buf[pos++] = 0x03;   /* reg 0x0300 high byte */
+            buf[pos++] = ESC_DIAG_BASE & 0xFF;
+            buf[pos++] = (ESC_DIAG_BASE >> 8) & 0xFF;
             le16put(buf + pos, aprd_lf); pos += 2;   /* LE per ETG.1000.4 */
             buf[pos++] = 0; buf[pos++] = 0;  /* IRQ */
-            memset(buf + pos, 0, 16);  /* 16 bytes data (zeroed, slaves fill in) */
-            pos += 16;
-            buf[pos++] = 0; buf[pos++] = 0;  /* WKC */
-        }
-
-        /* Second APRD set (Option C): per-slave lost-link counters, registers
-         * 0x0310-0x0313 (four consecutive 8-bit counters, one per port; a port
-         * increments its counter each time its link goes down). This is the
-         * per-segment outage detector the host NIC cannot provide: a downstream
-         * segment can flap without the host carrier ever changing. */
-        for (int s = 0; s < num_slaves; s++) {
-            int is_last = (s == num_slaves - 1);
-            uint16_t aprd2_lf = (uint16_t)(4 | (is_last ? 0 : 0x8000));
-            uint16_t node_le = (uint16_t)(-(int16_t)s);
-            buf[pos++] = ECAT_CMD_APRD;
-            buf[pos++] = (uint8_t)(0x80 | s);   /* idx: lost-link set marker */
-            buf[pos++] = (node_le) & 0xFF;
-            buf[pos++] = (node_le >> 8) & 0xFF;
-            buf[pos++] = 0x10;   /* reg 0x0310 low byte */
-            buf[pos++] = 0x03;   /* reg 0x0310 high byte */
-            le16put(buf + pos, aprd2_lf); pos += 2;   /* LE */
-            buf[pos++] = 0; buf[pos++] = 0;  /* IRQ */
-            memset(buf + pos, 0, 4);   /* 4 bytes data */
-            pos += 4;
+            memset(buf + pos, 0, ESC_DIAG_LEN);      /* slaves fill this in */
+            pos += ESC_DIAG_LEN;
             buf[pos++] = 0; buf[pos++] = 0;  /* WKC */
         }
     }
@@ -279,78 +259,54 @@ uint64_t parse_return_frame(const uint8_t *buf, int len,
 
         uint16_t aprd_wkc = le16get(buf + pos + dg_len);   /* WKC is LE */
 
-        if (fcs_ok && aprd_wkc == 1 && dg_len >= 16) {
-            /* Bytes 0-7: CRC error registers 0x0300-0x0307
-             * Layout per ETG.1000.6:
-             *   0x0300: Port0 invalid frame counter
-             *   0x0301: Port0 RX error counter
-             *   0x0302: Port1 invalid frame counter
-             *   0x0303: Port1 RX error counter
-             *   0x0304: Port2 ...
-             *   0x0305: Port2 ...
-             *   0x0306: Port3 ...
-             *   0x0307: Port3 ...
-             * Bytes 8-15 cover 0x0308-0x030F (forwarded error counters etc.)
-             * Lost link at 0x0310-0x0313 NOT in this read (we'd need another APRD)
-             * For now we track the 4 invalid-frame counters */
+        /* Gated on FCS-valid frames with WKC==1 (README §3.7): a corrupt frame
+         * carries garbage in these byte positions and one garbage value would
+         * permanently poison the 8-bit delta accumulation. The registers are
+         * cumulative in the slave, so skipping corrupt frames loses nothing. */
+        if (fcs_ok && aprd_wkc == 1 && dg_len >= ESC_DIAG_LEN) {
+            const uint8_t *d = buf + pos;
             for (int p = 0; p < 4; p++) {
-                /* byte 2p   = 0x0300+2p invalid frame counter, port p
-                 * byte 2p+1 = 0x0301+2p RX error counter,      port p
-                 * byte 8+p  = 0x0308+p  forwarded RX error,    port p */
-                uint8_t cur = buf[pos + p * 2];
+                uint8_t cur = d[p * 2];              /* 0x0300+2p invalid    */
                 g_stats.esc_crc[s][p] += (uint8_t)(cur - g_stats.esc_crc_prev[s][p]);
                 g_stats.esc_crc_prev[s][p] = cur;
                 g_stats.esc_raw_crc[s][p]  = cur;
 
-                uint8_t rx = buf[pos + p * 2 + 1];
+                uint8_t rx = d[p * 2 + 1];           /* 0x0301+2p RX error   */
                 g_stats.esc_rxerr[s][p] += (uint8_t)(rx - g_stats.esc_rxerr_prev[s][p]);
                 g_stats.esc_rxerr_prev[s][p] = rx;
                 g_stats.esc_raw_rxerr[s][p]  = rx;
 
-                uint8_t fw = buf[pos + 8 + p];
+                uint8_t fw = d[8 + p];               /* 0x0308+p forwarded   */
                 g_stats.esc_fwderr[s][p] += (uint8_t)(fw - g_stats.esc_fwderr_prev[s][p]);
                 g_stats.esc_fwderr_prev[s][p] = fw;
                 g_stats.esc_raw_fwderr[s][p]  = fw;
+
+                uint8_t ll = d[16 + p];              /* 0x0310+p lost link   */
+                g_stats.esc_lostlnk[s][p] += (uint8_t)(ll - g_stats.esc_lostlnk_prev[s][p]);
+                g_stats.esc_lostlnk_prev[s][p] = ll;
+
+                uint8_t ex = d[20 + p];              /* 0x0314+p extended RX */
+                g_stats.esc_extrx[s][p] += (uint8_t)(ex - g_stats.esc_extrx_prev[s][p]);
+                g_stats.esc_extrx_prev[s][p] = ex;
+                g_stats.esc_raw_extrx[s][p]  = ex;
+
+                /* 0x0320+2p RX error code — a latched REASON, not a counter. */
+                uint16_t code = le16get(d + 32 + p * 2);
+                if (code) {
+                    if (g_stats.esc_rxcode[s][p] != code)
+                        g_stats.esc_rxcode_seen[s][p]++;
+                    g_stats.esc_rxcode[s][p] = code;
+                }
             }
-            /* 0x030C ECAT processing unit error counter — counts errors of
-             * frames passing the processing unit. 0x030D PDI0 error counter. */
-            {
-                uint8_t pu = buf[pos + 12];
-                g_stats.esc_puerr[s] += (uint8_t)(pu - g_stats.esc_puerr_prev[s]);
-                g_stats.esc_puerr_prev[s] = pu;
-                g_stats.esc_raw_puerr[s]  = pu;
+            uint8_t pu = d[12];                      /* 0x030C proc unit     */
+            g_stats.esc_puerr[s] += (uint8_t)(pu - g_stats.esc_puerr_prev[s]);
+            g_stats.esc_puerr_prev[s] = pu;
+            g_stats.esc_raw_puerr[s]  = pu;
 
-                uint8_t pd = buf[pos + 13];
-                g_stats.esc_pdierr[s] += (uint8_t)(pd - g_stats.esc_pdierr_prev[s]);
-                g_stats.esc_pdierr_prev[s] = pd;
-                g_stats.esc_raw_pdierr[s]  = pd;
-            }
-        }
-
-        pos += dg_len + ECAT_DG_WKC_LEN;
-    }
-
-    /* Second APRD set (Option C): per-slave lost-link counters 0x0310-0x0313.
-     * Four consecutive 8-bit counters, one per port; each increments when that
-     * port's link goes down. Same gating as the CRC set: only trust data from
-     * FCS-valid frames with WKC==1. Counters are cumulative in the slave, so
-     * skipped (corrupt) frames lose nothing. */
-    for (int s = 0; s < num_slaves && s < MAX_SLAVES; s++) {
-        if (pos + ECAT_DG_HDR_LEN > len) break;
-        lf = le16get(buf + pos + 6);   /* LE */
-        dg_len = lf & 0x07FF;
-        pos += ECAT_DG_HDR_LEN;
-        if (pos + dg_len + ECAT_DG_WKC_LEN > len) break;
-
-        uint16_t ll_wkc = le16get(buf + pos + dg_len);   /* WKC is LE */
-        if (fcs_ok && ll_wkc == 1 && dg_len >= 4) {
-            for (int p = 0; p < 4; p++) {
-                uint8_t cur  = buf[pos + p];   /* lost-link counter, port p */
-                uint8_t prev = g_stats.esc_lostlnk_prev[s][p];
-                uint8_t delta = (uint8_t)(cur - prev);  /* 8-bit wrap */
-                g_stats.esc_lostlnk[s][p] += delta;
-                g_stats.esc_lostlnk_prev[s][p] = cur;
-            }
+            uint8_t pd = d[13];                      /* 0x030D PDI0 error    */
+            g_stats.esc_pdierr[s] += (uint8_t)(pd - g_stats.esc_pdierr_prev[s]);
+            g_stats.esc_pdierr_prev[s] = pd;
+            g_stats.esc_raw_pdierr[s]  = pd;
         }
 
         pos += dg_len + ECAT_DG_WKC_LEN;

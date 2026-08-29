@@ -45,6 +45,19 @@ typedef struct {
     uint8_t  esc_raw_fwderr[MAX_SLAVES][4];
     uint8_t  esc_raw_puerr[MAX_SLAVES];
     uint8_t  esc_raw_pdierr[MAX_SLAVES];
+    /* 0x0314-0x0317 extended RX error: counts even when the port is CLOSED,
+     * unlike 0x0300-0x030B which only count while the loop is open. */
+    uint64_t esc_extrx[MAX_SLAVES][4];
+    uint8_t  esc_extrx_prev[MAX_SLAVES][4];
+    uint8_t  esc_raw_extrx[MAX_SLAVES][4];
+    /* 0x0320-0x0327 RX ERROR CODE, 2 bytes per port. Not a counter: it names
+     * the REASON for the first event that took the extended counter to 1
+     * (ESC Sec II v3.3 §2.9.7). Latched value, so we keep the last non-zero
+     * one seen per port. This is the register that can say "IFG too short"
+     * (0x58), "FIFO overrun/underrun" (0x50/0x51) or "RX_CLK too fast/slow"
+     * (0x20/0x21) instead of merely "a port errored". */
+    uint16_t esc_rxcode[MAX_SLAVES][4];
+    uint64_t esc_rxcode_seen[MAX_SLAVES][4];
     uint32_t brd_wkc_expected;   /* = num_slaves */
     /* Cross-thread counters — atomic. Owner in comment. */
     _Atomic uint64_t frames_enqueued;  /* TX thread — send() accepted (ring)   */
@@ -233,6 +246,11 @@ extern _Atomic uint64_t g_rx_foreign;   /* non-NOP frames seen while counting */
  * symbols are excluded: an error there cannot produce a CRC count). 0 until
  * the first frame is built. */
 extern _Atomic uint64_t g_wire_bits_per_frame;
+/* Bytes actually covered by the payload CRC32C. Depends on slave count: more
+ * slaves means more datagrams and a smaller NOP payload, so the payload
+ * detector covers less of the frame (94% at 1 slave, ~70% at 8). Published by
+ * build_frame so the panel reports the real figure instead of a stale one. */
+extern _Atomic uint64_t g_payload_crc_bytes;
 
 /* Rx frame length check: every TX frame in a run has the SAME size (published
  * in g_wire_bits_per_frame as (frame_len + FCS) * 8), so every return must

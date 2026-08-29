@@ -38,7 +38,10 @@ static void verify(int slaves,int lb){
         if(!more) break;
     }
     CHECK(pos==len,"s=%d lb=%d datagram walk ends at %d, frame len %d (ESC would cut here)",slaves,lb,pos,len);
-    int expect_ndg = lb? 1 : (slaves? 1+1+2*slaves : 1);
+    /* NOP + BRD + ONE diagnostic APRD per slave. This was 2*slaves when the
+     * ESC block was read as two datagrams (16 B at 0x0300 + 4 B at 0x0310);
+     * it is now a single ESC_DIAG_LEN read covering 0x0300-0x0327. */
+    int expect_ndg = lb? 1 : (slaves? 1+1+slaves : 1);
     CHECK(ndg==expect_ndg,"s=%d lb=%d datagrams walked=%d expect %d",slaves,lb,ndg,expect_ndg);
     CHECK(last_more==0,"s=%d lb=%d last datagram has more=1 (chain never terminates)",slaves,lb);
     if(!fails) printf("PASS: s=%d lb=%d — hdr LE type=1 len=%u, %d datagrams walk to exactly frame end\n",slaves,lb,elen,ndg);

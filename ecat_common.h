@@ -119,6 +119,20 @@ static inline uint16_t le16get(const uint8_t *p) {
 #define ECAT_HDR_LEN         2
 #define ECAT_DG_HDR_LEN      10   /* cmd(1)+idx(1)+addr(4)+len(2)+irq(2) */
 #define ECAT_DG_WKC_LEN      2
+/* One contiguous ESC diagnostic block per slave: 0x0300-0x0327.
+ *   [ 0.. 7] 0x0300-0x0307 invalid-frame + RX error, 2 bytes per port
+ *   [ 8..11] 0x0308-0x030B forwarded RX error, 1 per port
+ *   [12]     0x030C ECAT processing unit error
+ *   [13]     0x030D PDI0 error counter
+ *   [14..15] 0x030E-0x030F PDI0 error code
+ *   [16..19] 0x0310-0x0313 lost link, 1 per port
+ *   [20..23] 0x0314-0x0317 extended RX error, 1 per port
+ *   [24..31] 0x0318-0x031F unassigned gap (read, ignored)
+ *   [32..39] 0x0320-0x0327 RX ERROR CODE, 2 bytes per port
+ * Reading it as ONE datagram costs less than the two it replaces and adds the
+ * extended counter and the reason codes for free. */
+#define ESC_DIAG_BASE        0x0300
+#define ESC_DIAG_LEN         40
 #define ECAT_DG_OVERHEAD     (ECAT_DG_HDR_LEN + ECAT_DG_WKC_LEN)
 
 /* Poll ESC counters every this many frames */

@@ -7,6 +7,7 @@ RxAccount g_rx;
 _Atomic uint64_t g_txok = 0;
 _Atomic uint64_t g_txer = 0;
 _Atomic uint64_t g_qdisc_drop = 0;
+_Atomic uint64_t g_payload_crc_bytes = 0;
 _Atomic uint64_t g_rx_missed  = 0;
 _Atomic uint64_t g_rx_dropped = 0;
 _Atomic uint64_t g_rx_fifo    = 0;
@@ -53,6 +54,40 @@ void badfcs_drain(int *budget, uint64_t *suppressed) {
         t++;
     }
     atomic_store_explicit(&g_bfe_tail, t, memory_order_release);
+}
+
+/* RX error code values, Beckhoff ESC Section II Register Description v3.3,
+ * table accompanying §2.9.7. These name WHY a port errored — the difference
+ * between "a link dropped" and "the inter-frame gap was too short". */
+const char *esc_rx_error_code_name(uint16_t c) {
+    switch (c & 0xFF) {
+    case 0x20: return "RX_CLK too fast";
+    case 0x21: return "RX_CLK too slow";
+    case 0x22: return "RX_CLK other error";
+    case 0x23: return "TX_CLK too fast";
+    case 0x24: return "TX_CLK too slow";
+    case 0x25: return "TX_CLK other error";
+    case 0x28: return "enhanced link detection prevents link";
+    case 0x29: return "MI link detection prevents link";
+    case 0x2A: return "unsupported link speed or half duplex";
+    case 0x30: return "false carrier";
+    case 0x31: return "false carrier extend (RGMII)";
+    case 0x32: return "bad SSD";
+    case 0x40: return "RX_ER in frame";
+    case 0x50: return "FIFO OVERRUN";
+    case 0x51: return "FIFO UNDERRUN";
+    case 0x52: return "FIFO other error";
+    case 0x58: return "FRAME DROPPED (inter-frame gap too short)";
+    case 0x60: return "checksum error";
+    case 0x61: return "forwarded error (checksum, closed port)";
+    case 0x62: return "frame without SFD";
+    case 0x63: return "frame too long (>2 KB)";
+    case 0x70: return "frame shorter than expected";
+    case 0x71: return "frame longer than expected";
+    case 0x72: return "circulating frame";
+    case 0x77: return "other EtherCAT processing unit error";
+    default:   return "unknown code";
+    }
 }
 
 /* ── Print stats ────────────────────────────────────────────────────────── */
@@ -230,9 +265,10 @@ void print_stats(FILE *csv, uint64_t elapsed_ns) {
          * (not the NIC's hardware CRC counter, which reads 0 under rx-all since
          * bad frames are delivered to us rather than dropped-and-counted):
          *   BER (FCS)     — whole-frame CRC (rx_bad_fcs_computed), ~100% coverage
-         *   BER (payload) — payload CRC32C, covers ~97.9% of the frame (all but
-         *                   the 32-byte Ethernet/EtherCAT/datagram headers, WKC,
-         *                   and the CRC field itself). For random bit errors the
+         *   BER (payload) — payload CRC32C, coverage DEPENDS ON SLAVE COUNT:
+         *                   more slaves means more datagrams and a smaller NOP
+         *                   payload, so the detector covers less of the frame.
+         *                   Reported below from the measured value. For random bit errors the
          *                   two should track within ~2%; a payload count much
          *                   below the FCS count means errors are concentrated in
          *                   the frame headers (front-of-frame link disruption),
@@ -240,8 +276,12 @@ void print_stats(FILE *csv, uint64_t elapsed_ns) {
         uint64_t bfc = atomic_load_explicit(&g_stats.rx_bad_fcs_computed, memory_order_relaxed);
         printf("  BER (FCS) <=:   %.2e   ((%lu + 0.5) / N)  [whole frame]\n",
                ((double)bfc + 0.5) / (double)total_bits, bfc);
-        printf("  BER (payload)<=:%.2e   ((%lu + 0.5) / N)  [no valid payload CRC]\n",
-               ((double)plcrc + 0.5) / (double)total_bits, plcrc);
+        uint64_t plb = atomic_load_explicit(&g_payload_crc_bytes, memory_order_relaxed);
+        uint64_t fl  = bits_per_frame / 8;
+        printf("  BER (payload)<=:%.2e   ((%lu + 0.5) / N)  [no valid payload CRC,\n"
+               "                                     covers %lu of %lu B = %.1f%% of frame]\n",
+               ((double)plcrc + 0.5) / (double)total_bits, plcrc,
+               plb, fl, fl ? 100.0 * (double)plb / (double)fl : 0.0);
         printf("  Frame loss rate:%.2e  (lost / TxOk)\n",
                txok ? (double)lost / (double)txok : 0.0);
     }
@@ -264,6 +304,17 @@ void print_stats(FILE *csv, uint64_t elapsed_ns) {
                    g_stats.esc_fwderr[s][2], g_stats.esc_fwderr[s][3]);
             printf("  Slave %2d proc-unit err (0x030C): %lu   PDI err (0x030D): %lu\n",
                    s, g_stats.esc_puerr[s], g_stats.esc_pdierr[s]);
+            printf("  Slave %2d extRX: P0=%lu P1=%lu P2=%lu P3=%lu  "
+                   "(0x0314+y, counts even when port closed)\n", s,
+                   g_stats.esc_extrx[s][0], g_stats.esc_extrx[s][1],
+                   g_stats.esc_extrx[s][2], g_stats.esc_extrx[s][3]);
+            for (int p = 0; p < 4; p++)
+                if (g_stats.esc_rxcode[s][p])
+                    printf("  Slave %2d P%d RX ERROR CODE 0x%04X = %s  "
+                           "(seen %lu distinct)\n", s, p,
+                           g_stats.esc_rxcode[s][p],
+                           esc_rx_error_code_name(g_stats.esc_rxcode[s][p]),
+                           g_stats.esc_rxcode_seen[s][p]);
             /* All these counters STOP at 0xFF (ESC Sec II v3.3 §2.9). Once
              * saturated the delta reads zero forever, which looks identical to
              * "no errors" — so say so explicitly. */
@@ -280,6 +331,38 @@ void print_stats(FILE *csv, uint64_t elapsed_ns) {
                            "           *** stopped counting and the total above is a\n"
                            "           *** FLOOR. Clear with ecat_escreset. ***\n", s);
             }        }
+    }
+    /* Distribution of link drops across the chain. Spread roughly evenly ->
+     * simply more links, more opportunity. Concentrated toward the far end ->
+     * something cumulative. In a chain port 0 faces the master and port 1 the
+     * next slave, so the segment between slave N and N+1 shows up as slave N
+     * port 1 AND slave N+1 port 0 — two independent witnesses per segment. */
+    if (g_verbose && !g_loopback && g_num_slaves > 1) {
+        uint64_t tot = 0, worst = 0; int worst_s = -1, worst_p = -1;
+        for (int s = 0; s < g_num_slaves && s < MAX_SLAVES; s++)
+            for (int p = 0; p < 4; p++) {
+                uint64_t v = g_stats.esc_lostlnk[s][p];
+                tot += v;
+                if (v > worst) { worst = v; worst_s = s; worst_p = p; }
+            }
+        printf("  ── Link-drop distribution across the chain ───────────────\n");
+        if (!tot) {
+            printf("  No lost-link events on any slave or port.\n");
+        } else {
+            printf("  slave:  ");
+            for (int s = 0; s < g_num_slaves && s < MAX_SLAVES; s++)
+                printf("%5d", s);
+            printf("\n  drops:  ");
+            for (int s = 0; s < g_num_slaves && s < MAX_SLAVES; s++) {
+                uint64_t v = 0;
+                for (int p = 0; p < 4; p++) v += g_stats.esc_lostlnk[s][p];
+                printf("%5lu", v);
+            }
+            printf("\n  total %lu; worst slave %d port %d with %lu\n",
+                   tot, worst_s, worst_p, worst);
+            printf("  [segment N<->N+1 appears as slave N port 1 and slave "
+                   "N+1 port 0]\n");
+        }
     }
     printf("──────────────────────────────────────────────────────────\n");
 
@@ -313,7 +396,8 @@ void print_stats(FILE *csv, uint64_t elapsed_ns) {
                     : -1L);
         for (int s = 0; s < g_num_slaves && s < MAX_SLAVES; s++)
             fprintf(csv, ",%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu"
-                         ",%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu",
+                         ",%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu"
+                         ",%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu",
                     g_stats.esc_crc[s][0], g_stats.esc_crc[s][1],
                     g_stats.esc_crc[s][2], g_stats.esc_crc[s][3],
                     g_stats.esc_lostlnk[s][0], g_stats.esc_lostlnk[s][1],
@@ -322,7 +406,11 @@ void print_stats(FILE *csv, uint64_t elapsed_ns) {
                     g_stats.esc_rxerr[s][2], g_stats.esc_rxerr[s][3],
                     g_stats.esc_fwderr[s][0], g_stats.esc_fwderr[s][1],
                     g_stats.esc_fwderr[s][2], g_stats.esc_fwderr[s][3],
-                    g_stats.esc_puerr[s], g_stats.esc_pdierr[s]);
+                    g_stats.esc_puerr[s], g_stats.esc_pdierr[s],
+                    g_stats.esc_extrx[s][0], g_stats.esc_extrx[s][1],
+                    g_stats.esc_extrx[s][2], g_stats.esc_extrx[s][3],
+                    (uint64_t)g_stats.esc_rxcode[s][0], (uint64_t)g_stats.esc_rxcode[s][1],
+                    (uint64_t)g_stats.esc_rxcode[s][2], (uint64_t)g_stats.esc_rxcode[s][3]);
         fprintf(csv, "\n");
         fflush(csv);
     }
@@ -344,9 +432,12 @@ void write_csv_header(FILE *csv, int num_slaves) {
                      ",slave%d_p0_lost,slave%d_p1_lost,slave%d_p2_lost,slave%d_p3_lost"
                      ",slave%d_p0_rxerr,slave%d_p1_rxerr,slave%d_p2_rxerr,slave%d_p3_rxerr"
                      ",slave%d_p0_fwderr,slave%d_p1_fwderr,slave%d_p2_fwderr,slave%d_p3_fwderr"
-                     ",slave%d_puerr,slave%d_pdierr",
+                     ",slave%d_puerr,slave%d_pdierr"
+                     ",slave%d_p0_extrx,slave%d_p1_extrx,slave%d_p2_extrx,slave%d_p3_extrx"
+                     ",slave%d_p0_rxcode,slave%d_p1_rxcode,slave%d_p2_rxcode,slave%d_p3_rxcode",
                 s, s, s, s, s, s, s, s,
-                s, s, s, s, s, s, s, s, s, s);
+                s, s, s, s, s, s, s, s, s, s,
+                s, s, s, s, s, s, s, s);
     fprintf(csv, "\n");
     fflush(csv);
 }

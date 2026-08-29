@@ -18,7 +18,7 @@
 set -u
 
 IFACE=${IFACE:-enp2s0}
-SLAVES=${SLAVES:-1}
+SLAVES=${SLAVES:-8}
 INTERVAL=${1:-60}
 TAG=${2:-soak_$(date +%Y%m%d_%H%M%S)}
 OUT=$TAG; mkdir -p "$OUT"
@@ -39,13 +39,45 @@ trap cleanup INT TERM EXIT
 
 echo "[soak] interface=$IFACE slaves=$SLAVES interval=${INTERVAL}s out=$OUT/"
 
-# Baseline BEFORE any traffic: full register state, and plant the canary.
+# Wait for a quiet wire. In the first overnight run the baseline regdump ran
+# while a previous instance was still shutting down and ALL 30 reads failed.
+echo "[soak] waiting for a quiet wire..."
+for _ in $(seq 1 30); do
+    pgrep -x ecat_ber >/dev/null 2>&1 || break
+    sleep 1
+done
+sleep 2
+
+# Baseline BEFORE any traffic: per-position identity and register state for
+# EVERY slave. With a mixed chain (EVS-XCR-E + unknown silicon) the log must
+# record what was present and in what order, since register semantics beyond
+# the ETG-standard set cannot be assumed for unknown ESCs.
+for p in $(seq 0 $((SLAVES-1))); do
+    ./ecat_regdump -i "$IFACE" -p "$p" > "$OUT/regdump_start_pos${p}.txt" 2>&1
+    TYPE=$(awk '/0x0000 Type/{print $3}' "$OUT/regdump_start_pos${p}.txt")
+    PORTS=$(awk '/0x0007 Port descriptor/{print $4}' "$OUT/regdump_start_pos${p}.txt")
+    echo "[soak]   position $p: ESC type=0x${TYPE:-??} portdesc=0x${PORTS:-??}"
+done
 ./ecat_regdump -i "$IFACE"                    > "$OUT/regdump_start.txt" 2>&1
-./ecat_phy -i "$IFACE" --ext --allow-phy-write \
-           --csv "$OUT/phy_start.csv"         > "$OUT/phy_start.txt"     2>&1
-./ecat_phy -i "$IFACE" --canary-write --allow-phy-write \
-                                              > "$OUT/canary_write.txt"  2>&1
-echo "[soak] baseline captured, canary planted"
+# PHY baseline and canary, per position. Only slaves whose ESC implements MII
+# management can be probed; the rest are recorded as such and skipped rather
+# than being decoded against the TI register map, which would report confident
+# nonsense for another vendor's PHY.
+MII_POS=""
+for p in $(seq 0 $((SLAVES-1))); do
+    if ./ecat_phy -i "$IFACE" -p "$p" --ext --allow-phy-write \
+                  --csv "$OUT/phy_start_pos${p}.csv" \
+                  > "$OUT/phy_start_pos${p}.txt" 2>&1; then
+        MII_POS="$MII_POS $p"
+        ./ecat_phy -i "$IFACE" -p "$p" --canary-write --allow-phy-write \
+                   > "$OUT/canary_write_pos${p}.txt" 2>&1
+        echo "[soak]   position $p: MII present, canary planted"
+    else
+        echo "[soak]   position $p: no MII management — PHY probing skipped"
+    fi
+done
+echo "$MII_POS" > "$OUT/mii_positions.txt"
+echo "[soak] baseline captured; MII positions:${MII_POS:- none}"
 
 ./ecat_ber -i "$IFACE" -s "$SLAVES" -v -o "$OUT/ber.csv" \
            > "$OUT/ber.log" 2>&1 &
@@ -69,8 +101,10 @@ while kill -0 "$BER_PID" 2>/dev/null; do
     sleep 1.0
     # Direct registers only: no --ext, so the probe does NOT write the PHY.
     # The canary check is read-only too.
-    ./ecat_phy -i "$IFACE" -d --csv "$OUT/phy_${TS}.csv" --canary-check \
-               > "$OUT/phy_${TS}.txt" 2>&1
+    for p in $MII_POS; do
+        ./ecat_phy -i "$IFACE" -p "$p" -d --csv "$OUT/phy_${TS}_pos${p}.csv" \
+                   --canary-check >> "$OUT/phy_${TS}.txt" 2>&1
+    done
     kill -USR2 "$BER_PID"
 
     if grep -qE "GONE|SATURATED|WRITE FAILED|READ FAILED" "$OUT/phy_${TS}.txt"; then
@@ -80,4 +114,7 @@ while kill -0 "$BER_PID" 2>/dev/null; do
 done
 
 echo "[soak] ecat_ber exited; final register state"
+for p in $(seq 0 $((SLAVES-1))); do
+    ./ecat_regdump -i "$IFACE" -p "$p" > "$OUT/regdump_end_pos${p}.txt" 2>&1
+done
 ./ecat_regdump -i "$IFACE" > "$OUT/regdump_end.txt" 2>&1
