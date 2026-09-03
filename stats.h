@@ -58,6 +58,23 @@ typedef struct {
      * (0x20/0x21) instead of merely "a port errored". */
     uint16_t esc_rxcode[MAX_SLAVES][4];
     uint64_t esc_rxcode_seen[MAX_SLAVES][4];
+    /* BASELINE ON FIRST READ. These counters are cumulative IN THE SLAVE and
+     * survive across sessions, so accumulating from prev=0 imported whatever
+     * the slave had collected since power-on and reported it as if this run
+     * had found it. On a 7-slave chain that showed 82 RX errors on one port
+     * and 125 on another for a run that was in fact completely clean.
+     * The first FCS-valid WKC==1 read per slave now SETS the baseline instead
+     * of accumulating. The pre-existing values are kept and reported
+     * separately, so the history is visible but never counted as this run's. */
+    uint8_t  esc_baselined[MAX_SLAVES];
+    uint8_t  esc_base_crc[MAX_SLAVES][4];
+    uint8_t  esc_base_rxerr[MAX_SLAVES][4];
+    uint8_t  esc_base_fwderr[MAX_SLAVES][4];
+    uint8_t  esc_base_lost[MAX_SLAVES][4];
+    uint8_t  esc_base_extrx[MAX_SLAVES][4];
+    uint8_t  esc_base_puerr[MAX_SLAVES];
+    uint8_t  esc_base_pdierr[MAX_SLAVES];
+    uint16_t esc_base_rxcode[MAX_SLAVES][4];
     uint32_t brd_wkc_expected;   /* = num_slaves */
     /* Cross-thread counters — atomic. Owner in comment. */
     _Atomic uint64_t frames_enqueued;  /* TX thread — send() accepted (ring)   */

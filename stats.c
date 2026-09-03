@@ -172,7 +172,12 @@ void print_stats(FILE *csv, uint64_t elapsed_ns) {
                            "  *** Another master is on the wire outside the pause\n"
                            "  *** windows; this run is not isolated. ***\n", rf);
         }
-    }    if (g_stats.qdisc_real_ok) {
+    }    if (g_stats.qdisc_real_ok && g_stats.qdisc_real_end == 0) {
+        /* Read at session start and exit only (it forks; §4.4). While the run
+         * is in progress there is no end value yet — say so rather than print
+         * a 0 that looks like a measurement. */
+        printf("  qdisc drops (root qdisc, real): pending (measured at exit)\n");
+    } else if (g_stats.qdisc_real_ok) {
         uint64_t qreal = (g_stats.qdisc_real_end >= g_stats.qdisc_real_start)
                        ? g_stats.qdisc_real_end - g_stats.qdisc_real_start : 0;
         printf("  qdisc drops (root qdisc, real): %lu  (excluded — never on wire)\n",
@@ -304,6 +309,40 @@ void print_stats(FILE *csv, uint64_t elapsed_ns) {
                    g_stats.esc_fwderr[s][2], g_stats.esc_fwderr[s][3]);
             printf("  Slave %2d proc-unit err (0x030C): %lu   PDI err (0x030D): %lu\n",
                    s, g_stats.esc_puerr[s], g_stats.esc_pdierr[s]);
+            {   /* Pre-existing values, recorded at the first read and NOT
+                 * counted above. Cumulative in the slave since power-on. */
+                int any = 0;
+                for (int p = 0; p < 4; p++)
+                    if (g_stats.esc_base_crc[s][p] || g_stats.esc_base_rxerr[s][p] ||
+                        g_stats.esc_base_fwderr[s][p] || g_stats.esc_base_lost[s][p] ||
+                        g_stats.esc_base_extrx[s][p] || g_stats.esc_base_rxcode[s][p])
+                        any = 1;
+                if (g_stats.esc_base_puerr[s] || g_stats.esc_base_pdierr[s]) any = 1;
+                if (any) {
+                    printf("  Slave %2d PRE-EXISTING at session start (power-on "
+                           "history, NOT counted above):\n", s);
+                    printf("           inval=%u/%u/%u/%u rxerr=%u/%u/%u/%u "
+                           "fwderr=%u/%u/%u/%u\n",
+                           g_stats.esc_base_crc[s][0], g_stats.esc_base_crc[s][1],
+                           g_stats.esc_base_crc[s][2], g_stats.esc_base_crc[s][3],
+                           g_stats.esc_base_rxerr[s][0], g_stats.esc_base_rxerr[s][1],
+                           g_stats.esc_base_rxerr[s][2], g_stats.esc_base_rxerr[s][3],
+                           g_stats.esc_base_fwderr[s][0], g_stats.esc_base_fwderr[s][1],
+                           g_stats.esc_base_fwderr[s][2], g_stats.esc_base_fwderr[s][3]);
+                    printf("           lost=%u/%u/%u/%u extRX=%u/%u/%u/%u "
+                           "0x030C=%u 0x030D=%u\n",
+                           g_stats.esc_base_lost[s][0], g_stats.esc_base_lost[s][1],
+                           g_stats.esc_base_lost[s][2], g_stats.esc_base_lost[s][3],
+                           g_stats.esc_base_extrx[s][0], g_stats.esc_base_extrx[s][1],
+                           g_stats.esc_base_extrx[s][2], g_stats.esc_base_extrx[s][3],
+                           g_stats.esc_base_puerr[s], g_stats.esc_base_pdierr[s]);
+                    for (int p = 0; p < 4; p++)
+                        if (g_stats.esc_base_rxcode[s][p])
+                            printf("           P%d pre-existing RX error code "
+                                   "0x%04X = %s\n", p, g_stats.esc_base_rxcode[s][p],
+                                   esc_rx_error_code_name(g_stats.esc_base_rxcode[s][p]));
+                }
+            }
             printf("  Slave %2d extRX: P0=%lu P1=%lu P2=%lu P3=%lu  "
                    "(0x0314+y, counts even when port closed)\n", s,
                    g_stats.esc_extrx[s][0], g_stats.esc_extrx[s][1],

@@ -51,6 +51,11 @@ int main(void){
     set_wkc(buf,len,1,2);
     set_wkc(buf,len,2,1); set_wkc(buf,len,3,1);
 
+    /* Step 0: the FIRST valid read baselines rather than accumulating (these
+     * registers are cumulative in the slave and persist across sessions), so
+     * establish a zero baseline before the steps below. */
+    parse_return_frame(buf,len,slaves,0,/*fcs_ok=*/1,NULL);
+
     /* Step 1: good frame, s0 port1 crc=5 (reg 0x0302 = byte offset 2), s0 port1 lost=3 (0x0311 = byte 1) */
     buf[crc_s0+2]=5; buf[ll_s0+1]=3;
     parse_return_frame(buf,len,slaves,0,/*fcs_ok=*/1,NULL);

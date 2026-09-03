@@ -265,6 +265,40 @@ uint64_t parse_return_frame(const uint8_t *buf, int len,
          * cumulative in the slave, so skipping corrupt frames loses nothing. */
         if (fcs_ok && aprd_wkc == 1 && dg_len >= ESC_DIAG_LEN) {
             const uint8_t *d = buf + pos;
+
+            /* First valid read of this slave: record what it already held and
+             * seed prev, WITHOUT accumulating. These registers are cumulative
+             * in the slave and persist across sessions, so accumulating from
+             * prev=0 would charge this run with power-on history. */
+            if (!g_stats.esc_baselined[s]) {
+                for (int p = 0; p < 4; p++) {
+                    g_stats.esc_base_crc[s][p]    = d[p * 2];
+                    g_stats.esc_base_rxerr[s][p]  = d[p * 2 + 1];
+                    g_stats.esc_base_fwderr[s][p] = d[8 + p];
+                    g_stats.esc_base_lost[s][p]   = d[16 + p];
+                    g_stats.esc_base_extrx[s][p]  = d[20 + p];
+                    g_stats.esc_base_rxcode[s][p] = le16get(d + 32 + p * 2);
+                    g_stats.esc_crc_prev[s][p]     = d[p * 2];
+                    g_stats.esc_rxerr_prev[s][p]   = d[p * 2 + 1];
+                    g_stats.esc_fwderr_prev[s][p]  = d[8 + p];
+                    g_stats.esc_lostlnk_prev[s][p] = d[16 + p];
+                    g_stats.esc_extrx_prev[s][p]   = d[20 + p];
+                    g_stats.esc_raw_crc[s][p]    = d[p * 2];
+                    g_stats.esc_raw_rxerr[s][p]  = d[p * 2 + 1];
+                    g_stats.esc_raw_fwderr[s][p] = d[8 + p];
+                    g_stats.esc_raw_extrx[s][p]  = d[20 + p];
+                }
+                g_stats.esc_base_puerr[s]  = d[12];
+                g_stats.esc_base_pdierr[s] = d[13];
+                g_stats.esc_puerr_prev[s]  = d[12];
+                g_stats.esc_pdierr_prev[s] = d[13];
+                g_stats.esc_raw_puerr[s]   = d[12];
+                g_stats.esc_raw_pdierr[s]  = d[13];
+                g_stats.esc_baselined[s]   = 1;
+                pos += dg_len + ECAT_DG_WKC_LEN;
+                continue;
+            }
+
             for (int p = 0; p < 4; p++) {
                 uint8_t cur = d[p * 2];              /* 0x0300+2p invalid    */
                 g_stats.esc_crc[s][p] += (uint8_t)(cur - g_stats.esc_crc_prev[s][p]);
@@ -292,7 +326,7 @@ uint64_t parse_return_frame(const uint8_t *buf, int len,
 
                 /* 0x0320+2p RX error code — a latched REASON, not a counter. */
                 uint16_t code = le16get(d + 32 + p * 2);
-                if (code) {
+                if (code && code != g_stats.esc_base_rxcode[s][p]) {
                     if (g_stats.esc_rxcode[s][p] != code)
                         g_stats.esc_rxcode_seen[s][p]++;
                     g_stats.esc_rxcode[s][p] = code;

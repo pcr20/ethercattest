@@ -78,8 +78,14 @@ int main(void)
         blk[13] = 14;                             /* 0x030D PDI0        */
         le16put(blk + 32 + 1*2, 0x0058);          /* 0x0322 port1 code  */
         uint8_t f[MAX_FRAME];
-        int len = mk(f, blk, 0, 1);
+        /* The first valid read now BASELINES rather than accumulating, so
+         * establish a zero baseline before presenting the values under test. */
+        uint8_t zero[ESC_DIAG_LEN];
+        memset(zero, 0, sizeof(zero));
+        int len = mk(f, zero, 0, 1);
         CHECK(len > 0, "could not build a synthetic APRD reply");
+        parse_return_frame(f, len, 1, 0, /*fcs_ok=*/1, NULL);
+        len = mk(f, blk, 1, 1);
         parse_return_frame(f, len, 1, 0, /*fcs_ok=*/1, NULL);
 
         CHECK(g_stats.esc_crc[0][0] == 1 && g_stats.esc_crc[0][3] == 7,
@@ -124,7 +130,11 @@ int main(void)
         memset(blk, 0, sizeof(blk));
         blk[0] = 0xFF; blk[12] = 0xFF;
         uint8_t f[MAX_FRAME];
-        int len = mk(f, blk, 0, 1);
+        uint8_t zero[ESC_DIAG_LEN];
+        memset(zero, 0, sizeof(zero));
+        int len = mk(f, zero, 0, 1);
+        parse_return_frame(f, len, 1, 0, /*fcs_ok=*/1, NULL);
+        len = mk(f, blk, 1, 1);
         parse_return_frame(f, len, 1, 0, /*fcs_ok=*/1, NULL);
         CHECK(g_stats.esc_raw_crc[0][0] == 0xFF,
               "raw value must be retained so saturation can be reported");
@@ -153,6 +163,62 @@ int main(void)
         if (fails == f0)
             printf("T4 PASS: new counters gated on FCS-valid frames, as §3.7 "
                    "requires for the existing ones\n");
+    }
+
+    /* ── T5: power-on history is baselined, not charged to this run ──────
+     * These counters are cumulative in the slave and survive across sessions.
+     * Accumulating from prev=0 imported that history: a 7-slave run that was
+     * completely clean reported 82 RX errors on one port and 125 on another,
+     * none of which happened during the run. */
+    {
+        int f0 = fails;
+        memset(&g_stats, 0, sizeof(g_stats));
+        g_num_slaves = 1;
+        uint8_t f[MAX_FRAME];
+
+        /* First read: the slave already holds history. */
+        uint8_t blk[ESC_DIAG_LEN];
+        memset(blk, 0, sizeof(blk));
+        blk[0] = 82;            /* 0x0300 port0 invalid  */
+        blk[1] = 125;           /* 0x0301 port0 rxerr    */
+        blk[16] = 2;            /* 0x0310 port0 lost     */
+        blk[12] = 7;            /* 0x030C proc unit      */
+        le16put(blk + 32, 0x0058);   /* pre-existing reason code */
+        int len = mk(f, blk, 0, 1);
+        parse_return_frame(f, len, 1, 0, 1, NULL);
+
+        CHECK(g_stats.esc_crc[0][0] == 0 && g_stats.esc_rxerr[0][0] == 0 &&
+              g_stats.esc_lostlnk[0][0] == 0 && g_stats.esc_puerr[0] == 0,
+              "first read must BASELINE, not accumulate: got inval=%lu rxerr=%lu "
+              "lost=%lu pu=%lu", g_stats.esc_crc[0][0], g_stats.esc_rxerr[0][0],
+              g_stats.esc_lostlnk[0][0], g_stats.esc_puerr[0]);
+        CHECK(g_stats.esc_base_rxerr[0][0] == 125 && g_stats.esc_base_crc[0][0] == 82,
+              "pre-existing values must be RETAINED for reporting: %u %u",
+              g_stats.esc_base_rxerr[0][0], g_stats.esc_base_crc[0][0]);
+        CHECK(g_stats.esc_base_rxcode[0][0] == 0x0058,
+              "pre-existing reason code must be retained as baseline");
+        CHECK(g_stats.esc_rxcode[0][0] == 0,
+              "a reason code already present at session start must not be "
+              "reported as a new event");
+
+        /* Second read: two more RX errors really do occur. */
+        blk[1] = 127;
+        len = mk(f, blk, 1, 1);
+        parse_return_frame(f, len, 1, 0, 1, NULL);
+        CHECK(g_stats.esc_rxerr[0][0] == 2,
+              "only the DELTA after baselining counts: got %lu, want 2",
+              g_stats.esc_rxerr[0][0]);
+
+        /* A genuinely new reason code must still be reported. */
+        le16put(blk + 32, 0x0050);
+        len = mk(f, blk, 2, 1);
+        parse_return_frame(f, len, 1, 0, 1, NULL);
+        CHECK(g_stats.esc_rxcode[0][0] == 0x0050,
+              "a NEW reason code must be reported: 0x%04X",
+              g_stats.esc_rxcode[0][0]);
+        if (fails == f0)
+            printf("T5 PASS: power-on history baselined and retained; only "
+                   "post-baseline deltas and new reason codes counted\n");
     }
 
     if (fails) { printf("\n%d ESC-CLEAR CHECK(S) FAILED\n", fails); return 1; }
