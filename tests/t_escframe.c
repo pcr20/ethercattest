@@ -161,7 +161,7 @@ int main(void)
          * tier tables — a register added there but not here would not be
          * covered by this read-only guarantee. */
         uint16_t addrs[] = {0x0000,0x0007,0x0110,0x0500,0x0510,0x0516,0x0517,
-                            0x0300,0x0308,0x030C,0x030D,0x0310,0x0314};
+                            0x0300,0x0308,0x030C,0x030D,0x0310};
         for (unsigned i = 0; i < sizeof(addrs)/sizeof(addrs[0]); i++) {
             EscRead r = { .addr = addrs[i], .len = 2 };
             int flen = esc_build_read_frame(buf, sizeof(buf), SRC, 0, 0, &r, 1);

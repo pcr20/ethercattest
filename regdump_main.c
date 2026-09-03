@@ -16,55 +16,47 @@
 static int g_json = 0;
 
 /* ── Register tier tables ───────────────────────────────────────────────── */
-/* optional=1: the register exists only on some ESC implementations. A WKC=0
- * on one of these means "this silicon does not implement it", which is a
- * finding, not a failure — an ESC does not process a datagram addressed
- * wholly to registers it lacks. */
-typedef struct { uint16_t addr; uint16_t len; const char *name; int optional; } RegDef;
+typedef struct { uint16_t addr; uint16_t len; const char *name; } RegDef;
 
 /* Tier 1 — identity. The Type byte at 0x0000 is what identifies the silicon. */
 static const RegDef tier1[] = {
-    { 0x0000, 1, "Type", 0 },
-    { 0x0001, 1, "Revision", 0 },
-    { 0x0002, 2, "Build", 0 },
-    { 0x0004, 1, "FMMUs supported", 0 },
-    { 0x0005, 1, "SyncManagers supported", 0 },
-    { 0x0006, 1, "RAM size (KB)", 0 },
-    { 0x0007, 1, "Port descriptor", 0 },
-    { 0x0008, 2, "ESC features supported", 0 },
+    { 0x0000, 1, "Type" },
+    { 0x0001, 1, "Revision" },
+    { 0x0002, 2, "Build" },
+    { 0x0004, 1, "FMMUs supported" },
+    { 0x0005, 1, "SyncManagers supported" },
+    { 0x0006, 1, "RAM size (KB)" },
+    { 0x0007, 1, "Port descriptor" },
+    { 0x0008, 2, "ESC features supported" },
 };
 /* Tier 2 — addressing, link state, and (the point of the exercise) the
  * SII/EEPROM and MII management ownership registers. */
 static const RegDef tier2[] = {
-    { 0x0010, 2, "Configured station address", 0 },
-    { 0x0012, 2, "Configured station alias", 0 },
-    { 0x0100, 4, "ESC DL control", 0 },
-    { 0x0110, 2, "ESC DL status", 0 },
-    { 0x0120, 2, "AL control", 0 },
-    { 0x0130, 2, "AL status", 0 },
-    { 0x0134, 2, "AL status code", 0 },
-    { 0x0500, 1, "EEPROM configuration (PDI/ECAT owner)", 0 },
-    { 0x0501, 1, "EEPROM PDI access state", 0 },
-    { 0x0502, 2, "EEPROM control/status", 0 },
-    { 0x0510, 2, "MII management control/status", 0 },
-    { 0x0512, 1, "MII PHY address", 0 },
-    { 0x0513, 1, "MII PHY register address", 0 },
-    { 0x0514, 2, "MII PHY data", 0 },
-    { 0x0516, 1, "MII ECAT access state", 0 },
-    { 0x0517, 1, "MII PDI access state", 0 },
+    { 0x0010, 2, "Configured station address" },
+    { 0x0012, 2, "Configured station alias" },
+    { 0x0100, 4, "ESC DL control" },
+    { 0x0110, 2, "ESC DL status" },
+    { 0x0120, 2, "AL control" },
+    { 0x0130, 2, "AL status" },
+    { 0x0134, 2, "AL status code" },
+    { 0x0500, 1, "EEPROM configuration (PDI/ECAT owner)" },
+    { 0x0501, 1, "EEPROM PDI access state" },
+    { 0x0502, 2, "EEPROM control/status" },
+    { 0x0510, 2, "MII management control/status" },
+    { 0x0512, 1, "MII PHY address" },
+    { 0x0513, 1, "MII PHY register address" },
+    { 0x0514, 2, "MII PHY data" },
+    { 0x0516, 1, "MII ECAT access state" },
+    { 0x0517, 1, "MII PDI access state" },
 };
 /* Tier 3 — per-port error counters (static snapshot of what the BER tool
  * polls dynamically, for direct comparison). */
 static const RegDef tier3[] = {
-    { 0x0300, 8, "RX error counters (ports 0-3: invalid frame + RX error)", 0 },
-    { 0x0308, 4, "Forwarded RX error counters (ports 0-3)", 0 },
-    { 0x030C, 1, "ECAT processing unit error counter", 0 },
-    { 0x030D, 1, "PDI error counter", 0 },
-    { 0x0310, 4, "Lost link counters (ports 0-3)", 0 },
-    /* Counts even when the port is CLOSED, unlike 0x0300-0x030B which only
-     * count while the loop is open — so this still records errors on a port
-     * that has already dropped. (ESC Sec II v3.3 §2.9.7.) */
-    { 0x0314, 4, "Extended RX error counters (ports 0-3)", 1 },
+    { 0x0300, 8, "RX error counters (ports 0-3: invalid frame + RX error)" },
+    { 0x0308, 4, "Forwarded RX error counters (ports 0-3)" },
+    { 0x030C, 1, "ECAT processing unit error counter" },
+    { 0x030D, 1, "PDI error counter" },
+    { 0x0310, 4, "Lost link counters (ports 0-3)" },
 };
 
 static uint64_t le_val(const uint8_t *d, int len) {
@@ -130,19 +122,7 @@ static int dump_tier(EscCtx *ctx, const char *title,
         printf("  0x%04X %-42s  ", defs[i].addr, defs[i].name);
         hexdump(r.data, r.len);
         printf("   (wkc=%u)\n", r.wkc);
-        if (r.wkc == 0 && defs[i].optional) {
-            /* Expected on most silicon. 0x0314-0x0317 and 0x0320-0x0327 are
-             * annotated "IP core V4.0.0" only in Beckhoff ESC Section II v3.3
-             * §2.9.7/§2.9.8 — the ESC20/ET1100/ET1150/ET1200 columns are
-             * blank. An ESC will not process a datagram addressed wholly to
-             * registers it does not implement, so WKC=0 IS the answer here.
-             * Not a failure, and the all-zero data means nothing: suppress the
-             * decode rather than print four reassuring zeros. */
-            printf("      NOT IMPLEMENTED on this ESC (WKC=0). These registers\n"
-                   "      exist only on EtherCAT IP core V4.0.0 and later; the\n"
-                   "      data above is meaningless, not a reading of zero.\n");
-            continue;
-        } else if (r.wkc == 0) {
+        if (r.wkc == 0) {
             /* WKC=0 means NO slave processed the datagram. On a loopback
              * interface our own frame reflects back unmodified and looks like
              * a "response" — treat it as the failure it is. */
@@ -171,10 +151,6 @@ static int dump_tier(EscCtx *ctx, const char *title,
         } else if (defs[i].addr == 0x0310) {
             for (int p = 0; p < 4; p++)
                 printf("      P%d lost-link=%u\n", p, r.data[p]);
-        } else if (defs[i].addr == 0x0314) {
-            for (int p = 0; p < 4; p++)
-                printf("      P%d extended-rx-error=%u%s\n", p, r.data[p],
-                       r.data[p] == 0xFF ? "  <- SATURATED" : "");
         }
     }
     return failures;
