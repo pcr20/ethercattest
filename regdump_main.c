@@ -12,6 +12,7 @@
  * alone — the raw value is authoritative. */
 #include "ecat_common.h"
 #include "escreg.h"
+#include "stats.h"   /* esc_rx_error_code_name() — decode only, no writes */
 
 static int g_json = 0;
 
@@ -57,6 +58,14 @@ static const RegDef tier3[] = {
     { 0x030C, 1, "ECAT processing unit error counter" },
     { 0x030D, 1, "PDI error counter" },
     { 0x0310, 4, "Lost link counters (ports 0-3)" },
+    /* Counts even when the port is CLOSED, unlike 0x0300-0x030B which only
+     * count while the loop is open — so this still records errors on a port
+     * that has already dropped. (ESC Sec II v3.3 §2.9.7.) */
+    { 0x0314, 4, "Extended RX error counters (ports 0-3)" },
+    /* THE reason register: names why the port errored, rather than only that
+     * it did. 2 bytes per port. Cleared by the same write that clears
+     * 0x0300-0x030B, so capture it BEFORE running ecat_escreset. */
+    { 0x0320, 8, "RX error code (ports 0-3, 2 bytes each)" },
 };
 
 static uint64_t le_val(const uint8_t *d, int len) {
@@ -151,6 +160,23 @@ static int dump_tier(EscCtx *ctx, const char *title,
         } else if (defs[i].addr == 0x0310) {
             for (int p = 0; p < 4; p++)
                 printf("      P%d lost-link=%u\n", p, r.data[p]);
+        } else if (defs[i].addr == 0x0314) {
+            for (int p = 0; p < 4; p++)
+                printf("      P%d extended-rx-error=%u%s\n", p, r.data[p],
+                       r.data[p] == 0xFF ? "  <- SATURATED" : "");
+        } else if (defs[i].addr == 0x0320) {
+            int any = 0;
+            for (int p = 0; p < 4; p++) {
+                uint16_t code = (uint16_t)le_val(r.data + p * 2, 2);
+                if (!code) { printf("      P%d no error code latched\n", p); continue; }
+                any = 1;
+                printf("      P%d code=0x%04X -> %s\n", p, code,
+                       esc_rx_error_code_name(code));
+            }
+            if (any)
+                printf("      [reason for the FIRST event that took the extended\n"
+                       "       counter to 1. CLEARED by a write to 0x0300 — record\n"
+                       "       it before running ecat_escreset.]\n");
         }
     }
     return failures;
