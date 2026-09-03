@@ -35,6 +35,35 @@ static void bits16(uint16_t v) {
                                     if (b % 4 == 0 && b) putchar(' '); }
 }
 
+/* ── PHY identity gate ──────────────────────────────────────────────────────
+ * Everything this tool decodes, and every register it writes, comes from
+ * SNLS505H — the DP83822 datasheet. On a MIXED chain some slaves carry other
+ * vendors' PHYs, where the same register numbers mean entirely different
+ * things. Decoding those against the TI map would report confident nonsense,
+ * and WRITING them (the canary targets 0x001B and MMD 0x1F 0x04A5, verified
+ * inert only on a DP83822) could hit a control register on unknown silicon.
+ *
+ * So: confirm the part from the standard clause-22 PHY Identifier before
+ * decoding or writing. SNLS505H Tables 8-3/8-4 give OUI 0x080028 and vendor
+ * model 0x24; revision is allowed to be anything. */
+#define DP83822_OUI    0x080028u
+#define DP83822_MODEL  0x24u
+
+static int phy_is_dp83822(EscCtx *ctx, int phy, uint32_t *oui_out,
+                          unsigned *model_out, unsigned *rev_out) {
+    uint16_t id1 = 0, id2 = 0;
+    if (mii_read_phy(ctx, (uint8_t)phy, 0x02, &id1, NULL) != 0) return -1;
+    if (mii_read_phy(ctx, (uint8_t)phy, 0x03, &id2, NULL) != 0) return -1;
+    uint32_t oui   = ((uint32_t)id1 << 6) | ((id2 >> 10) & 0x3F);
+    unsigned model = (id2 >> 4) & 0x3F;
+    unsigned rev   = id2 & 0xF;
+    if (oui_out) *oui_out = oui;
+    if (model_out) *model_out = model;
+    if (rev_out) *rev_out = rev;
+    if (id1 == 0xFFFF || (id1 == 0 && id2 == 0)) return 0;   /* nothing there */
+    return (oui == DP83822_OUI && model == DP83822_MODEL) ? 1 : 0;
+}
+
 /* ── Decoders. Every claim below cites SNLS505H Rev H section 8. ─────────── */
 static void d_bmcr(uint16_t v) {
     printf("        reset=%d loopback=%d speed=%s autoneg=%s pwrdn=%d isolate=%d "
@@ -221,6 +250,20 @@ static int sweep_phy(EscCtx *ctx, int phy, int do_ext) {
     memset(val, 0, sizeof(val)); memset(ok, 0, sizeof(ok));
 
     printf("══ PHY %d ═════════════════════════════════════════════════\n", phy);
+    uint32_t oui = 0; unsigned model = 0, rev = 0;
+    int known = phy_is_dp83822(ctx, phy, &oui, &model, &rev);
+    if (known == 1) {
+        printf("  identity: DP83822 confirmed (OUI=0x%06X model=0x%02X rev=0x%X)\n",
+               oui, model, rev);
+    } else if (known == 0) {
+        printf("  identity: OUI=0x%06X model=0x%02X rev=0x%X — NOT a DP83822.\n",
+               oui, model, rev);
+        printf("  *** Register VALUES below are raw and real, but the DECODES are\n"
+               "  *** suppressed: they come from SNLS505H and do not apply to this\n"
+               "  *** part. Consult that vendor's datasheet. ***\n");
+    } else {
+        printf("  identity: could not read the PHY ID — decodes suppressed\n");
+    }
     printf("  Acquisition order is NOT address order: PHYSTS (0x10) is read\n"
            "  first because its latch bits are cleared by reading BMSR, ANER,\n"
            "  MISR1, FCSCR, RECR and 10BTSCR (SNLS505H Table 8-16). Values are\n"
@@ -249,7 +292,7 @@ static int sweep_phy(EscCtx *ctx, int phy, int do_ext) {
         bits16(val[r]);
         printf("%s\n", phy_direct[r].perishable ? "  [RC]" : "");
         csv_row(phy, "direct", (unsigned)r, name, 1, val[r]);
-        decode_direct((uint8_t)r, val, ok);
+        if (known == 1) decode_direct((uint8_t)r, val, ok);
     }
 
     if (do_ext) {
@@ -319,6 +362,20 @@ static int canary_write(EscCtx *ctx, int phy) {
     uint16_t rb = 0;
     int rc = 0;
     printf("── Reset canary: writing PHY %d ─────────────────────────────\n", phy);
+    /* REFUSE on anything that is not a confirmed DP83822. The canary target
+     * registers are verified inert only for that part; on another vendor's
+     * PHY 0x001B is unknown vendor space and could be a control register. */
+    uint32_t oui = 0; unsigned model = 0, rev = 0;
+    int known = phy_is_dp83822(ctx, phy, &oui, &model, &rev);
+    if (known != 1) {
+        printf("  REFUSED: PHY %d is not a confirmed DP83822 "
+               "(OUI=0x%06X model=0x%02X rev=0x%X).\n", phy, oui, model, rev);
+        printf("  The canary registers are verified inert only on that part;\n"
+               "  writing them on unknown silicon is not safe. Skipped.\n");
+        return 2;
+    }
+    printf("  PHY %d confirmed DP83822 (OUI=0x%06X model=0x%02X rev=0x%X)\n",
+           phy, oui, model, rev);
     int r = mii_write_phy(ctx, (uint8_t)phy, CANARY_T1_REG, CANARY_T1_VAL, 1, &rb);
     if (r == 0) printf("  tier1 BICSR1 0x1B    <- 0x%04X  (read-back 0x%04X)\n",
                        CANARY_T1_VAL, rb);

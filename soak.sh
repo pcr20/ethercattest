@@ -14,13 +14,22 @@
 # A watchdog inside ecat_ber force-resumes after 30 s, so if this script dies
 # mid-probe the soak continues rather than stalling until morning.
 #
-# Run as root (raw sockets). Usage: sudo ./soak.sh [interval_s] [tag]
+# Run as root (raw sockets).
+#   sudo ./soak.sh <slaves> [interval_s] [tag]
+# e.g. a 7-slave chain probed every minute:
+#   sudo ./soak.sh 7 60 mixed_chain
+#
+# SLAVES is a positional argument, not an environment variable, because sudo
+# resets the environment — "sudo SLAVES=7 ./soak.sh" does not do what it looks
+# like it does. Getting it wrong is not harmless: ecat_ber compares the BRD
+# working counter against the slave count, so an incorrect value reports a
+# permanent WKC mismatch on every frame.
 set -u
 
 IFACE=${IFACE:-enp2s0}
-SLAVES=${SLAVES:-8}
-INTERVAL=${1:-60}
-TAG=${2:-soak_$(date +%Y%m%d_%H%M%S)}
+SLAVES=${1:?usage: sudo ./soak.sh <slaves> [interval_s] [tag]}
+INTERVAL=${2:-60}
+TAG=${3:-soak_$(date +%Y%m%d_%H%M%S)}
 OUT=$TAG; mkdir -p "$OUT"
 
 [ "$(id -u)" -eq 0 ] || { echo "must run as root"; exit 1; }
@@ -65,6 +74,9 @@ done
 # nonsense for another vendor's PHY.
 MII_POS=""
 for p in $(seq 0 $((SLAVES-1))); do
+    # --ext writes REGCR/ADDAR; only attempted where MII responds. The canary
+    # is a further step and ecat_phy itself refuses it unless the PHY is a
+    # confirmed DP83822, so unknown silicon is never written.
     if ./ecat_phy -i "$IFACE" -p "$p" --ext --allow-phy-write \
                   --csv "$OUT/phy_start_pos${p}.csv" \
                   > "$OUT/phy_start_pos${p}.txt" 2>&1; then
