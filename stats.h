@@ -327,5 +327,10 @@ void badfcs_drain(int *budget, uint64_t *suppressed);
 
 void print_stats(FILE *csv, uint64_t elapsed_ns);
 void write_csv_header(FILE *csv, int num_slaves);
+/* Decode an ESC RX error code (0x0320+2y) into a human-readable reason.
+ * Values per Beckhoff ESC Section II Register Description v3.3 §2.9.7 —
+ * these say WHY a port errored (IFG too short, FIFO over/underrun,
+ * RX_CLK/TX_CLK out of tolerance, ...). Defined in stats.c. */
+const char *esc_rx_error_code_name(uint16_t c);
 
 #endif /* ECAT_STATS_H */

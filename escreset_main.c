@@ -30,6 +30,7 @@
  * Reads before and after so the effect is demonstrated, not assumed. */
 #include "ecat_common.h"
 #include "escmii.h"          /* for esc_write()/esc_read* — ESC write path */
+#include "stats.h"           /* esc_rx_error_code_name()                   */
 
 typedef struct { uint16_t reg; const char *name; const char *clears; } ClearGroup;
 
@@ -43,22 +44,42 @@ static const ClearGroup groups[] = {
 #define NGROUPS ((int)(sizeof(groups)/sizeof(groups[0])))
 
 /* The full error-counter block, for before/after display. */
+/* The whole diagnostic block in one read: 0x0300-0x0327 (ESC_DIAG_LEN).
+ * Layout per Beckhoff ESC Section II Register Description v3.3 §2.9. */
 static void dump_counters(EscCtx *ctx, const char *tag) {
-    uint8_t b[20];
+    uint8_t b[ESC_DIAG_LEN];
     printf("  %s:\n", tag);
-    if (esc_read_range(ctx, 0x0300, 16, b) < 1) {
-        printf("    read of 0x0300-0x030F FAILED\n"); return; }
+    if (esc_read_range(ctx, ESC_DIAG_BASE, ESC_DIAG_LEN, b) < 1) {
+        printf("    read of 0x0300-0x0327 FAILED\n"); return; }
+
+    printf("    port  invalid  rxerr  fwderr  lost  extRX   RX error code\n");
+    for (int p = 0; p < 4; p++) {
+        uint8_t inval = b[p * 2], rxe = b[p * 2 + 1], fwd = b[8 + p];
+        uint8_t lost  = b[16 + p], ext = b[20 + p];
+        uint16_t code = (uint16_t)(b[32 + p * 2] | (b[32 + p * 2 + 1] << 8));
+        int sat = (inval == 0xFF || rxe == 0xFF || fwd == 0xFF ||
+                   lost == 0xFF || ext == 0xFF);
+        printf("     %d    %5u  %5u   %5u  %4u  %5u   ",
+               p, inval, rxe, fwd, lost, ext);
+        if (code) printf("0x%04X %s", code, esc_rx_error_code_name(code));
+        else      printf("-");
+        printf("%s\n", sat ? "   <- SATURATED" : "");
+    }
+    printf("    0x030C proc-unit=%-3u%s   0x030D pdi=%-3u%s   "
+           "0x030E:0F pdi-code=0x%04X\n",
+           b[12], b[12] == 0xFF ? " <-SAT" : "",
+           b[13], b[13] == 0xFF ? " <-SAT" : "",
+           (uint16_t)(b[14] | (b[15] << 8)));
+
+    /* The reason codes are the most perishable thing here: they are wiped by
+     * the very group that clears the RX error counters. Say so where it will
+     * be read, not only in --help. */
+    int any_code = 0;
     for (int p = 0; p < 4; p++)
-        printf("    port%d  invalid=%-3u rxerr=%-3u fwderr=%-3u%s\n", p,
-               b[p*2], b[p*2+1], b[8+p],
-               (b[p*2]==0xFF||b[p*2+1]==0xFF||b[8+p]==0xFF) ? "  <- SATURATED" : "");
-    printf("    0x030C proc-unit=%-3u%s   0x030D pdi=%-3u%s\n",
-           b[12], b[12]==0xFF ? " <- SATURATED" : "",
-           b[13], b[13]==0xFF ? " <- SATURATED" : "");
-    uint8_t l[4];
-    if (esc_read_range(ctx, 0x0310, 4, l) >= 1)
-        printf("    0x0310 lost-link  P0=%u P1=%u P2=%u P3=%u\n",
-               l[0], l[1], l[2], l[3]);
+        if (b[32 + p * 2] || b[32 + p * 2 + 1]) any_code = 1;
+    if (any_code)
+        printf("    NOTE: an RX error code is present. Writing 0x0300 CLEARS\n"
+               "    0x0320-0x0327 along with the counters — record it first.\n");
 }
 
 static void usage(const char *p) {
