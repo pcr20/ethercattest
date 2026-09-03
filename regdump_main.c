@@ -12,7 +12,6 @@
  * alone — the raw value is authoritative. */
 #include "ecat_common.h"
 #include "escreg.h"
-#include "stats.h"   /* esc_rx_error_code_name() — decode only, no writes */
 
 static int g_json = 0;
 
