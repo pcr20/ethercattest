@@ -71,10 +71,26 @@ static void hexdump(const uint8_t *d, int len) {
 
 /* ── Decode helpers (convenience only; raw value is authoritative) ──────── */
 static const char *esc_type_name(uint8_t t) {
-    /* CONFIRM against ETG.1000.6 Table "Type". These are the commonly cited
-     * encodings; the raw byte is printed regardless and must be trusted over
-     * this table. */
+    /* Two classes of entry here, deliberately distinguished:
+     *
+     *  - 0x90 / 0x91 are IDENTIFIED FROM THIS RIG, not from any spec. The
+     *    Novanta EVS-XCR-E reads 0x91 and the EVE-NET reads 0x90, both
+     *    confirmed by reading the parts in a known chain. They are labelled
+     *    "observed" because that is exactly what they are: an empirical
+     *    mapping, which is stronger than the guesses below for this hardware
+     *    and worthless for anyone else's.
+     *  - the rest are the commonly cited encodings and remain unconfirmed
+     *    against ETG.1000.6, hence the question marks.
+     *
+     * The raw byte is printed regardless and must be trusted over this table.
+     *
+     * Note both Novanta parts carry the SAME PHY (TI DP83822), so PHY probing
+     * and the canary apply to both. Nothing in these tools gates on the ESC
+     * type — ecat_phy gates on the PHY identifier and soak.sh on whether MII
+     * management responds. */
     switch (t) {
+        case 0x90: return "Novanta EVE-NET (observed on this rig)";
+        case 0x91: return "Novanta EVS-XCR-E (observed on this rig)";
         case 0x01: return "ESC10/20 (early)?";
         case 0x02: return "IP Core?";
         case 0x04: return "IP Core (Altera/Xilinx)?";
