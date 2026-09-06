@@ -143,6 +143,31 @@ int main(void)
             printf("T7 PASS: read path cannot assert the PHY write-enable bit\n");
     }
 
+    /* ── T8: MDIO address-scan presence classifier ──────────────────────
+     * An MDIO address with no device floats to all-ones via the bus pull-up;
+     * some implementations read back all-zeros. Neither is a PHY identifier.
+     * Getting this wrong makes a scan either miss real parts or report 32
+     * phantom ones — the EVE-NET reads 0xFFFF at address 0, which is exactly
+     * the case that must NOT be decoded as a PHY. */
+    {
+        int f0 = fails;
+        CHECK(phy_id_present(0xFFFF, 0xFFFF) == 0,
+              "all-ones is a floating bus, not a PHY");
+        CHECK(phy_id_present(0x0000, 0x0000) == 0,
+              "all-zeros is not a PHY identifier");
+        /* A real DP83822: OUI 0x080028, model 0x24. */
+        CHECK(phy_id_present(0x2000, 0xA240) == 1,
+              "a genuine DP83822 identifier must be recognised as present");
+        /* Partially-populated identifiers are still devices. */
+        CHECK(phy_id_present(0x0000, 0xA240) == 1,
+              "a nonzero PHYIDR2 alone still indicates a device");
+        CHECK(phy_id_present(0xFFFF, 0x0000) == 1,
+              "only ALL-ones across both words means nothing is there");
+        if (fails == f0)
+            printf("T8 PASS: scan treats all-ones and all-zeros as absent, "
+                   "real identifiers as present\n");
+    }
+
     if (fails) { printf("\n%d PHY-SWEEP CHECK(S) FAILED\n", fails); return 1; }
     printf("\nALL PHY-SWEEP TESTS PASS\n");
     return 0;

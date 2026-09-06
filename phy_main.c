@@ -60,7 +60,7 @@ static int phy_is_dp83822(EscCtx *ctx, int phy, uint32_t *oui_out,
     if (oui_out) *oui_out = oui;
     if (model_out) *model_out = model;
     if (rev_out) *rev_out = rev;
-    if (id1 == 0xFFFF || (id1 == 0 && id2 == 0)) return 0;   /* nothing there */
+    if (!phy_id_present(id1, id2)) return 0;                 /* nothing there */
     return (oui == DP83822_OUI && model == DP83822_MODEL) ? 1 : 0;
 }
 
@@ -522,11 +522,57 @@ static int canary_check(EscCtx *ctx, int phy) {
     return (t1_ok && t2_ok) ? 0 : 2;
 }
 
+/* Sweep every MDIO address and report which ones hold a PHY.
+ *
+ * Reads ONLY the PHY Identifier (0x02/0x03). Both are plain read-only
+ * registers with no latched or clear-on-read bits, so a discovery scan cannot
+ * consume diagnostic state — deliberately so: BMSR, PHYSTS, MISR and FLDS are
+ * exactly what you want intact when you come to look at a link that has been
+ * misbehaving, and a scan is often the first thing you run.
+ *
+ * Needed because PHY addresses are strapped per board and are not portable:
+ * the EVS-XCR-E answers at 0 and 1, while the EVE-NET has nothing at 0. The
+ * ESC's own 0x0510[7:3] "PHY address of port 0" field disagreed with what the
+ * bus actually reports on that part, so it cannot be relied on either. */
+static int scan_phys(EscCtx *ctx) {
+    printf("── MDIO address scan (0-31) ───────────────────────────────\n");
+    printf("  Reads only the PHY Identifier (0x02/0x03) — no latched or\n"
+           "  clear-on-read register is touched, so this is safe to run\n"
+           "  before inspecting a link.\n\n");
+    int found = 0, failed = 0;
+    for (int a = 0; a < 32; a++) {
+        uint16_t id1 = 0, id2 = 0;
+        if (mii_read_phy(ctx, (uint8_t)a, 0x02, &id1, NULL) != 0 ||
+            mii_read_phy(ctx, (uint8_t)a, 0x03, &id2, NULL) != 0) {
+            failed++;
+            continue;
+        }
+        if (!phy_id_present(id1, id2)) continue;
+        uint32_t oui   = ((uint32_t)id1 << 6) | ((id2 >> 10) & 0x3F);
+        unsigned model = (id2 >> 4) & 0x3F, rev = id2 & 0xF;
+        int is822 = (oui == DP83822_OUI && model == DP83822_MODEL);
+        printf("  addr %2d: PHYIDR1=0x%04X PHYIDR2=0x%04X  OUI=0x%06X "
+               "model=0x%02X rev=0x%X  %s\n",
+               a, id1, id2, oui, model, rev,
+               is822 ? "<- DP83822" : "<- other vendor");
+        found++;
+    }
+    if (!found)
+        printf("  no PHY responded at any address 0-31\n");
+    else
+        printf("\n  %d PHY(s) found. Use -a <addr> to probe one.\n", found);
+    if (failed)
+        printf("  (%d address(es) could not be read at all — MII errors)\n", failed);
+    return found ? 0 : 1;
+}
+
 static void usage(const char *p) {
     printf("Usage: %s -i <iface> [options]\n"
            "  -i <iface>         interface (required)\n"
            "  -p <position>      chain position of the slave (default 0)\n"
-           "  -a <phy|both>      PHY address, or 'both' (default: both 0 and 1)\n"
+           "  -a <phy|both|scan> PHY address, 'both' (0 and 1, the default), or\n"
+           "                     'scan' to sweep all 32 MDIO addresses and\n"
+           "                     report which hold a PHY (non-destructive)\n"
            "  -t <ms>            transaction timeout (default 10)\n"
            "  -d                 sweep all 32 direct registers (default action)\n"
            "  --ext              also read extended registers (needs --allow-phy-write)\n"
@@ -565,8 +611,11 @@ int main(int argc, char *argv[]) {
         switch (opt) {
         case 'i': iface = optarg; break;
         case 'p': position = atoi(optarg); break;
-        case 'a': phy_sel = (strcmp(optarg, "both") == 0)
-                            ? -1 : (int)strtol(optarg, NULL, 0); break;
+        case 'a':
+            if (strcmp(optarg, "both") == 0)      phy_sel = -1;
+            else if (strcmp(optarg, "scan") == 0) phy_sel = -2;
+            else phy_sel = (int)strtol(optarg, NULL, 0);
+            break;
         case 't': timeout_ms = atoi(optarg); break;
         case 'd': do_sweep = 1; break;
         case 'r': rd_reg = (int)strtol(optarg, NULL, 0); break;
@@ -588,8 +637,9 @@ int main(int argc, char *argv[]) {
         }
     }
     if (!iface) { usage(argv[0]); return 1; }
-    if (!do_sweep && !do_ext && !do_fld_status && !do_fld_enable &&
-        !cw && !cc && rd_reg < 0 && wr_reg < 0) do_sweep = 1;
+    if (phy_sel == -2) do_sweep = 0;      /* scan replaces the sweep */
+    else if (!do_sweep && !do_ext && !do_fld_status && !do_fld_enable &&
+             !cw && !cc && rd_reg < 0 && wr_reg < 0) do_sweep = 1;
     if (do_ext) do_sweep = 1;
 
     if ((wr_reg >= 0 || do_fld_enable || cw) && !allow_write) {
@@ -603,7 +653,7 @@ int main(int argc, char *argv[]) {
                         "also be using. Re-run with --allow-phy-write if intended.\n");
         return 1;
     }
-    if (phy_sel > 31) { fprintf(stderr, "PHY address must be 0..31\n"); return 1; }
+    if (phy_sel > 31) { fprintf(stderr, "PHY address must be 0..31, 'both' or 'scan'\n"); return 1; }
 
     EscCtx ctx;
     if (esc_open(&ctx, iface, (uint16_t)position, timeout_ms) != 0) return 1;
@@ -625,6 +675,7 @@ int main(int argc, char *argv[]) {
     if (check_mii_owner(&ctx) != 0) { esc_close(&ctx); return 1; }
 
     int rc = 0;
+    if (phy_sel == -2) { rc |= scan_phys(&ctx); goto done; }
     if (cw) { if (phy_sel < 0) { rc |= canary_write(&ctx, 0);
                                  rc |= canary_write(&ctx, 1); }
               else               rc |= canary_write(&ctx, phy_sel);
@@ -682,6 +733,7 @@ int main(int argc, char *argv[]) {
         else              { printf("  WRITE FAILED (rc=%d)\n", r); rc = 1; }
     }
 
+done:
     printf("\nTransactions: %lu sent, %lu matched, %lu retries, %lu timeouts\n",
            ctx.frames_sent, ctx.frames_matched, ctx.retries, ctx.timeouts);
     if (g_csv) { fclose(g_csv); printf("CSV written to %s\n", csv_path); }

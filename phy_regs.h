@@ -98,4 +98,15 @@ static const PhyExt phy_ext[] = {
 };
 #define PHY_EXT_COUNT ((int)(sizeof(phy_ext)/sizeof(phy_ext[0])))
 
+/* Is there a PHY at this MDIO address? An address with no device floats to
+ * all-ones via the bus pull-up; some implementations read back all-zeros.
+ * Neither is a PHY identifier. In the header so the address scan and its
+ * unit test share one definition — the EVE-NET reads 0xFFFF at address 0,
+ * which is exactly the case that must not be decoded as a PHY. */
+static inline int phy_id_present(uint16_t id1, uint16_t id2) {
+    if (id1 == 0xFFFF && id2 == 0xFFFF) return 0;
+    if (id1 == 0x0000 && id2 == 0x0000) return 0;
+    return 1;
+}
+
 #endif /* ECAT_PHY_REGS_H */
