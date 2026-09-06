@@ -92,6 +92,12 @@ typedef struct {
     _Atomic uint64_t rx_bad_fcs_auxdata;/* RX thread — kernel PACKET_AUXDATA    */
     _Atomic uint64_t rx_bad_fcs_computed;/* RX thread — self-computed Eth FCS   */
     _Atomic uint64_t rx_truncated;     /* RX thread — frame too short to parse  */
+    /* Frames whose EtherType is not 0x88A4 because the leading bytes of the
+     * frame never arrived (prefix loss). Before the socket was moved to
+     * ETH_P_ALL these were discarded by the kernel's protocol dispatch and
+     * counted only in netdev rx_dropped — they are damage, and they were
+     * previously invisible. See README §4.5. */
+    _Atomic uint64_t rx_hdr_damaged;   /* RX thread — EtherType destroyed       */
     _Atomic uint64_t tx_ts_completions;/* errqueue thread — sw TX timestamps   */
     /* On-wire TX packet count (ethtool tx_packets). Owned by supervisor. */
     uint64_t tx_wire_packets;          /* cumulative, from ethtool             */

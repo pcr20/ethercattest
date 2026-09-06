@@ -34,6 +34,10 @@
 #define FAULTCAP_REASON_FCS      (1u << 0)
 #define FAULTCAP_REASON_PAYLOAD  (1u << 1)
 #define FAULTCAP_REASON_LENGTH   (1u << 2)
+/* EtherType is not 0x88A4: the frame's leading bytes never arrived, so the
+ * header field is payload. Only reachable since the RX socket moved to
+ * ETH_P_ALL — the kernel used to discard these before delivery. */
+#define FAULTCAP_REASON_HEADER   (1u << 3)
 
 /* Open the capture set under dir/: frames.pcap, events.csv, probes.txt.
  * num_slaves positions are probed on each trigger. Returns 0 on success. */

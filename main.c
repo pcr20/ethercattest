@@ -123,9 +123,38 @@ int main(int argc, char *argv[]) {
     g_num_slaves = num_slaves;
     g_stats.brd_wkc_expected = num_slaves;
 
-    /* Open raw socket */
-    int sock = socket(AF_PACKET, SOCK_RAW, htons(ETHERTYPE_ECAT));
+    /* Open raw socket.
+     *
+     * ETH_P_ALL, not ETH_P_ECAT. A frame that lost its leading K bytes on the
+     * wire has payload bytes where its EtherType should be, so the kernel's
+     * protocol dispatch never offers it to an ETH_P_ECAT-bound socket: it is
+     * counted in netdev rx_dropped and discarded unseen. Those frames are the
+     * damage we are here to measure. Measured on a 10-slave chain: three
+     * prefix-chopped frames on the wire, rx_dropped == 3, delivered == 0.
+     *
+     * The protocol filter was also, incidentally, what kept our own transmits
+     * out of this socket: dev_queue_xmit_nit() offers outgoing frames only to
+     * ptype_all hooks. Widening to ETH_P_ALL puts us on that list, so
+     * PACKET_IGNORE_OUTGOING below restores the inbound-only property
+     * explicitly. Without it every TX frame would arrive as a bogus return. */
+    int sock = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
     if (sock < 0) { perror("socket"); return 1; }
+
+    /* Hard requirement, not best-effort: if outgoing frames are delivered to
+     * this socket the return accounting is silently doubled. Fail loudly. */
+    {
+        int ign = 1;
+        if (setsockopt(sock, SOL_PACKET, PACKET_IGNORE_OUTGOING,
+                       &ign, sizeof(ign)) < 0) {
+            perror("setsockopt(PACKET_IGNORE_OUTGOING)");
+            fprintf(stderr,
+                "FATAL: this kernel cannot suppress delivery of our own\n"
+                "transmitted frames to the capture socket (needs Linux 4.20+).\n"
+                "Refusing to run: every TX frame would be counted as a return.\n");
+            close(sock);
+            return 1;
+        }
+    }
 
     /* Bind to interface */
     int ifindex = get_ifindex(sock, iface);
@@ -134,7 +163,7 @@ int main(int argc, char *argv[]) {
     struct sockaddr_ll sll;
     memset(&sll, 0, sizeof(sll));
     sll.sll_family   = AF_PACKET;
-    sll.sll_protocol = htons(ETHERTYPE_ECAT);
+    sll.sll_protocol = htons(ETH_P_ALL);
     sll.sll_ifindex  = ifindex;
     if (bind(sock, (struct sockaddr *)&sll, sizeof(sll)) < 0) {
         perror("bind"); return 1;

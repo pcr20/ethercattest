@@ -197,6 +197,16 @@ void *rx_thread(void *arg) {
         if (atomic_load_explicit(&g_rx_discard, memory_order_relaxed)) break;   \
         atomic_fetch_add_explicit(&g_stats.frames_received, 1,                  \
                                   memory_order_relaxed);                       \
+        /* Is this frame's Ethernet header intact? Since the socket moved to    \
+         * ETH_P_ALL we also receive frames whose leading bytes were lost on    \
+         * the wire, which puts payload where the EtherType belongs. Such a     \
+         * frame is damage, but it cannot be parsed as EtherCAT and must not    \
+         * reach the foreign-frame test (frame.c), which reads byte 16 and      \
+         * would misread arbitrary payload as another master's datagram. */     \
+        int hdr_ok = frame_hdr_is_ecat(bufs[idx], raw_len);                    \
+        if (!hdr_ok)                                                           \
+            atomic_fetch_add_explicit(&g_stats.rx_hdr_damaged, 1,              \
+                                      memory_order_relaxed);                   \
         int len_bad = rx_check_len(raw_len, ctx->rx_fcs_on);                   \
         /* Grab PACKET_AUXDATA tp_status (detector 1 source). */               \
         uint32_t tp_status = 0; int have_aux = 0;                              \
@@ -278,12 +288,15 @@ void *rx_thread(void *arg) {
             uint32_t why = 0;                                                  \
             if (comp_bad) why |= FAULTCAP_REASON_FCS;                          \
             if (len_bad) why |= FAULTCAP_REASON_LENGTH;                        \
+            if (!hdr_ok)  why |= FAULTCAP_REASON_HEADER;                       \
             if (why) faultcap_frame(now_ns(), why, bufs[idx], raw_len);        \
         }                                                                      \
         int payload_ok = 0;                                                    \
-        uint64_t rseq = parse_return_frame(bufs[idx], content_len,             \
-                                           ctx->num_slaves, ctx->loopback,     \
-                                           !comp_bad, &payload_ok);            \
+        uint64_t rseq = UINT64_MAX;                                            \
+        if (hdr_ok)                                                            \
+            rseq = parse_return_frame(bufs[idx], content_len,                  \
+                                      ctx->num_slaves, ctx->loopback,          \
+                                      !comp_bad, &payload_ok);                 \
         /* Count-based accounting (Issue 1). loss = TxOk − good distinct        \
          * returns. A frame counts as a GOOD return iff its Ethernet FCS is     \
          * valid (!comp_bad) AND its payload CRC32C verified (payload_ok) — only \

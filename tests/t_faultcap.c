@@ -115,6 +115,62 @@ int main(void)
                    "new event restarts the quiet window\n");
     }
 
+    /* ── T5: a prefix-chopped frame is captured, and is NOT called foreign ─
+     *
+     * Regression for the blind spot found on the 10-slave chain: frames that
+     * lost their leading K bytes on the wire (K = 74/126/165 measured) carry
+     * payload where the EtherType belongs. They used to be dropped by the
+     * kernel's protocol dispatch before delivery. Now that the socket is
+     * ETH_P_ALL they arrive, and two things must hold: they are captured as
+     * damage, and they never reach the foreign-frame test — byte 16 is
+     * arbitrary payload, so parse_return_frame() would misfile them as
+     * another master's traffic and subtract them from TxOk. */
+    {
+        int f0 = fails;
+        uint8_t frame[1518];
+        for (size_t i = 0; i < sizeof(frame); i++) frame[i] = (uint8_t)(i * 7 + 3);
+        /* An intact EtherCAT frame passes the gate; a chopped one does not. */
+        frame[12] = 0x88; frame[13] = 0xA4;
+        CHECK(frame_hdr_is_ecat(frame, (int)sizeof(frame)) == 1,
+              "an intact 0x88A4 header must pass the gate");
+        /* Chop 165 bytes off the front, exactly as observed on the wire. */
+        uint8_t chopped[1518 - 165];
+        memcpy(chopped, frame + 165, sizeof(chopped));
+        CHECK(frame_hdr_is_ecat(chopped, (int)sizeof(chopped)) == 0,
+              "a prefix-chopped frame must FAIL the gate (EtherType is payload)");
+        CHECK(frame_hdr_is_ecat(frame, 8) == 0,
+              "a runt shorter than the Ethernet header must fail the gate");
+
+        /* The gate is load-bearing: without it this frame is booked foreign. */
+        uint64_t before = atomic_load_explicit(&g_rx_foreign, memory_order_relaxed);
+        int payload_ok = 0;
+        (void)parse_return_frame(chopped, (int)sizeof(chopped), 10, 0, 0,
+                                 &payload_ok);
+        uint64_t after = atomic_load_explicit(&g_rx_foreign, memory_order_relaxed);
+        CHECK(after > before,
+              "parse_return_frame must misfile an unguarded chopped frame as "
+              "foreign — if it does not, this test no longer proves the gate "
+              "is needed");
+
+        /* And it is captured as damage, tagged with the header reason. */
+        uint64_t n0 = faultcap_event_count();
+        faultcap_frame(1000, FAULTCAP_REASON_FCS | FAULTCAP_REASON_LENGTH |
+                             FAULTCAP_REASON_HEADER,
+                       chopped, (int)sizeof(chopped));
+        faultcap_flush();
+        (void)n0;
+        char pp[512]; snprintf(pp, sizeof(pp), "%s/frames.pcap", dir);
+        long sz = -1;
+        FILE *pf = fopen(pp, "rb");
+        CHECK(pf != NULL, "pcap missing");
+        if (pf) { fseek(pf, 0, SEEK_END); sz = ftell(pf); fclose(pf); }
+        CHECK(sz > 24, "pcap still header-only: chopped frame not captured "
+                       "(size %ld)", sz);
+        if (fails == f0)
+            printf("T5 PASS: prefix-chopped frame is captured as damage and is "
+                   "gated out of the foreign-frame test\n");
+    }
+
     faultcap_close();
     if (fails) { printf("\n%d FAULTCAP CHECK(S) FAILED\n", fails); return 1; }
     printf("\nALL FAULTCAP TESTS PASS\n");

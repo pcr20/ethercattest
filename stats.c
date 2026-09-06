@@ -206,6 +206,10 @@ void print_stats(FILE *csv, uint64_t elapsed_ns) {
       uint64_t lerr = atomic_load_explicit(&g_stats.rx_len_errors, memory_order_relaxed);
       printf("  Rx frame length errors: %lu  %s\n", lerr,
              lerr ? "(received length != TX frame length)" : "(all correct length)");
+      uint64_t hdmg = atomic_load_explicit(&g_stats.rx_hdr_damaged, memory_order_relaxed);
+      if (hdmg)
+          printf("    of which EtherType destroyed: %lu  (leading bytes lost "
+                 "on the wire)\n", hdmg);
     }
     printf("  TX backpressure:%lu  (EAGAIN ring-full, normal)\n", backp);
     printf("  Kernel RX drops:%lu  %s\n", kdrops,
