@@ -534,6 +534,19 @@ static int canary_check(EscCtx *ctx, int phy) {
  * the EVS-XCR-E answers at 0 and 1, while the EVE-NET has nothing at 0. The
  * ESC's own 0x0510[7:3] "PHY address of port 0" field disagreed with what the
  * bus actually reports on that part, so it cannot be relied on either. */
+/* Fill addrs[] with every MDIO address holding a PHY. Non-destructive: reads
+ * only the PHY Identifier. Returns the count. */
+static int discover_phys(EscCtx *ctx, int *addrs, int max) {
+    int n = 0;
+    for (int a = 0; a < 32 && n < max; a++) {
+        uint16_t id1 = 0, id2 = 0;
+        if (mii_read_phy(ctx, (uint8_t)a, 0x02, &id1, NULL) != 0) continue;
+        if (mii_read_phy(ctx, (uint8_t)a, 0x03, &id2, NULL) != 0) continue;
+        if (phy_id_present(id1, id2)) addrs[n++] = a;
+    }
+    return n;
+}
+
 static int scan_phys(EscCtx *ctx) {
     printf("── MDIO address scan (0-31) ───────────────────────────────\n");
     printf("  Reads only the PHY Identifier (0x02/0x03) — no latched or\n"
@@ -570,9 +583,14 @@ static void usage(const char *p) {
     printf("Usage: %s -i <iface> [options]\n"
            "  -i <iface>         interface (required)\n"
            "  -p <position>      chain position of the slave (default 0)\n"
-           "  -a <phy|both|scan> PHY address, 'both' (0 and 1, the default), or\n"
-           "                     'scan' to sweep all 32 MDIO addresses and\n"
-           "                     report which hold a PHY (non-destructive)\n"
+           "  -a <phy|all|scan|both>\n"
+           "                     PHY address. Default 'all': discover which\n"
+           "                     addresses hold a PHY and probe every one —\n"
+           "                     addresses are strapped per board (EVS-XCR-E\n"
+           "                     uses 0,1; EVE-NET uses 1,3), so a fixed pair\n"
+           "                     silently misses PHYs. 'scan' reports the\n"
+           "                     addresses without probing. 'both' forces the\n"
+           "                     legacy 0,1.\n"
            "  -t <ms>            transaction timeout (default 10)\n"
            "  -d                 sweep all 32 direct registers (default action)\n"
            "  --ext              also read extended registers (needs --allow-phy-write)\n"
@@ -612,8 +630,9 @@ int main(int argc, char *argv[]) {
         case 'i': iface = optarg; break;
         case 'p': position = atoi(optarg); break;
         case 'a':
-            if (strcmp(optarg, "both") == 0)      phy_sel = -1;
+            if (strcmp(optarg, "all") == 0)       phy_sel = -1;
             else if (strcmp(optarg, "scan") == 0) phy_sel = -2;
+            else if (strcmp(optarg, "both") == 0) phy_sel = -3;
             else phy_sel = (int)strtol(optarg, NULL, 0);
             break;
         case 't': timeout_ms = atoi(optarg); break;
@@ -653,7 +672,7 @@ int main(int argc, char *argv[]) {
                         "also be using. Re-run with --allow-phy-write if intended.\n");
         return 1;
     }
-    if (phy_sel > 31) { fprintf(stderr, "PHY address must be 0..31, 'both' or 'scan'\n"); return 1; }
+    if (phy_sel > 31) { fprintf(stderr, "PHY address must be 0..31, or 'all', 'scan', 'both'\n"); return 1; }
 
     EscCtx ctx;
     if (esc_open(&ctx, iface, (uint16_t)position, timeout_ms) != 0) return 1;
@@ -676,22 +695,25 @@ int main(int argc, char *argv[]) {
 
     int rc = 0;
     if (phy_sel == -2) { rc |= scan_phys(&ctx); goto done; }
-    if (cw) { if (phy_sel < 0) { rc |= canary_write(&ctx, 0);
-                                 rc |= canary_write(&ctx, 1); }
-              else               rc |= canary_write(&ctx, phy_sel);
+    int addrs[32], naddr = 0;
+    if (phy_sel == -1) {
+        naddr = discover_phys(&ctx, addrs, 32);
+        printf("── PHYs discovered: ");
+        for (int i = 0; i < naddr; i++) printf("%d%s", addrs[i],
+                                               i + 1 < naddr ? ", " : "");
+        printf("%s ──\n\n", naddr ? "" : "(none)");
+    } else if (phy_sel == -3) { addrs[0] = 0; addrs[1] = 1; naddr = 2; }
+    else { addrs[0] = phy_sel; naddr = 1; }
+
+    if (cw) { for (int i = 0; i < naddr; i++) rc |= canary_write(&ctx, addrs[i]);
               printf("\n"); }
     if (cc) { printf("── Reset canary: check ────────────────────────────────────\n");
-              if (phy_sel < 0) { rc |= canary_check(&ctx, 0);
-                                 rc |= canary_check(&ctx, 1); }
-              else               rc |= canary_check(&ctx, phy_sel);
+              for (int i = 0; i < naddr; i++) rc |= canary_check(&ctx, addrs[i]);
               printf("\n"); }
-    if (do_sweep) {
-        if (phy_sel < 0) { rc |= sweep_phy(&ctx, 0, do_ext);
-                           rc |= sweep_phy(&ctx, 1, do_ext); }
-        else               rc |= sweep_phy(&ctx, phy_sel, do_ext);
-    }
+    if (do_sweep)
+        for (int i = 0; i < naddr; i++) rc |= sweep_phy(&ctx, addrs[i], do_ext);
 
-    int one = phy_sel < 0 ? 0 : phy_sel;
+    int one = (phy_sel >= 0) ? phy_sel : (naddr ? addrs[0] : 0);
     if (rd_reg >= 0) {
         uint16_t v = 0, st = 0;
         if (mii_read_phy(&ctx, (uint8_t)one, (uint8_t)rd_reg, &v, &st) != 0) {
