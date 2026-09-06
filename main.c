@@ -4,6 +4,7 @@
 #include "stats.h"
 #include "nic.h"
 #include "threads.h"
+#include "faultcap.h"
 
 /* ── Signal handler ─────────────────────────────────────────────────────── */
 /* Stop TX first; the main thread performs the drain barrier and then clears
@@ -75,12 +76,14 @@ static uint64_t wait_tx_drained(const char *iface) {
 int main(int argc, char *argv[]) {
     const char *iface     = NULL;
     const char *csv_path  = "ber_results.csv";
+    uint64_t    stop_after_errors = 128;   /* -N: stop after this many ESC error events */
+    const char *faultdir = NULL;          /* -F: fault-capture output directory        */
     int   num_slaves      = 0;
     long  rate_hz         = 0;      /* 0 = saturate */
     long  duration_s      = 0;      /* 0 = until Ctrl-C */
 
     int opt;
-    while ((opt = getopt(argc, argv, "i:s:r:d:o:lv")) != -1) {
+    while ((opt = getopt(argc, argv, "i:s:r:d:o:lvN:F:")) != -1) {
         switch (opt) {
         case 'i': iface       = optarg;          break;
         case 's': num_slaves  = atoi(optarg);    break;
@@ -88,11 +91,21 @@ int main(int argc, char *argv[]) {
         case 'd': duration_s  = atol(optarg);    break;
         case 'o': csv_path    = optarg;          break;
         case 'l': g_loopback  = 1;               break;
+        case 'N': stop_after_errors = strtoull(optarg, NULL, 10); break;
+        case 'F': faultdir = optarg;             break;
         case 'v': g_verbose   = 1;               break;
         default:
             fprintf(stderr,
                 "Usage: %s -i <iface> -s <slaves> [-r <hz>] [-d <secs>] "
-                "[-o <csv>] [-l] [-v]\n", argv[0]);
+                "[-o <csv>] [-l] [-v]\n"
+                "       [-F <dir>] [-N <errors>]\n\n"
+                "  -F <dir>     enable fault capture into <dir>: frames.pcap\n"
+                "               (bytes of every damaged frame that reaches us),\n"
+                "               events.csv (every ESC error-counter change) and\n"
+                "               probes.txt (PHY registers read after each burst)\n"
+                "  -N <errors>  stop once this many ESC error events are seen\n"
+                "               (default 128; needs -F). Use -d for the timeout.\n",
+                argv[0]);
             return 1;
         }
     }
@@ -304,6 +317,15 @@ int main(int argc, char *argv[]) {
     ctx.errq_core  = errq_core;
 
     uint64_t start_ns    = now_ns();
+    /* Fault-capture run control. The test may end on a deliberate error
+     * budget rather than only on Ctrl-C or a wall-clock duration: -N stops
+     * once that many ESC error events have been recorded, -d supplies the
+     * timeout. Probing pauses TX, so it must not fire on the first error of a
+     * burst — that would suppress the rest of the burst and bias the sample.
+     * Instead the burst is allowed to drain and the probe fires after a quiet
+     * period, by which time every failing frame in it has been logged. */
+    const uint64_t BURST_QUIET_NS = 200ULL * 1000000ULL;
+    uint64_t last_probe_events = 0;
     uint64_t last_stat_ns = start_ns;
     int      badfcs_budget = BADFCS_PRINT_CAP;   /* prints left this interval */
     uint64_t badfcs_suppressed = 0;
@@ -312,6 +334,14 @@ int main(int argc, char *argv[]) {
      * link-state reporting is correct from the start rather than reading DOWN
      * from a 0-initialised flag. */
     atomic_store_explicit(&g_stats.link_state_up, 1, memory_order_relaxed);
+
+    if (faultdir) {
+        if (faultcap_open(iface, num_slaves, faultdir) != 0) return 1;
+        printf("Fault capture: %s/ (frames.pcap, events.csv, probes.txt)\n"
+               "  stop after %lu ESC error event(s)%s\n",
+               faultdir, stop_after_errors,
+               duration_s > 0 ? "" : "  [no -d timeout given]");
+    }
 
     printf("Running... (Ctrl-C to stop)\n");
 
@@ -426,6 +456,43 @@ int main(int argc, char *argv[]) {
             break;
         }
 
+        /* Burst has drained: log everything it produced, then probe. */
+        if (faultdir && faultcap_burst_settled(now, BURST_QUIET_NS)) {
+            uint64_t ev = faultcap_event_count();
+            if (ev != last_probe_events) {
+                fprintf(stderr, "[fault] burst settled at %lu event(s) — "
+                                "pausing to probe\n", ev);
+                atomic_store_explicit(&g_tx_paused, 1, memory_order_relaxed);
+                uint64_t drained = wait_tx_drained(iface);
+                sleep_ns(PAUSE_SETTLE_NS);
+                atomic_store_explicit(&g_rx_discard, 1, memory_order_relaxed);
+                uint64_t txok_before = read_nic_tx_packets(iface);
+                (void)drained;
+
+                int np = faultcap_probe(iface, now - start_ns);
+
+                /* Same foreign-frame accounting as the external pause: we
+                 * transmitted nothing, so every frame the NIC put on the wire
+                 * in this window was the probe's. */
+                sleep_ns(RESUME_SETTLE_NS);
+                uint64_t f = read_nic_tx_packets(iface) - txok_before;
+                atomic_fetch_add_explicit(&g_foreign_txok, f, memory_order_relaxed);
+                atomic_store_explicit(&g_rx_discard, 0, memory_order_relaxed);
+                atomic_store_explicit(&g_tx_paused, 0, memory_order_relaxed);
+                atomic_fetch_add_explicit(&g_pause_count, 1, memory_order_relaxed);
+                fprintf(stderr, "[fault] probed %d position(s); %lu foreign "
+                                "frame(s) excluded\n", np, f);
+                last_probe_events = ev;
+            }
+        }
+        if (faultdir && faultcap_event_count() >= stop_after_errors) {
+            fprintf(stderr, "\n*** error budget reached: %lu ESC error event(s) "
+                            ">= -N %lu — stopping ***\n",
+                    faultcap_event_count(), stop_after_errors);
+            g_tx_running = 0;
+            break;
+        }
+
         badfcs_drain(&badfcs_budget, &badfcs_suppressed);
 
         poll_kernel_drops(sock);
@@ -536,6 +603,7 @@ int main(int argc, char *argv[]) {
                 badfcs_suppressed);
     print_stats(csv, end_ns - start_ns);
 
+    if (faultdir) faultcap_close();
     if (g_linkev_csv) fclose(g_linkev_csv);
     fclose(csv);
     close(sock);

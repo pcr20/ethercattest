@@ -1,4 +1,5 @@
 #include "threads.h"
+#include "faultcap.h"
 #include "frame.h"
 #include "crc.h"
 #include "stats.h"
@@ -196,7 +197,7 @@ void *rx_thread(void *arg) {
         if (atomic_load_explicit(&g_rx_discard, memory_order_relaxed)) break;   \
         atomic_fetch_add_explicit(&g_stats.frames_received, 1,                  \
                                   memory_order_relaxed);                       \
-        rx_check_len(raw_len, ctx->rx_fcs_on);                                 \
+        int len_bad = rx_check_len(raw_len, ctx->rx_fcs_on);                   \
         /* Grab PACKET_AUXDATA tp_status (detector 1 source). */               \
         uint32_t tp_status = 0; int have_aux = 0;                              \
         for (struct cmsghdr *cm = CMSG_FIRSTHDR(&msgs[idx].msg_hdr); cm;       \
@@ -269,6 +270,16 @@ void *rx_thread(void *arg) {
         if (content_len < (int)(ETH_HDR_LEN + ECAT_HDR_LEN + ECAT_DG_HDR_LEN)) \
             atomic_fetch_add_explicit(&g_stats.rx_truncated, 1,                \
                                       memory_order_relaxed);                   \
+        /* Capture the BYTES of any frame that fails our checks. These are   \
+         * the genuinely damaged frames — the forensic record. Non-blocking:   \
+         * queued to a ring, written to pcap by the supervisor (§4.4).         \
+         * Only ~6% of damage events produce one; the NIC drops the rest.      \*/ \
+        {                                                                      \
+            uint32_t why = 0;                                                  \
+            if (comp_bad) why |= FAULTCAP_REASON_FCS;                          \
+            if (len_bad) why |= FAULTCAP_REASON_LENGTH;                        \
+            if (why) faultcap_frame(now_ns(), why, bufs[idx], raw_len);        \
+        }                                                                      \
         int payload_ok = 0;                                                    \
         uint64_t rseq = parse_return_frame(bufs[idx], content_len,             \
                                            ctx->num_slaves, ctx->loopback,     \

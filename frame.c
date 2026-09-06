@@ -1,4 +1,21 @@
 #include "frame.h"
+#include "faultcap.h"
+
+/* Weak no-op default. frame.c is compiled into every unit test, but the tests
+ * link only the modules they exercise and none of them link faultcap.o (which
+ * pulls in the ESC/MII transport and does file I/O). The strong definition in
+ * faultcap.c overrides this whenever ecat_ber is linked, so the production
+ * path is unaffected and the tests need no stub of their own. */
+#ifndef FAULTCAP_REAL     /* t_faultcap.c defines this: it includes faultcap.c
+                           * into the same translation unit, so the strong
+                           * definition is already present and this would be a
+                           * redefinition rather than a weak fallback. */
+__attribute__((weak))
+void faultcap_esc_event(uint64_t t_ns, int slave, int port,
+                        const char *counter, unsigned delta) {
+    (void)t_ns; (void)slave; (void)port; (void)counter; (void)delta;
+}
+#endif
 #include "crc.h"
 #include "stats.h"
 
@@ -301,21 +318,36 @@ uint64_t parse_return_frame(const uint8_t *buf, int len,
 
             for (int p = 0; p < 4; p++) {
                 uint8_t cur = d[p * 2];              /* 0x0300+2p invalid    */
+                /* Every increment is a damage event, including those whose
+                 * frame never reached us. This is the probe trigger and the
+                 * only signal with ~100% coverage. */
+                if (cur != g_stats.esc_crc_prev[s][p])
+                    faultcap_esc_event(now_ns(), s, p, "invalid",
+                                       (uint8_t)(cur - g_stats.esc_crc_prev[s][p]));
                 g_stats.esc_crc[s][p] += (uint8_t)(cur - g_stats.esc_crc_prev[s][p]);
                 g_stats.esc_crc_prev[s][p] = cur;
                 g_stats.esc_raw_crc[s][p]  = cur;
 
                 uint8_t rx = d[p * 2 + 1];           /* 0x0301+2p RX error   */
+                if (rx != g_stats.esc_rxerr_prev[s][p])
+                    faultcap_esc_event(now_ns(), s, p, "rxerr",
+                                       (uint8_t)(rx - g_stats.esc_rxerr_prev[s][p]));
                 g_stats.esc_rxerr[s][p] += (uint8_t)(rx - g_stats.esc_rxerr_prev[s][p]);
                 g_stats.esc_rxerr_prev[s][p] = rx;
                 g_stats.esc_raw_rxerr[s][p]  = rx;
 
                 uint8_t fw = d[8 + p];               /* 0x0308+p forwarded   */
+                if (fw != g_stats.esc_fwderr_prev[s][p])
+                    faultcap_esc_event(now_ns(), s, p, "fwderr",
+                                       (uint8_t)(fw - g_stats.esc_fwderr_prev[s][p]));
                 g_stats.esc_fwderr[s][p] += (uint8_t)(fw - g_stats.esc_fwderr_prev[s][p]);
                 g_stats.esc_fwderr_prev[s][p] = fw;
                 g_stats.esc_raw_fwderr[s][p]  = fw;
 
                 uint8_t ll = d[16 + p];              /* 0x0310+p lost link   */
+                if (ll != g_stats.esc_lostlnk_prev[s][p])
+                    faultcap_esc_event(now_ns(), s, p, "lostlink",
+                                       (uint8_t)(ll - g_stats.esc_lostlnk_prev[s][p]));
                 g_stats.esc_lostlnk[s][p] += (uint8_t)(ll - g_stats.esc_lostlnk_prev[s][p]);
                 g_stats.esc_lostlnk_prev[s][p] = ll;
 

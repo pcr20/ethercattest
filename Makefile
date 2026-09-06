@@ -1,7 +1,9 @@
 CC      = gcc
 CFLAGS  = -D_GNU_SOURCE -O2 -Wall -Wextra -std=c11 -msse4.2 -flto
 LDFLAGS = -flto -lm -lpthread
-OBJS    = crc.o stats.o frame.o nic.o threads.o main.o
+# ecat_ber links the fault-capture module and the ESC/MII transport it needs.
+# The objects stay separate and ecat_ber includes only faultcap.h.
+OBJS    = crc.o stats.o frame.o nic.o threads.o main.o faultcap.o escreg.o escmii.o
 
 DUMP_OBJS = escreg.o nic.o regdump_main.o
 # ecat_phy WRITES to the slave (ESC MII management). It links escmii.o; the
@@ -29,15 +31,15 @@ ecat_phy: $(PHY_OBJS) stats.o crc.o
 ecat_escreset: $(RESET_OBJS) stats.o crc.o
 	$(CC) -o $@ $(RESET_OBJS) stats.o crc.o $(LDFLAGS)
 
-%.o: %.c ecat_common.h crc.h stats.h frame.h nic.h threads.h escreg.h escmii.h phy_regs.h
+%.o: %.c ecat_common.h crc.h stats.h frame.h nic.h threads.h escreg.h escmii.h phy_regs.h faultcap.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
-TESTS = t_escframe t_miiframe t_physweep t_hostrx t_escclear t_pause t_wirefmt t_framesz t_txok t_crc t_resid3 t_escgate t_plsem t_ring
+TESTS = t_escframe t_miiframe t_physweep t_hostrx t_escclear t_pause t_faultcap t_wirefmt t_framesz t_txok t_crc t_resid3 t_escgate t_plsem t_ring
 test: $(TESTS:%=tests/%)
 	@for t in $(TESTS); do ./tests/$$t || exit 1; done
 	@echo "ALL TEST SUITES PASS"
 
-tests/%: tests/%.c crc.c stats.c frame.c nic.c escreg.c escmii.c ecat_common.h crc.h stats.h frame.h escreg.h escmii.h phy_regs.h
+tests/%: tests/%.c crc.c stats.c frame.c nic.c escreg.c escmii.c faultcap.c ecat_common.h crc.h stats.h frame.h escreg.h escmii.h phy_regs.h faultcap.h
 	$(CC) -D_GNU_SOURCE -O2 -Wall -std=c11 -msse4.2 -I. -o $@ $< -lm -lpthread
 
 clean:
