@@ -226,20 +226,49 @@ static int check_mii_owner(EscCtx *ctx) {
         { ESC_MII_PDI_ACC,  1, "0x0517 MII PDI access"     },
     };
     uint8_t buf[4];
-    int nfail = 0;
+    int nfail = 0, ctrl_ok = 0;
     uint16_t ctrl = 0; uint8_t ea = 0, pa = 0;
+    int arb_missing = 0;
 
     printf("── MII management arbitration ─────────────────────────────\n");
     for (int i = 0; i < 3; i++) {
         int wkc = esc_read_range(ctx, m[i].addr, m[i].len, buf);
         if (wkc < 1) {
             printf("  %-28s UNREADABLE (wkc=%d)\n", m[i].name, wkc);
-            nfail++;
+            if (i == 0) nfail++; else arb_missing++;
         } else {
+            if (i == 0) ctrl_ok = 1;
             if (i == 0) ctrl = le16get(buf);
             else if (i == 1) ea = buf[0];
             else pa = buf[0];
         }
+    }
+
+    /* 0x0516/0x0517 exist ONLY to arbitrate MII between ECAT and the PDI.
+     * 0x0510[1] says whether the PDI can control the interface at all
+     * (Beckhoff §2.12.1; reset value "Others: 0" for non-IP-core parts). When
+     * that bit is clear the PDI can never take MII, there is nothing to
+     * arbitrate, and an ESC need not implement the arbitration registers —
+     * so their absence is CORRECT, not a failure. Requiring all three refused
+     * perfectly good hardware: the EVE-NET (type 0x90) reads 0x0510 fine with
+     * bit 1 clear, meaning ECAT holds MII exclusively and unconditionally,
+     * which is a stronger position than a part where the PDI may take over. */
+    if (ctrl_ok && arb_missing && !(ctrl & MII_CTRL_PDI_CTRL)) {
+        printf("  0x0516/0x0517 not implemented — and not needed: 0x0510 bit1\n"
+               "  is CLEAR, so the PDI cannot control MII on this ESC. ECAT has\n"
+               "  exclusive, unconditional access. Proceeding.\n");
+        decode_mii_status(ctrl);
+        printf("\n");
+        return 0;
+    }
+    if (ctrl_ok && arb_missing) {
+        printf("  WARNING: 0x0510 bit1 is SET (PDI may control MII) but the\n"
+               "  arbitration registers 0x0516/0x0517 are unreadable, so who\n"
+               "  owns the interface cannot be determined. Proceeding, but a\n"
+               "  PDI access could collide with ours.\n");
+        decode_mii_status(ctrl);
+        printf("\n");
+        return 0;
     }
 
     if (nfail) {
