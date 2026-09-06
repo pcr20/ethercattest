@@ -702,6 +702,18 @@ int main(int argc, char *argv[]) {
         for (int i = 0; i < naddr; i++) printf("%d%s", addrs[i],
                                                i + 1 < naddr ? ", " : "");
         printf("%s ──\n\n", naddr ? "" : "(none)");
+        if (naddr == 0) {
+            /* Nothing to sweep, nothing to write. Exiting 0 here reported
+             * success for a run that did no work, and an orchestrator that
+             * only checks the exit code then logged a canary as planted when
+             * none was. Doing nothing is not success. */
+            printf("  No PHY answered on the MDIO bus, so nothing was probed\n"
+                   "  and nothing was written. If the arbitration block above\n"
+                   "  shows the PDI holding MII, the slave's own firmware owns\n"
+                   "  the bus and the master cannot reach the PHYs.\n");
+            rc = 3;
+            goto done;
+        }
     } else if (phy_sel == -3) { addrs[0] = 0; addrs[1] = 1; naddr = 2; }
     else { addrs[0] = phy_sel; naddr = 1; }
 
