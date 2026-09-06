@@ -214,22 +214,90 @@ static void decode_mii_status(uint16_t st) {
            (st >> 3) & 0x1F, !!(st & 0x1000));
 }
 
+/* Probe the MII block register by register and, if it is unreachable, gather
+ * the context that explains WHY. A single "cannot read the MII block" told us
+ * nothing: not which register failed, not whether the slave answered at all,
+ * and not whether the ESC is even in a state where register access is
+ * expected to work. Returns 0 if MII is usable, -1 otherwise. */
 static int check_mii_owner(EscCtx *ctx) {
-    uint8_t ea = 0, pa = 0; uint16_t ctrl = 0;
-    if (esc_read8(ctx, ESC_MII_ECAT_ACC, &ea) != 0 ||
-        esc_read8(ctx, ESC_MII_PDI_ACC, &pa) != 0 ||
-        esc_read16(ctx, ESC_MII_CTRL, &ctrl) != 0) {
-        fprintf(stderr, "ERROR: cannot read the ESC MII block (0x0510-0x0517)\n");
+    struct { uint16_t addr; uint16_t len; const char *name; } m[] = {
+        { ESC_MII_CTRL,     2, "0x0510 MII control/status" },
+        { ESC_MII_ECAT_ACC, 1, "0x0516 MII ECAT access"    },
+        { ESC_MII_PDI_ACC,  1, "0x0517 MII PDI access"     },
+    };
+    uint8_t buf[4];
+    int nfail = 0;
+    uint16_t ctrl = 0; uint8_t ea = 0, pa = 0;
+
+    printf("── MII management arbitration ─────────────────────────────\n");
+    for (int i = 0; i < 3; i++) {
+        int wkc = esc_read_range(ctx, m[i].addr, m[i].len, buf);
+        if (wkc < 1) {
+            printf("  %-28s UNREADABLE (wkc=%d)\n", m[i].name, wkc);
+            nfail++;
+        } else {
+            if (i == 0) ctrl = le16get(buf);
+            else if (i == 1) ea = buf[0];
+            else pa = buf[0];
+        }
+    }
+
+    if (nfail) {
+        /* Distinguish "this slave is not answering at all" from "this slave
+         * answers but has no MII management". Read registers every ESC must
+         * implement, plus the ones that say whether it is configured and
+         * whether its EEPROM loaded — a slave with a bad or custom SII can
+         * come up with register access restricted. */
+        printf("\n  ── Why: context from registers every ESC implements ──\n");
+        struct { uint16_t addr; uint16_t len; const char *name; } c[] = {
+            { 0x0000, 1, "0x0000 Type"                    },
+            { 0x0007, 1, "0x0007 Port descriptor"         },
+            { 0x0110, 2, "0x0110 DL status"               },
+            { 0x0140, 2, "0x0140 PDI control"             },
+            { 0x0500, 1, "0x0500 EEPROM config (owner)"   },
+            { 0x0502, 2, "0x0502 EEPROM control/status"   },
+        };
+        int answered = 0;
+        for (size_t i = 0; i < sizeof(c)/sizeof(c[0]); i++) {
+            uint8_t b[4]; int wkc = esc_read_range(ctx, c[i].addr, c[i].len, b);
+            if (wkc < 1) { printf("  %-30s UNREADABLE (wkc=%d)\n", c[i].name, wkc);
+                           continue; }
+            answered++;
+            printf("  %-30s 0x", c[i].name);
+            for (int k = c[i].len - 1; k >= 0; k--) printf("%02X", b[k]);
+            if (c[i].addr == 0x0007) {
+                static const char *pm[4] = {"not impl","not cfg","EBUS","MII"};
+                printf("  P0=%s P1=%s P2=%s P3=%s", pm[b[0]&3], pm[(b[0]>>2)&3],
+                       pm[(b[0]>>4)&3], pm[(b[0]>>6)&3]);
+            } else if (c[i].addr == 0x0110) {
+                printf("  PDI-operational(bit0)=%d  EEPROM-loaded", b[0] & 1);
+            } else if (c[i].addr == 0x0502) {
+                uint16_t v = (uint16_t)(b[0] | (b[1] << 8));
+                printf("  checksum-err(bit11)=%d ack/cmd-err(bit13)=%d "
+                       "write-err(bit14)=%d busy(bit15)=%d",
+                       (v>>11)&1, (v>>13)&1, (v>>14)&1, (v>>15)&1);
+            }
+            printf("\n");
+        }
+        printf("\n  Reading of this: if the registers above ANSWER but\n"
+               "  0x0510-0x0517 do not, the slave is present and addressed\n"
+               "  correctly and this ESC simply does not expose MII management\n"
+               "  over EtherCAT. If 0x0007 shows MII ports while 0x0510 is\n"
+               "  unreadable, the PHYs are there but not reachable THIS way —\n"
+               "  a master that can still read them is doing so by another\n"
+               "  route (vendor CoE served by the drive firmware, which has its\n"
+               "  own MDIO to the PHY), not through these ESC registers.\n"
+               "  If 0x0110 bit0 is 0 or 0x0502 shows a checksum error, the SII\n"
+               "  EEPROM did not load and register access may be restricted —\n"
+               "  that is a device-state problem, not a tooling one.\n");
+        if (!answered)
+            printf("\n  NOTHING answered: no slave at position %u, or the frame\n"
+                   "  never reached it. Check the chain position.\n", ctx->position);
         return -1;
     }
-    printf("── MII management arbitration ─────────────────────────────\n");
-    /* Polarity per Beckhoff ESC Sec II v3.3 §2.12.5/§2.12.6:
-     *   0x0516[0]  0 = ECAT permits PDI takeover, 1 = ECAT claims exclusive
-     *   0x0517[0]  0 = ECAT has access,           1 = PDI has access
-     *   0x0517[1]  ECAT-writable: 1 resets 0x0517[0] to 0 */
+
     printf("  0x0516 ECAT access = 0x%02X -> %s\n", ea,
-           (ea & 1) ? "ECAT claims EXCLUSIVE access"
-                    : "ECAT permits PDI takeover");
+           (ea & 1) ? "ECAT claims EXCLUSIVE access" : "ECAT permits PDI takeover");
     printf("  0x0517 PDI  access = 0x%02X -> %s\n", pa,
            (pa & 1) ? "*** PDI HAS ACCESS ***" : "ECAT has access");
     decode_mii_status(ctrl);
