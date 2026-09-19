@@ -21,10 +21,11 @@ independent origin inferences across five runs all land on an EVE-NET; no
 EVS-XCR, EVS-NET or third-party slave has ever been the origin of a step
 increase in the error gradient.
 
-The emission rate is **not a fixed property of the device**. It scales with the
-number of slaves *downstream* of the EVE-NET, from zero (nothing downstream) to
-~1/s (eight devices downstream). This is the mechanism behind the field
-observation that the fault is "much more apparent with a long chain".
+The emission rate is **not a fixed property of the device**: the same module has
+measured 0/s, 0.011/s and 0.11/s in different chain arrangements. But **no model
+of that variation currently survives the data** — a downstream-depth hypothesis
+was proposed and then falsified by a controlled test (§5). Every rate
+measurement so far is underpowered.
 
 **No link has ever dropped.** Across 8.25 hours of continuous measurement:
 Fast Link Down never fired, every ESC lost-link counter stayed at zero, and the
@@ -58,6 +59,9 @@ From 3,221 damaged frames captured in one run:
 | **prefix loss** | 3,068 (95.2%) | first K bytes missing; ends `…+4 bytes+0x50` | — |
 | **+4, ends `0x55`** | 28 (0.9%) | 1522 bytes | **24 of 28** followed by a prefix-loss frame within 200 µs |
 | **+1, ends `0x00`/`0x01`** | 125 (3.9%) | 1519 bytes | always isolated |
+
+The trailing `0x50` is **not applied by the device that caused the damage** —
+it is the EVS-XCR's bad-frame marking, added in transit (§7.1).
 
 `0x55` is the Ethernet preamble byte. The pairing is not coincidence: at 0.103
 events/s the expected number of chance coincidences within 200 µs across 153
@@ -140,6 +144,14 @@ an inference from slave N−1's counter.
 | **C** 12-slave, 191.9 s | 0–2 XCR, 3 EVE-NET/XCR, 4 XCR, 5 CN, 6 EVS-NET, 7–8 EVE-NET, 9–11 CN | s9,s10=7; s8=0; s7=13; s6=63; s5=66; s4=63; s3=63; s2–s0 **255 sat** | s9,s10,s11 = 7 | **s8 (+13)**, **s7 (+50)**, **s3 (≥192)** |
 | **D** 5-slave truncated | 0–2 XCR, 3 EVE-NET/XCR, 4 XCR | **all zero** | **all zero** | none |
 | **E** 5-slave reordered | 0 XCR, 1 EVE-NET/XCR, 2 XCR, 3 CN, 4 EVS-NET | s0 = 10 **only** | none | **s1 (EVE-NET)** |
+| **F** 5-slave, EVE-NET first | 0 EVE-NET/XCR, 1–2 XCR, 3 CN, 4 EVS-NET | **all zero** | **all zero** | **s0 (EVE-NET)** — see below |
+
+Run F is the strongest single attribution. Every ESC counter in the chain read
+zero, yet the host logged one damaged frame. With the EVE-NET at position 0
+there is no ESC between it and the master, so nothing existed to count the
+frame: it went straight from the EVE-NET's port 0 to the NIC. The origin is
+identified by the *absence* of any intervening counter rather than by a
+gradient.
 
 **Every traced origin is an EVE-NET.** Run E is the cleanest configuration
 built: a single non-zero counter in the entire chain, one origin, one hop, no
@@ -158,26 +170,56 @@ useful sanity check on the port mapping.
 
 ---
 
-## 5. Emission scales with downstream chain depth
+## 5. Rate varies with chain arrangement — mechanism unknown
 
 The same physical EVE-NET module, moved within the chain:
 
-| chain | EVE-NET at | devices downstream | emission rate |
-|---|---|---|---|
-| 5-slave (run D) | pos 3 | **1** | **0** /s |
-| 12-slave (run C) | pos 8 | 3 | ~0.07 /s |
-| 5-slave (run E) | pos 1 | 3 | 0.11 /s |
-| 12-slave (run C) | pos 7 | 4 | ~0.26 /s |
-| 12-slave (run C) | pos 3 | 8 | ≥1.0 /s |
+| run | EVE-NET at | devices downstream | events / 91 s | rate |
+|---|---|---|---|---|
+| D | pos 3 | 1 | 0 | 0 /s |
+| E | pos 1 | 3 | 10 | 0.11 /s |
+| **F** | pos 0 | **4** | **1** | **0.011 /s** |
 
-Five measurements, monotonic, roughly doubling per additional downstream
-device. In run D the module received clean frames and emitted nothing; in run E
-the same module, with three devices downstream, emitted ten.
+**A downstream-depth hypothesis was proposed and then falsified.** Earlier
+readings from the 12-slave run appeared to show emission scaling with the number
+of slaves downstream (~0.07 /s at 3, ~0.26 /s at 4, ≥1.0 /s at 8). Run F was the
+controlled test: four devices downstream, predicted 0.3–0.5 /s, **measured
+0.011 /s** — an order of magnitude the wrong way, and non-monotonic against D
+and E.
 
-This is the single most important unexplained behaviour: **the device's
-emission depends on what is behind it, not in front of it.**
+Two reasons the earlier trend should not have been trusted:
 
----
+1. **Those points came from saturated counters.** In the 12-slave run the ESC
+   counters nearest the master had pegged at 255, so three of the five points
+   were floors, not measurements (§10.2).
+2. **Every measurement is underpowered.** Poisson confidence intervals on the
+   two controlled runs *overlap*:
+
+   ```
+   run F:  1 event  / 90.9 s -> 0.0110/s   95% CI [0.0003, 0.0613]
+   run E: 10 events / 91.0 s -> 0.1099/s   95% CI [0.0527, 0.2021]
+   ```
+
+   One event is not a rate. Even the E-versus-F difference is only marginally
+   supported, and D, E and F cannot be ordered at this power.
+
+**What is established** is only that the rate varies by more than an order of
+magnitude with chain arrangement, and that the variation is not explained by
+downstream device count. What varies alongside position — upstream neighbour,
+which devices sit downstream, cable identity, round-trip time — has not been
+separated.
+
+To settle it, each configuration needs **~20 events at the lowest rate**, i.e.
+**30-minute runs**:
+
+```bash
+for p in 0 1 2 3 4; do sudo ./ecat_escreset -i enp2s0 -p $p --all --yes-write-to-slave; done
+sudo ./ecat_ber -i enp2s0 -s 5 -d 1800 -o posX.csv -F posX
+```
+
+At the high-rate end 30 minutes is ~200 events, close to the 255 ESC ceiling.
+The host-side count is what the rate comparison needs and it does not saturate;
+keep the ESC counters for attribution on short runs.
 
 ## 6. Two device families
 
@@ -230,6 +272,22 @@ gradient chased earlier in the investigation: RX_ER was never the damage, it
 was the marker being regenerated by the XCRs, which is why it appeared near the
 master and vanished mid-chain.
 
+### 7.1 The trailing `0x50` is the same marking
+
+```
+run E  EVE-NET -> one EVS-XCR -> master     10 frames, ALL end 0x50
+run F  EVE-NET -> master directly            1 frame,     ends 0x79
+```
+
+Remove the intervening type-`0x91` device and the trailing `0x50` disappears.
+The marker byte tracked since the start of the investigation is **applied by the
+EVS-XCR when it forwards a frame it has found bad**, not by the device that
+caused the damage — the same story as `RX_ER`.
+
+This is n=1 for the direct case, so it is suggestive rather than settled. It
+makes a sharp prediction: with the EVE-NET last before the master, damaged
+frames should not end in `0x50`.
+
 ---
 
 ## 8. What has been ruled out
@@ -243,6 +301,7 @@ Each of these was a working hypothesis that the data killed.
 | **EEE / LPI wake, or any fixed timing constant** | K is exponentially distributed, not clustered. Events landed 6.3–18.7 s after the nearest idle gap, with the previous frame only 20–134 µs earlier — the wire was saturated. |
 | **Fast Link Down firing** | `FLDS = 0x0000` on all 8,676 probe reads over 8.25 h. Every ESC lost-link counter zero. Host carrier transitions zero. |
 | **Signal integrity at the faulting hop** | `RECR = 0` on both EVE-NET PHYs across 723 probes / 8.25 h, while slaves 0/1/2 recorded thousands. The counter was proven working on that exact PHY by a deliberate shorted-pair test (`RECR = 67`, `FLDS = 0x08`). The PHYs see clean symbols; the damage is downstream of the PHY, inside the device. |
+| **Emission scales with downstream device count** | Run F: four devices downstream, predicted 0.3–0.5 /s, measured 0.011 /s. Non-monotonic against runs D and E. The earlier trend came from saturated counters (§5). |
 | **The custom M400 carrier is required** | Run E's sole emitter is an EVE-NET on **Novanta's own XCR carrier**. The M400 carrier is not necessary for the fault. Whether it makes it worse is still open. |
 
 ---
@@ -319,10 +378,12 @@ At ~1.4 events/s a 90-second run stays comfortably under the ceiling.
 
 ## 11. Open questions
 
-1. **Why does emission depend on downstream depth?** The device receives clean
-   frames (its own counters are zero) and emits damaged ones at a rate set by
-   what is behind it. Accumulated forwarding jitter is the obvious candidate;
-   nothing has tested it.
+1. **What sets the emission rate?** The same module measures 0/s, 0.011/s and
+   0.11/s in different chain arrangements, and the obvious candidate —
+   downstream device count — is falsified (§5). Upstream neighbour, downstream
+   device *types*, cable identity and round-trip time are all still confounded
+   with position. Needs 30-minute runs per configuration before any model is
+   worth proposing.
 2. **What is `0x0E04`?** Behaves like a damage-related counter but the
    magnitudes do not match any known quantity.
 3. **What is the trailing `0x50` byte?** Constant across every damaged frame
