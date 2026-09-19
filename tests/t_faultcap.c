@@ -22,6 +22,19 @@ int main(void)
     /* ── T1: the capture set opens and the pcap header is well formed ───── */
     {
         int f0 = fails;
+        /* The capture directory must be CREATED, not assumed to exist. A
+         * missing directory used to kill the run after the banner printed,
+         * wasting a hardware session. Open into a subdirectory that does
+         * not exist yet. */
+        char sub[600];
+        snprintf(sub, sizeof(sub), "%s/cap", dir);
+        CHECK(faultcap_open("lo", 2, sub) == 0,
+              "faultcap_open must create a missing capture directory");
+        faultcap_close();
+        /* And it must be idempotent: opening the same directory again works. */
+        CHECK(faultcap_open("lo", 2, sub) == 0,
+              "faultcap_open must succeed when the directory already exists");
+        faultcap_close();
         CHECK(faultcap_open("lo", 2, dir) == 0, "faultcap_open failed");
         faultcap_flush();
         char p[512]; snprintf(p, sizeof(p), "%s/frames.pcap", dir);

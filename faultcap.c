@@ -2,6 +2,7 @@
 #include "faultcap.h"
 #include "escmii.h"          /* ESC/MII transport: APRD + APWR              */
 #include "phy_regs.h"        /* phy_id_present(), DP83822 register names    */
+#include <sys/stat.h>       /* mkdir() — the capture directory is created here */
 
 /* ── Rings ─────────────────────────────────────────────────────────────────
  * SPSC, single RX producer and single supervisor consumer, drop-and-count
@@ -49,6 +50,16 @@ int faultcap_open(const char *iface, int num_slaves, const char *dir) {
     (void)iface;
     char p[512];
     g_nslaves = num_slaves;
+    /* Create the capture directory. Without this the tool starts, prints its
+     * banner, then dies on the first fopen() -- which silently costs a whole
+     * run on hardware the operator may have spent minutes setting up. Only one
+     * level is created; a nested path whose parent is missing still fails, but
+     * now with a message naming the directory rather than a file inside it. */
+    if (mkdir(dir, 0755) != 0 && errno != EEXIST) {
+        fprintf(stderr, "faultcap: cannot create directory %s: %s\n",
+                dir, strerror(errno));
+        return -1;
+    }
     snprintf(p, sizeof(p), "%s/frames.pcap", dir);
     g_pcap = fopen(p, "wb");
     if (!g_pcap || pcap_write_header(g_pcap) != 0) {
