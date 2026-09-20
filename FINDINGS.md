@@ -21,17 +21,16 @@ independent origin inferences all land on an EVE-NET; no EVS-XCR, EVS-NET or
 third-party slave has ever been the origin of a step increase in the error
 gradient.
 
-**Three conditions must hold simultaneously** for the fault to appear, each
-established by a controlled negative with 2.4–3.7 million frames of clean
-measurement (§5):
+**One condition is necessary, one is not** (§5):
 
-1. an **EVE-NET** must be in the chain;
-2. its **port 1 must face an EVS-XCR**;
-3. **at least one further device must lie beyond that EVS-XCR**.
-
-Remove any one and the rate falls from ~1×10⁻⁵ per frame to zero. Condition 3
-has no mechanism yet — the devices that enable it sit two or more hops away and
-record nothing themselves.
+1. **An EVE-NET must be in the chain.** Remove it and the rate falls from
+   ~1×10⁻⁵ to **≤7.3×10⁻⁹ per frame** — a 409-million-frame control.
+2. **At least one device must lie beyond the EVE-NET's port-1 partner.**
+   Remove it and the rate falls to ≤1.2×10⁻⁶ over 3.2M frames. No mechanism
+   yet: the enabling devices sit two or more hops away and record nothing.
+3. **An EVS-XCR on port 1 is *not* necessary — it is a ~10× enhancement.**
+   With an EVS-XCR there: ~1.1×10⁻⁵. With a Chinese slave or an EVS-NET:
+   ~1×10⁻⁶. Non-zero either way.
 
 **No link has ever dropped.** Across 8.25 hours of continuous measurement:
 Fast Link Down never fired, every ESC lost-link counter stayed at zero, and the
@@ -176,7 +175,7 @@ useful sanity check on the port mapping.
 
 ---
 
-## 5. Three necessary conditions
+## 5. What the rate depends on
 
 All figures below are per transmitted frame, with exact Poisson 95% intervals,
 measured at the host NIC (which does not saturate). Chains are 5 slaves unless
@@ -199,28 +198,49 @@ zero-versus-nonzero step as solid.
 
 | removes | run | chain | frames | events | 95% CI upper |
 |---|---|---|---|---|---|
-| **the EVE-NET** | allXCR | XCR×4, EVS-NET | 2,441,064 | **0** | 1.51e-06 |
-| **the EVS-XCR on port 1** | Y | XCR, EVE-NET, **CN**, EVS-NET, XCR | 2,441,715 | **0** | 1.23e-06 |
-| " (EVS-NET instead) | Z | XCR, EVE-NET, **EVS-NET**, CN, XCR | 2,438,826 | 1 | 2.29e-06 |
+| **the EVE-NET** | **allXCR+CN long** | XCR×4, EVS-NET, CN×4 | **409,620,857** | **0** | **7.32e-09** |
+| " (5-slave) | allXCR | XCR×4, EVS-NET | 2,441,064 | 0 | 1.51e-06 |
 | **everything beyond port 1's partner** | D (pooled) | XCR×3, EVE-NET, XCR | 3,178,706 | **0** | 1.16e-06 |
 | the port-1 link entirely | A | …EVS-NET, **EVE-NET** last, port 1 open | 2,441,400 | **0** | 1.51e-06 |
 
-Every negative interval sits below every positive interval. No overlap anywhere.
+**The 14-hour control is the strongest result in the campaign.** Nine slaves,
+409,620,857 frames (4.97×10¹² bits), 14.00 h: every counter on every port zero,
+no captured frames, no link events. It differs from the 9-slave positive case by
+**one device only** — an EVS-XCR at position 3 swapped for an EVE-NET — giving a
+separation of at least **1,480×**, with 111× more observation on the negative
+side. It also rules out the EVS-XCRs, the M400 carrier and the rig itself as
+sources, and it satisfies condition 2 (four Chinese slaves beyond the middle),
+so depth alone cannot produce the fault.
 
-**`allXCR` is the key control**: four EVS-XCRs and an M400-carrier EVS-NET
-forwarding 2.4M frames between them produce nothing. The fault is not an
-artefact of the EVS-XCRs, the M400 carrier, or the test rig.
+That run is incidentally the campaign's best clean-chain BER: 4.97×10¹² bits,
+zero errors of any kind, and no carrier transition in 14 continuous hours.
 
-### 5.3 What each condition rules out
+### 5.3 What each variable does
 
-**Condition 2 (port-1 partner) — X/Y/Z.** These three runs hold the EVE-NET at
-position 1, the EVS-XCR on port 0, the chain length, and the downstream *set*
-{XCR, CN, EVS-NET} all constant, reordering only which device sits at position
-2. Rate: EVS-XCR 27, EVS-NET 1, Chinese 0. Note EVS-XCR and EVS-NET are the
-*same ESC* (§6) differing only in carrier, yet differ 27-fold — so this is not
-an ESC-type effect.
+**The port-1 partner is an enhancement, not a requirement.** X/Y/Z hold the
+EVE-NET at position 1, the EVS-XCR on port 0, the chain length and the
+downstream *set* {XCR, CN, EVS-NET} constant, reordering only position 2:
 
-**Condition 3 (something beyond) — D versus 9-slave.** These two chains share
+| port-1 neighbour | run | frames | events | rate | 95% CI |
+|---|---|---|---|---|---|
+| EVS-XCR | X | 2,370,822 | 27 | 1.14e-05 | [7.51e-06, 1.66e-05] |
+| EVS-XCR | 9-slave pooled | 3,688,003 | 40 | 1.09e-05 | [7.75e-06, 1.48e-05] |
+| **Chinese** | **4XCR+EVS+EVE+4CN** | **11,195,038** | **12** | **1.07e-06** | **[5.54e-07, 1.87e-06]** |
+| Chinese | Y | 2,441,715 | 0 | 0 | [0, 1.51e-06] |
+| EVS-NET | Z | 2,438,826 | 1 | 4.10e-07 | [1.04e-08, 2.29e-06] |
+
+An earlier draft called this condition *necessary*, on the strength of Y's zero.
+**That was wrong.** The 11.2M-frame run with a Chinese slave on port 1 measures
+1.07e-06 — a value that sits *inside* Y's confidence interval, so Y never
+contradicted it; Y simply had 4.6× less observation and could not resolve a rate
+that low. Z is consistent with the same value.
+
+The corrected statement: an EVS-XCR on port 1 raises the rate roughly **tenfold**
+over a Chinese slave or an EVS-NET, but the fault occurs at ~1×10⁻⁶ without one.
+Note EVS-XCR and EVS-NET are the *same ESC* (§6) differing only in carrier, yet
+differ tenfold — so this is not an ESC-type effect.
+
+**Condition 2 (something beyond) — D versus 9-slave.** These two chains share
 their first five positions exactly; the EVE-NET's immediate neighbourhood is
 identical (EVS-XCR on both ports). The only change is four Chinese slaves
 appended *beyond* position 4, which record nothing themselves. Pooled:
@@ -235,8 +255,8 @@ downstream) measured 6.3e-07 against a predicted 0.3–0.5/s. Two reasons it
 should not have been trusted — three of its five points came from saturated
 counters (§10.2), and every rate then measured was underpowered.
 
-Condition 3 does resemble that idea, but it is not the same claim: what has been
-demonstrated is a **zero-versus-nonzero step**, not a scaling law. Whether the
+Condition 2 does resemble that idea, but it is not the same claim: what has been
+demonstrated is a **step from below-detection to ~1e-05**, not a scaling law. Whether the
 rate grows with the number of devices beyond the port-1 partner, or saturates at
 the first one, is untested — see §11.
 
@@ -322,6 +342,12 @@ The EVE-NET emits a bad-FCS frame with no RX_ER; the first type-`0x91` device
 downstream detects it and re-transmits with RX_ER asserted. All 26 frames
 trailed `0x50`, consistent with §7.1.
 
+The behaviour belongs to the ESC, not to one product. In the
+`4XCR+EVS+EVE+4CN` chain the EVE-NET sits at position 5 and the first device
+downstream is an **EVS-NET**: slave 4 records `crc=13, rxerr=0`, slave 3 records
+`crc=13, rxerr=13`. The EVS-NET regenerates the marker exactly as an EVS-XCR
+does — as expected, since they are the same ESC.
+
 ---
 
 ## 8. What has been ruled out
@@ -336,7 +362,8 @@ Each of these was a working hypothesis that the data killed.
 | **Fast Link Down firing** | `FLDS = 0x0000` on all 8,676 probe reads over 8.25 h. Every ESC lost-link counter zero. Host carrier transitions zero. |
 | **Signal integrity at the faulting hop** | `RECR = 0` on both EVE-NET PHYs across 723 probes / 8.25 h, while slaves 0/1/2 recorded thousands. The counter was proven working on that exact PHY by a deliberate shorted-pair test (`RECR = 67`, `FLDS = 0x08`). The PHYs see clean symbols; the damage is downstream of the PHY, inside the device. |
 | **Emission scales with downstream device count** | Run F: four devices downstream, predicted 0.3–0.5 /s, measured 0.011 /s. Non-monotonic against runs D and E. The earlier trend came from saturated counters (§5). |
-| **The fault is an artefact of the EVS-XCRs, the M400 carrier, or the rig** | `allXCR`: four EVS-XCRs and an M400-carrier EVS-NET, 2,441,064 frames, every counter zero. An EVE-NET is necessary. |
+| **The fault is an artefact of the EVS-XCRs, the M400 carrier, or the rig** | `allXCR+CN long`: no EVE-NET, 409,620,857 frames over 14 h, every counter on all nine slaves zero. An EVE-NET is necessary. |
+| **An EVS-XCR on port 1 is necessary** | 11.2M frames with a Chinese slave on port 1 measured 1.07e-06 (§5.3). Run Y's zero was a resolution limit, not an absence. |
 | **The custom M400 carrier is required** | Run E's sole emitter is an EVE-NET on **Novanta's own XCR carrier**. The M400 carrier is not necessary for the fault. Whether it makes it worse is still open. |
 
 ---
@@ -413,7 +440,7 @@ At ~1.4 events/s a 90-second run stays comfortably under the ceiling.
 
 ## 11. Open questions
 
-1. **Why must something lie beyond the port-1 partner (condition 3)?** The
+1. **Why must something lie beyond the port-1 partner (condition 2)?** The
    enabling devices are two or more hops away and record nothing. Accumulated
    return-path latency or jitter is the obvious candidate; nothing has tested
    it. The discriminating experiment is an incremental-depth series holding the
@@ -429,10 +456,10 @@ At ~1.4 events/s a 90-second run stays comfortably under the ceiling.
    The 6-slave point is the most informative: a jump straight to ~1e-05 means
    presence, not depth, and the next question is whether any device will do.
    A value in between means cumulative, and points at round-trip time.
-2. **Why an EVS-XCR specifically on port 1 (condition 2)?** EVS-XCR and EVS-NET
-   are the same ESC differing only in carrier, and differ 27-fold. Confounded
-   with unit identity and cable; swap the position-1↔2 cable, then try a second
-   EVS-XCR, to separate them.
+2. **Why does an EVS-XCR on port 1 raise the rate ~10× (§5.3)?** EVS-XCR and
+   EVS-NET are the same ESC differing only in carrier, yet differ tenfold.
+   Confounded with unit identity and cable; swap the position-1↔2 cable, then
+   try a second EVS-XCR, to separate them.
 2. **What is `0x0E04`?** Behaves like a damage-related counter but the
    magnitudes do not match any known quantity.
 3. **What is the trailing `0x50` byte?** Constant across every damaged frame
@@ -458,6 +485,17 @@ Standard configuration — run X/E, the cleanest rig that reproduces the fault
 Use **300 s** runs: at ~1e-05 that is ~25 events, enough for a rate, and well
 under the 255 ESC counter ceiling. Given ~3x run-to-run scatter, only treat a
 zero-versus-nonzero step as solid.
+
+**`-N` counts ESC counter increments, not frames.** Every damaged frame trips a
+counter at each slave it passes on the way back, and two at most of them
+(`invalid` + `rxerr`), so one frame costs roughly `2 x hops-to-master` events.
+Measured: 12 frames with the origin five hops out produced exactly 108 events
+and halted a run set to `-N 100`. Budget `-N` accordingly, or set it high and
+let `-d` end the run.
+
+**Match `-s` to the physical chain.** A mismatch is not fatal but the tool only
+addresses and monitors that many slaves, so the extras become a blind spot and
+`brd_wkc_mismatches` climbs on every frame.
 
 ```bash
 for p in 0 1 2 3 4; do sudo ./ecat_escreset -i enp2s0 -p $p --all --yes-write-to-slave; done
