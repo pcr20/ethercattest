@@ -169,6 +169,36 @@ static inline void sleep_ns(uint64_t ns) {
 
 
 /* ── Shared run-state globals (defined in stats.c) ────────────────────────── */
+/* send() errnos that cannot succeed on retry.
+ *
+ * The TX-never-halts policy (threads.c) is correct for TRANSIENT failures:
+ * EAGAIN/ENOBUFS is ring or qdisc backpressure, and a carrier-down link has
+ * its frames discarded by the driver without ever reaching TxOk, so retrying
+ * means traffic resumes the instant the link returns. Those must not stop the
+ * run.
+ *
+ * It is wrong for PERMANENT failures. Retrying an over-MTU frame or a closed
+ * socket forever produces a run that prints healthy panels for its full
+ * duration and transmits nothing — the worst outcome for an unattended test,
+ * because it is indistinguishable from success until the numbers are read.
+ *
+ * ENETDOWN is deliberately NOT here: an administratively-down interface can be
+ * brought back up, and riding that out is exactly what the never-halt policy
+ * is for. */
+static inline int send_errno_is_permanent(int e) {
+    switch (e) {
+    case EMSGSIZE:  /* frame larger than the interface MTU        */
+    case ENODEV:    /* interface has gone away                    */
+    case EBADF:     /* socket closed underneath us                */
+    case ENXIO:     /* no such device or address                  */
+    case EPERM:     /* blocked by the kernel (filter, LSM, caps)  */
+    case EACCES:    /* permission denied                          */
+        return 1;
+    default:
+        return 0;
+    }
+}
+
 extern volatile sig_atomic_t g_running;
 extern volatile sig_atomic_t g_tx_running;
 extern uint64_t     g_start_ns;

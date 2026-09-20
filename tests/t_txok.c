@@ -78,6 +78,28 @@ int main(void){
     else if(g_rx.max_good_seq!=base+999){printf("T7 FAIL max_good=%lu\n",g_rx.max_good_seq);fails++;}
     else printf("T7 PASS: uint64 across 2^32 exact (max_good_seq=%lu)\n",g_rx.max_good_seq);
 
+    /* T8: send() errno classification. The never-halt policy must keep
+     * riding out transient failures, and must NOT ride out ones that can
+     * never succeed — an unattended run that transmits nothing while printing
+     * healthy panels is the worst failure mode this tool has. */
+    {
+        int f0=fails;
+        const int perm[]  = { EMSGSIZE, ENODEV, EBADF, ENXIO, EPERM, EACCES };
+        const char *pn[]  = {"EMSGSIZE","ENODEV","EBADF","ENXIO","EPERM","EACCES"};
+        const int trans[] = { EAGAIN, EWOULDBLOCK, ENOBUFS, EINTR, ENETDOWN, 0 };
+        const char *tn[]  = {"EAGAIN","EWOULDBLOCK","ENOBUFS","EINTR","ENETDOWN","0"};
+        for(size_t i=0;i<sizeof(perm)/sizeof(perm[0]);i++)
+            if(!send_errno_is_permanent(perm[i])){
+                printf("FAIL: %s must be permanent\n",pn[i]); fails++; }
+        for(size_t i=0;i<sizeof(trans)/sizeof(trans[0]);i++)
+            if(send_errno_is_permanent(trans[i])){
+                printf("FAIL: %s must stay transient (never-halt policy)\n",tn[i]);
+                fails++; }
+        if(fails==f0)
+            printf("T8 PASS: 6 permanent errnos stop the run; EAGAIN/ENOBUFS/"
+                   "ENETDOWN still ridden out\n");
+    }
+
     printf("\n%s\n", fails?"*** FAILURES ***":"ALL TXOK-MODEL TESTS PASS");
     return fails;
 }

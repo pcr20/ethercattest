@@ -121,6 +121,23 @@ void *tx_thread(void *arg) {
              * retry the SAME seq — nothing is lost (the frame was not enqueued). */
             atomic_fetch_add_explicit(&g_stats.tx_backpressure, 1, memory_order_relaxed);
             sleep_ns(10000);   /* 10 microseconds */
+        } else if (send_errno_is_permanent(errno)) {
+            /* Cannot succeed on retry. Stop loudly rather than run to
+             * completion transmitting nothing. */
+            fprintf(stderr,
+                "\n*** FATAL: send() failed permanently: %s (frame_len=%d)\n",
+                strerror(errno), frame_len);
+            if (errno == EMSGSIZE)
+                fprintf(stderr,
+                "    The frame exceeds the interface MTU. Lower -b or raise\n"
+                "    the MTU.\n");
+            fprintf(stderr,
+                "    Retrying cannot succeed; stopping the run. Results are\n"
+                "    INCOMPLETE.\n");
+            g_tx_running = 0;
+            g_running    = 0;
+            break;
+
         } else {
             static _Atomic uint64_t send_errors = 0;
             uint64_t e = atomic_fetch_add_explicit(&send_errors, 1, memory_order_relaxed);
