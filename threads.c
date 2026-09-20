@@ -1,4 +1,5 @@
 #include "threads.h"
+#include "pace.h"
 #include "faultcap.h"
 #include "frame.h"
 #include "crc.h"
@@ -65,8 +66,10 @@ void *tx_thread(void *arg) {
 
     uint8_t  tx_buf[MAX_FRAME];
     uint64_t seq          = 0;
-    uint64_t interval_ns  = (ctx->rate_hz > 0) ? (1000000000ULL / ctx->rate_hz) : 0;
-    uint64_t next_send_ns = now_ns();
+    int      was_paused   = 0;
+    PaceState pace;
+    pace_init(&pace, ctx->rate_hz, now_ns());
+    uint64_t interval_ns = pace.interval_ns;   /* 0 = saturate */
 
     while (g_tx_running) {
         /* External pause (SIGUSR1). Not the §3.5 banned pause: the resume
@@ -75,14 +78,16 @@ void *tx_thread(void *arg) {
          * makes the foreign-TxOk subtraction exact. */
         if (atomic_load_explicit(&g_tx_paused, memory_order_relaxed)) {
             sleep_ns(1000 * 1000);          /* 1 ms */
+            was_paused = 1;
             continue;
         }
+        if (was_paused) { pace_resume(&pace, now_ns()); was_paused = 0; }
         if (interval_ns) {
+            /* Absolute deadline; skips missed cycles rather than bursting to
+             * catch up after a stall (see pace.h). */
             uint64_t now = now_ns();
-            if (now < next_send_ns) {
-                /* Rate-limited mode: sleep the remaining time. */
-                sleep_ns(next_send_ns - now);
-            }
+            uint64_t dl  = pace_deadline(&pace, now);
+            if (dl > now) sleep_until_ns(dl);
         }
 
         /* Issue 2: TX never halts. There is no backlog cap and no credit
@@ -114,7 +119,15 @@ void *tx_thread(void *arg) {
              * TxOk − distinct returns, computed elsewhere. */
             atomic_fetch_add_explicit(&g_stats.frames_enqueued, 1, memory_order_relaxed);
             seq++;
-            if (interval_ns) next_send_ns += interval_ns;
+            if (interval_ns) {
+                pace_on_sent(&pace, now_ns());
+                atomic_store_explicit(&g_stats.tx_cycle_count,  pace.count,  memory_order_relaxed);
+                atomic_store_explicit(&g_stats.tx_cycle_sum_ns, pace.sum_ns, memory_order_relaxed);
+                atomic_store_explicit(&g_stats.tx_cycle_min_ns, pace.min_ns, memory_order_relaxed);
+                atomic_store_explicit(&g_stats.tx_cycle_max_ns, pace.max_ns, memory_order_relaxed);
+                atomic_store_explicit(&g_stats.tx_cycles_late,  pace.late,   memory_order_relaxed);
+                atomic_store_explicit(&g_stats.tx_cycles_missed,pace.missed, memory_order_relaxed);
+            }
 
         } else if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS) {
             /* TX ring/qdisc full = backpressure. Sleep a short bounded time and
@@ -147,7 +160,7 @@ void *tx_thread(void *arg) {
                 if (errno == EMSGSIZE)
                     fprintf(stderr, "  -> frame too large for interface MTU.\n");
             }
-            if (interval_ns) next_send_ns += interval_ns;
+            if (interval_ns) pace.next_send_ns += interval_ns;
         }
     }
 

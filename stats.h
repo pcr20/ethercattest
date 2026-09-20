@@ -83,6 +83,13 @@ typedef struct {
     _Atomic uint64_t frames_lost;      /* TX thread (retire)                   */
     _Atomic uint64_t seq_bad;          /* RX thread                            */
     _Atomic uint64_t tx_backpressure;  /* TX thread — EAGAIN/ENOBUFS retries   */
+    /* TX cycle measurement (-r only; count==0 means "not measured"). */
+    _Atomic uint64_t tx_cycle_count;   /* intervals measured                   */
+    _Atomic uint64_t tx_cycle_sum_ns;  /* -> mean, and the drift check         */
+    _Atomic uint64_t tx_cycle_min_ns;
+    _Atomic uint64_t tx_cycle_max_ns;
+    _Atomic uint64_t tx_cycles_late;   /* interval > 1.5x target               */
+    _Atomic uint64_t tx_cycles_missed; /* deadlines skipped rather than burst  */
     _Atomic uint64_t credit_writeoff_events;/* TX thread — valve fired count    */
     _Atomic uint64_t brd_wkc_mismatches;/* RX thread                           */
     _Atomic uint64_t distinct_returns; /* RX thread — deduped returned seqs     */

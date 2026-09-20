@@ -161,6 +161,16 @@ static inline uint64_t now_ns(void) {
     return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
 }
 
+/* Sleep until an absolute CLOCK_MONOTONIC deadline — the standard cyclic-task
+ * idiom. Unlike a relative nanosleep there is no read-compute-sleep race, so
+ * the wake time does not inherit the cost of deciding to sleep. */
+static inline void sleep_until_ns(uint64_t deadline_ns) {
+    struct timespec ts = { .tv_sec  = deadline_ns / 1000000000ULL,
+                           .tv_nsec = deadline_ns % 1000000000ULL };
+    while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL) == EINTR)
+        ;
+}
+
 static inline void sleep_ns(uint64_t ns) {
     struct timespec ts = { .tv_sec = ns / 1000000000ULL,
                            .tv_nsec = ns % 1000000000ULL };
@@ -202,6 +212,7 @@ static inline int send_errno_is_permanent(int e) {
 extern volatile sig_atomic_t g_running;
 extern volatile sig_atomic_t g_tx_running;
 extern uint64_t     g_start_ns;
+extern double       g_tx_target_us;   /* -r target period in us, for the panel */
 extern int          g_verbose;
 extern int          g_loopback;
 extern int          g_num_slaves;

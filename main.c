@@ -370,6 +370,7 @@ int main(int argc, char *argv[]) {
     ctx.rx_all_on  = rx_all_on;
     ctx.rate_hz    = rate_hz;
     ctx.frame_bytes = frame_bytes;
+    g_tx_target_us = (rate_hz > 0) ? 1000000.0 / (double)rate_hz : 0.0;
     ctx.tx_core    = tx_core;
     ctx.rx_core    = rx_core;
     ctx.errq_core  = errq_core;

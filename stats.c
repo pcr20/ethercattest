@@ -35,6 +35,7 @@ pthread_mutex_t g_linkev_mtx = PTHREAD_MUTEX_INITIALIZER;
 int g_verbose = 0;
 int g_loopback = 0;
 int g_num_slaves = 0;
+double g_tx_target_us = 0.0;
 
 /* Supervisor-side drain: consume all pending events, printing up to *budget
  * of them (decrementing it) and counting the rest into *suppressed. Called
@@ -212,6 +213,24 @@ void print_stats(FILE *csv, uint64_t elapsed_ns) {
                  "on the wire)\n", hdmg);
     }
     printf("  TX backpressure:%lu  (EAGAIN ring-full, normal)\n", backp);
+    {   /* TX cycle — only meaningful with -r. In saturate mode there is no
+         * target period, so count stays 0 and the section is suppressed. */
+        uint64_t cn  = atomic_load_explicit(&g_stats.tx_cycle_count,  memory_order_relaxed);
+        if (cn) {
+            uint64_t sum = atomic_load_explicit(&g_stats.tx_cycle_sum_ns, memory_order_relaxed);
+            uint64_t mn  = atomic_load_explicit(&g_stats.tx_cycle_min_ns, memory_order_relaxed);
+            uint64_t mx  = atomic_load_explicit(&g_stats.tx_cycle_max_ns, memory_order_relaxed);
+            uint64_t lt  = atomic_load_explicit(&g_stats.tx_cycles_late,  memory_order_relaxed);
+            uint64_t ms  = atomic_load_explicit(&g_stats.tx_cycles_missed,memory_order_relaxed);
+            printf("  ── TX cycle ────────────────────────────────────\n");
+            printf("  target %.1f us   mean %.1f   min %.1f   max %.1f\n",
+                   g_tx_target_us, (double)sum / cn / 1000.0,
+                   mn / 1000.0, mx / 1000.0);
+            printf("  late (>1.5x target): %lu   missed cycles: %lu  %s\n",
+                   lt, ms,
+                   (lt || ms) ? "*** cadence not held ***" : "(cadence held)");
+        }
+    }
     printf("  Kernel RX drops:%lu  %s\n", kdrops,
            kdrops ? "*** DRAIN SATURATED — BER INVALID ***" : "(none, drain healthy)");
 
@@ -437,6 +456,15 @@ void print_stats(FILE *csv, uint64_t elapsed_ns) {
                     ? (long)(g_stats.qdisc_real_end >= g_stats.qdisc_real_start
                              ? g_stats.qdisc_real_end - g_stats.qdisc_real_start : 0)
                     : -1L);
+        {   /* count == 0 is the unambiguous "not measured" marker (saturate). */
+            uint64_t cn = atomic_load_explicit(&g_stats.tx_cycle_count, memory_order_relaxed);
+            uint64_t sm = atomic_load_explicit(&g_stats.tx_cycle_sum_ns,memory_order_relaxed);
+            fprintf(csv, ",%lu,%lu,%lu,%lu,%lu,%lu", cn, cn ? sm / cn : 0UL,
+                atomic_load_explicit(&g_stats.tx_cycle_min_ns, memory_order_relaxed),
+                atomic_load_explicit(&g_stats.tx_cycle_max_ns, memory_order_relaxed),
+                atomic_load_explicit(&g_stats.tx_cycles_late,  memory_order_relaxed),
+                atomic_load_explicit(&g_stats.tx_cycles_missed,memory_order_relaxed));
+        }
         for (int s = 0; s < g_num_slaves && s < MAX_SLAVES; s++)
             fprintf(csv, ",%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu"
                          ",%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu"
@@ -469,7 +497,9 @@ void write_csv_header(FILE *csv, int num_slaves) {
                  "link_down_cp,link_up_cp,link_down_nl,link_up_nl,netlink_overflows,"
                  "rx_bad_fcs_computed,rx_bad_fcs_auxdata,rx_truncated,rx_len_errors,"
                  "host_rx_missed,host_rx_dropped,host_rx_fifo,host_rx_errors,"
-                 "host_rx_crc,txok_minus_returns_signed,qdisc_drops_real");
+                 "host_rx_crc,txok_minus_returns_signed,qdisc_drops_real,"
+                 "tx_cycle_count,tx_cycle_mean_ns,tx_cycle_min_ns,"
+                 "tx_cycle_max_ns,tx_cycles_late,tx_cycles_missed");
     for (int s = 0; s < num_slaves; s++)
         fprintf(csv, ",slave%d_p0_crc,slave%d_p1_crc,slave%d_p2_crc,slave%d_p3_crc"
                      ",slave%d_p0_lost,slave%d_p1_lost,slave%d_p2_lost,slave%d_p3_lost"
