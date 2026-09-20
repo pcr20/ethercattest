@@ -115,6 +115,10 @@ static inline uint16_t le16get(const uint8_t *p) {
  * A raw AF_PACKET socket can only send eth_header(14) + payload(<=1500)
  * = 1514 bytes. Sending more returns EMSGSIZE. */
 #define MAX_FRAME            1514
+/* Smallest legal Ethernet frame excluding FCS. A shorter frame is padded by
+ * the NIC, which would make the measured on-wire size disagree with the
+ * length build_frame returns — so -b never goes below this. */
+#define ETH_MIN_FRAME        60
 #define ETH_HDR_LEN          14
 #define ECAT_HDR_LEN         2
 #define ECAT_DG_HDR_LEN      10   /* cmd(1)+idx(1)+addr(4)+len(2)+irq(2) */

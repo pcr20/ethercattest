@@ -8,6 +8,19 @@
 /* Build one test frame into buf (loopback: single NOP; slaves: NOP + BRD +
  * per-slave CRC-APRD + per-slave lost-link-APRD). Returns the frame length.
  * Aborts if the overhead budget ever disagrees with what was written. */
+/* Smallest buflen build_frame can honour for this chain: the datagram chain
+ * plus a payload large enough to hold seq+CRC. Below this, build_frame would
+ * force nop_payload up to PL_HDR_LEN and write past buflen — which its own
+ * self-check catches with abort(). MUST mirror the overhead arithmetic in
+ * build_frame; the unit test pins them together. */
+static inline int frame_min_bytes(int num_slaves, int loopback) {
+    int aprd = loopback ? 0 : num_slaves * (ECAT_DG_OVERHEAD + ESC_DIAG_LEN);
+    int brd  = loopback ? 0 : (ECAT_DG_OVERHEAD + 1);
+    int ov   = ETH_HDR_LEN + ECAT_HDR_LEN + ECAT_DG_OVERHEAD + brd + aprd;
+    int min  = ov + PL_HDR_LEN;
+    return min < ETH_MIN_FRAME ? ETH_MIN_FRAME : min;
+}
+
 int build_frame(uint8_t *buf, int buflen, const uint8_t *src_mac,
                 int num_slaves, uint64_t seq, int loopback);
 

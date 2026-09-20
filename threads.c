@@ -95,7 +95,7 @@ void *tx_thread(void *arg) {
          * low-latency resumption: the instant the link returns, the next send()
          * succeeds and frames flow, because TX never stopped trying. */
 
-        int frame_len = build_frame(tx_buf, sizeof(tx_buf), ctx->src_mac,
+        int frame_len = build_frame(tx_buf, ctx->frame_bytes, ctx->src_mac,
                                     ctx->loopback ? 0 : ctx->num_slaves,
                                     seq, ctx->loopback);
 

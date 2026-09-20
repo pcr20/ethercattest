@@ -33,6 +33,41 @@ int main(void){
             free(buf);
         }
     }
+    /* -b: frame_min_bytes() must agree with build_frame for every chain, and
+     * build_frame must honour a buflen at (and just above) that minimum. One
+     * byte below, build_frame would force the payload up to PL_HDR_LEN and
+     * write past buflen -- which is why main.c rejects it rather than trying. */
+    {
+        int f0=fails;
+        for(int slaves=0;slaves<=8;slaves++){
+            for(int lb=0;lb<=1;lb++){
+                if(lb && slaves) continue;
+                int fmin=frame_min_bytes(slaves,lb);
+                if(fmin<ETH_MIN_FRAME){
+                    printf("FAIL: min %d below Ethernet minimum %d (s=%d lb=%d)\n",
+                           fmin,ETH_MIN_FRAME,slaves,lb); fails++; continue;
+                }
+                for(int b=fmin;b<=fmin+2 && b<=MAX_FRAME;b++){
+                    uint8_t *buf=malloc(MAX_FRAME+64);
+                    memset(buf+b,0xAA,MAX_FRAME+64-b);
+                    int len=build_frame(buf,b,src,lb?0:slaves,1234,lb);
+                    if(len>b){ printf("FAIL: build_frame(buflen=%d) returned %d "
+                                      "(s=%d lb=%d)\n",b,len,slaves,lb); fails++; }
+                    for(int i=b;i<MAX_FRAME+64;i++)
+                        if(buf[i]!=0xAA){ printf("FAIL: wrote past buflen=%d at +%d "
+                                                 "(s=%d lb=%d)\n",b,i-b,slaves,lb);
+                                          fails++; break; }
+                    free(buf);
+                }
+            }
+        }
+        /* The minimum must actually track the slave count, not be a constant. */
+        if(!(frame_min_bytes(9,0) > frame_min_bytes(4,0))){
+            printf("FAIL: minimum does not grow with slave count\n"); fails++; }
+        if(fails==f0) printf("frame_min_bytes agrees with build_frame for 0-8 "
+                             "slaves; -b at the minimum is safe\n");
+    }
+
     printf("\n%s\n",fails?"*** FRAME SIZE FAILURES ***":"ALL FRAME-SIZE TESTS PASS");
     return fails;
 }

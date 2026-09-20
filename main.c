@@ -81,14 +81,16 @@ int main(int argc, char *argv[]) {
     int   num_slaves      = 0;
     long  rate_hz         = 0;      /* 0 = saturate */
     long  duration_s      = 0;      /* 0 = until Ctrl-C */
+    int   frame_bytes     = MAX_FRAME;  /* -b: TX frame size excl FCS        */
 
     int opt;
-    while ((opt = getopt(argc, argv, "i:s:r:d:o:lvN:F:")) != -1) {
+    while ((opt = getopt(argc, argv, "i:s:r:d:o:b:lvN:F:")) != -1) {
         switch (opt) {
         case 'i': iface       = optarg;          break;
         case 's': num_slaves  = atoi(optarg);    break;
         case 'r': rate_hz     = atol(optarg);    break;
         case 'd': duration_s  = atol(optarg);    break;
+        case 'b': frame_bytes = atoi(optarg);    break;
         case 'o': csv_path    = optarg;          break;
         case 'l': g_loopback  = 1;               break;
         case 'N': stop_after_errors = strtoull(optarg, NULL, 10); break;
@@ -97,8 +99,12 @@ int main(int argc, char *argv[]) {
         default:
             fprintf(stderr,
                 "Usage: %s -i <iface> -s <slaves> [-r <hz>] [-d <secs>] "
-                "[-o <csv>] [-l] [-v]\n"
+                "[-o <csv>] [-b <bytes>] [-l] [-v]\n"
                 "       [-F <dir>] [-N <errors>]\n\n"
+                "  -b <bytes>   TX frame size excluding FCS (default 1514).\n"
+                "               Minimum is the datagram chain plus a 12-byte\n"
+                "               payload, so it grows with -s; the error message\n"
+                "               states the minimum for your chain.\n"
                 "  -F <dir>     enable fault capture into <dir>: frames.pcap\n"
                 "               (bytes of every damaged frame that reaches us),\n"
                 "               events.csv (every ESC error-counter change) and\n"
@@ -114,6 +120,24 @@ int main(int argc, char *argv[]) {
     if (!g_loopback && num_slaves <= 0) {
         fprintf(stderr, "Error: -s <slaves> required (or -l for loopback)\n");
         return 1;
+    }
+    {   /* -b validation. Below the minimum, build_frame would force the
+         * payload up to PL_HDR_LEN and write past buflen; it self-checks and
+         * aborts, so reject here with a message that names the number. */
+        int fmin = frame_min_bytes(num_slaves, g_loopback);
+        if (frame_bytes > MAX_FRAME) {
+            fprintf(stderr, "Error: -b %d exceeds MAX_FRAME (%d)\n",
+                    frame_bytes, MAX_FRAME);
+            return 1;
+        }
+        if (frame_bytes < fmin) {
+            fprintf(stderr,
+                "Error: -b %d is below the minimum %d for %d slave(s).\n"
+                "  The datagram chain alone needs %d bytes; the payload must\n"
+                "  hold at least seq+CRC (%d bytes).\n",
+                frame_bytes, fmin, num_slaves, fmin - PL_HDR_LEN, PL_HDR_LEN);
+            return 1;
+        }
     }
     if (num_slaves > MAX_SLAVES) {
         fprintf(stderr, "Error: max %d slaves supported\n", MAX_SLAVES);
@@ -186,6 +210,10 @@ int main(int argc, char *argv[]) {
         printf("Rate:       %ld Hz\n", rate_hz);
     else
         printf("Rate:       saturate\n");
+    printf("Frame size: %d bytes on the wire (%d + 4 B FCS), payload %d B%s\n",
+           frame_bytes + 4, frame_bytes,
+           frame_bytes - (frame_min_bytes(num_slaves, g_loopback) - PL_HDR_LEN),
+           frame_bytes == MAX_FRAME ? "" : "  [-b]");
     if (duration_s > 0)
         printf("Duration:   %ld s\n", duration_s);
     else
@@ -341,6 +369,7 @@ int main(int argc, char *argv[]) {
     ctx.rx_fcs_on  = rx_fcs_on;
     ctx.rx_all_on  = rx_all_on;
     ctx.rate_hz    = rate_hz;
+    ctx.frame_bytes = frame_bytes;
     ctx.tx_core    = tx_core;
     ctx.rx_core    = rx_core;
     ctx.errq_core  = errq_core;

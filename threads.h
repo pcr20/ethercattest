@@ -15,6 +15,7 @@ typedef struct {
     int             rx_fcs_on;    /* rx-fcs enabled: frames carry 4B FCS trailer */
     int             rx_all_on;    /* rx-all enabled: bad-FCS frames delivered   */
     long            rate_hz;      /* 0 = saturate */
+    int             frame_bytes;  /* TX frame size, excl FCS (-b)         */
     int             tx_core;      /* CPU to pin TX thread (-1 = no pin) */
     int             rx_core;      /* CPU to pin RX thread (-1 = no pin) */
     int             errq_core;    /* CPU to pin errqueue thread (-1 = none) */
