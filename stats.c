@@ -91,6 +91,41 @@ const char *esc_rx_error_code_name(uint16_t c) {
     }
 }
 
+/* True when slave s has recorded nothing at all: no counter moved during the
+ * session, no pre-existing power-on history, nothing saturated. Covers every
+ * field the per-slave block would print, so "clean" never hides a line that
+ * had something in it. */
+int esc_slave_clean(int s)
+{
+    if (s < 0 || s >= MAX_SLAVES) return 1;
+    for (int p = 0; p < 4; p++) {
+        if (g_stats.esc_crc[s][p]   || g_stats.esc_lostlnk[s][p] ||
+            g_stats.esc_rxerr[s][p] || g_stats.esc_fwderr[s][p]  ||
+            g_stats.esc_extrx[s][p] || g_stats.esc_rxcode[s][p]) return 0;
+        if (g_stats.esc_base_crc[s][p]   || g_stats.esc_base_rxerr[s][p] ||
+            g_stats.esc_base_fwderr[s][p]|| g_stats.esc_base_lost[s][p]  ||
+            g_stats.esc_base_extrx[s][p] || g_stats.esc_base_rxcode[s][p]) return 0;
+        /* A saturated counter reads back a zero delta forever, so it looks
+         * identical to "no errors" — it must never be collapsed away. */
+        if (g_stats.esc_raw_crc[s][p]   == 0xFF ||
+            g_stats.esc_raw_rxerr[s][p] == 0xFF ||
+            g_stats.esc_raw_fwderr[s][p]== 0xFF) return 0;
+    }
+    if (g_stats.esc_puerr[s]      || g_stats.esc_pdierr[s])      return 0;
+    if (g_stats.esc_base_puerr[s] || g_stats.esc_base_pdierr[s]) return 0;
+    if (g_stats.esc_raw_puerr[s] == 0xFF || g_stats.esc_raw_pdierr[s] == 0xFF) return 0;
+    return 1;
+}
+
+/* True when any slave recorded a lost link this session. */
+int esc_any_lostlink(void)
+{
+    for (int s = 0; s < g_num_slaves && s < MAX_SLAVES; s++)
+        for (int p = 0; p < 4; p++)
+            if (g_stats.esc_lostlnk[s][p]) return 1;
+    return 0;
+}
+
 /* ── Print stats ────────────────────────────────────────────────────────── */
 void print_stats(FILE *csv, uint64_t elapsed_ns) {
     double elapsed_s  = elapsed_ns / 1e9;
@@ -314,9 +349,16 @@ void print_stats(FILE *csv, uint64_t elapsed_ns) {
                txok ? (double)lost / (double)txok : 0.0);
     }
 
-    if (g_verbose && !g_loopback) {
-        printf("  ── Per-slave ESC counters (invalid-frame / lost-link) ──\n");
+    /* The chain's own error counters. Shown by default: on an unattended run
+     * this is the only view of what the ESCs saw, and hiding it behind -v made
+     * a clean chain indistinguishable from an unmeasured one. Slaves with
+     * nothing to report collapse into a single line so 10 slaves do not cost
+     * 60 lines of zeros per refresh; -v still prints every slave in full. */
+    if (!g_loopback) {
+        int clean = 0;
+        printf("  ── Per-slave ESC counters (0x0300-0x0327, read every frame) ──\n");
         for (int s = 0; s < g_num_slaves && s < MAX_SLAVES; s++) {
+            if (!g_verbose && esc_slave_clean(s)) { clean++; continue; }
             printf("  Slave %2d CRC:  P0=%lu P1=%lu P2=%lu P3=%lu\n", s,
                    g_stats.esc_crc[s][0], g_stats.esc_crc[s][1],
                    g_stats.esc_crc[s][2], g_stats.esc_crc[s][3]);
@@ -393,13 +435,18 @@ void print_stats(FILE *csv, uint64_t elapsed_ns) {
                            "           *** stopped counting and the total above is a\n"
                            "           *** FLOOR. Clear with ecat_escreset. ***\n", s);
             }        }
+        if (clean)
+            printf("  %d of %d slave(s) recorded nothing: no invalid frame, RX error,\n"
+                   "     forwarded error, lost link or pre-existing history.%s\n",
+                   clean, g_num_slaves,
+                   clean < g_num_slaves ? "" : "  [-v lists each]");
     }
     /* Distribution of link drops across the chain. Spread roughly evenly ->
      * simply more links, more opportunity. Concentrated toward the far end ->
      * something cumulative. In a chain port 0 faces the master and port 1 the
      * next slave, so the segment between slave N and N+1 shows up as slave N
      * port 1 AND slave N+1 port 0 — two independent witnesses per segment. */
-    if (g_verbose && !g_loopback && g_num_slaves > 1) {
+    if (!g_loopback && g_num_slaves > 1 && (g_verbose || esc_any_lostlink())) {
         uint64_t tot = 0, worst = 0; int worst_s = -1, worst_p = -1;
         for (int s = 0; s < g_num_slaves && s < MAX_SLAVES; s++)
             for (int p = 0; p < 4; p++) {

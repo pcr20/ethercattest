@@ -345,5 +345,8 @@ void write_csv_header(FILE *csv, int num_slaves);
  * these say WHY a port errored (IFG too short, FIFO over/underrun,
  * RX_CLK/TX_CLK out of tolerance, ...). Defined in stats.c. */
 const char *esc_rx_error_code_name(uint16_t c);
+int esc_slave_clean(int s);   /* slave recorded nothing: no counter, no
+                               * pre-existing history, nothing saturated */
+int esc_any_lostlink(void);   /* any slave saw a lost link this session */
 
 #endif /* ECAT_STATS_H */

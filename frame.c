@@ -131,10 +131,22 @@ int build_frame(uint8_t *buf, int buflen,
         buf[pos++] = 0;                   /* 1 byte data */
         buf[pos++] = 0; buf[pos++] = 0;  /* WKC */
 
-        /* Datagrams 2..N+1: APRD per slave, reading 16 bytes at 0x0300 —
-         * registers 0x0300-0x030F (port invalid-frame + RX-error counters).
-         * Lost-link counters live at 0x0310-0x0313 and are NOT covered by
-         * this read; they would need a second APRD set (see parse side). */
+        /* Datagrams 2..N+1: APRD per slave, reading ESC_DIAG_LEN (40) bytes
+         * at 0x0300 — the whole Section II diagnostic block, 0x0300-0x0327:
+         *   0x0300+2y invalid frame counter, port y
+         *   0x0301+2y RX error counter, port y
+         *   0x0308+y  forwarded RX error counter, port y
+         *   0x030C    ECAT processing unit error counter
+         *   0x030D    PDI error counter
+         *   0x0310+y  lost link counter, port y
+         *   0x0314+y  extended RX error counter / RX error code, port y
+         * All of it is read on EVERY frame, so the chain's error counters are
+         * sampled at the full TX rate with no extra traffic and no dependence
+         * on -F (which adds the per-event log, the pcap and the PHY probe, not
+         * the counter reads). These are 8-bit saturating registers: at any
+         * realistic TX rate they cannot roll between reads, but a chain left
+         * uncleared can arrive already at 0xFF — hence the baseline capture
+         * and the saturation warning on the parse side. */
         for (int s = 0; s < num_slaves; s++) {
             int is_last = (s == num_slaves - 1);
             uint16_t aprd_lf = (uint16_t)(ESC_DIAG_LEN | (is_last ? 0 : 0x8000));
