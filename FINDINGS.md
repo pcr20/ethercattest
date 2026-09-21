@@ -32,10 +32,25 @@ gradient.
    With an EVS-XCR there: ~1.1×10⁻⁵. With a Chinese slave or an EVS-NET:
    ~1×10⁻⁶. Non-zero either way.
 
-**No link has ever dropped.** Across 8.25 hours of continuous measurement:
+**The rate is driven by link utilisation, not by frames, bytes or time**
+(§5.5). At 98% utilisation the fault runs at ~1×10⁻⁶ per frame; at 4.7%
+utilisation — same chain, same rig, 22% *more* bytes on the wire — it is
+**≤3.6×10⁻⁸**, a suppression of at least 21× with disjoint confidence
+intervals. Per-frame, per-byte and per-second models are all refuted by many
+orders of magnitude. Utilisation and frame size were varied together, so the
+two are not yet separated (§11).
+
+**No link has ever dropped.** Across 31 hours of measurement in total:
 Fast Link Down never fired, every ESC lost-link counter stayed at zero, and the
 host NIC logged no carrier transitions. The reported field symptom of
 intermittent *link drops* has not been reproduced and may be a different fault.
+
+That negative is sharper than it first appears, because **the EVE-NET is the
+only device in the chain with Fast Link Drop armed** (§6.2) — an aggressive
+10 µs link-drop mechanism, triggered on RX_ER count and energy loss, that TI
+themselves warn is "more exposed to temporary bad link-quality scenarios". It
+is enabled, it is pointed at the signal this fault generates, and it has never
+once fired.
 
 ---
 
@@ -74,8 +89,16 @@ trials is ~0.003; 24 were observed. In a later run **every** 1522-byte frame was
 followed by a truncated frame at the same timestamp, 17 pairs with no
 exceptions.
 
-So classes 1 and 2 are **one disturbance straddling a frame boundary**: the tail
-of frame N runs into the preamble of frame N+1, and frame N+1 loses its head.
+So classes 1 and 2 are **one disturbance spanning a frame boundary**: a frame
+acquires trailing preamble bytes and a nearby frame loses its head.
+
+The one pair for which sequence numbers were recovered (run `4XCR+XCR+EVE+4CN`,
+§5.5) were **six frames apart**, not consecutive — seq 19,587,050 and
+19,587,056, 114 µs apart at 8,105 fps. Every other gap in that run was ≥56,000
+frames, so the clustering is real (P ≈ 2×10⁻⁴ for any of 29 gaps to be ≤6 by
+chance), but the disturbance spans **several frame times**, not a single
+boundary. The "frame N / frame N+1" phrasing of earlier drafts was too
+specific.
 
 ### 2.3 Recovering K
 
@@ -260,7 +283,53 @@ demonstrated is a **step from below-detection to ~1e-05**, not a scaling law. Wh
 rate grows with the number of devices beyond the port-1 partner, or saturates at
 the first one, is untested — see §11.
 
-## 6. Two device families
+### 5.5 The rate depends on link utilisation
+
+Two runs on the **same ten-slave chain**, same rig, same day, differing only in
+how hard the link was driven:
+
+| run | frame | pacing | utilisation | frames | bytes | events | rate |
+|---|---|---|---|---|---|---|---|
+| **A** | 1514 B | saturated | **98.4%** | 26,845,369 | 4.08×10¹⁰ | **30** | 1.118e-06 [7.54e-07, 1.60e-06] |
+| **B** | 600 B | 1 kHz | **4.7%** | 82,472,968 | 4.98×10¹⁰ | **0** | ≤3.63e-08 (95%) |
+
+Chain for both: `XCR×4, EVS-NET, EVE-NET, CN×4`.
+
+Three models, all refuted by run B:
+
+| model | expected in B | P(observe 0) |
+|---|---|---|
+| per-frame, at A's rate | 92.2 | 9.4e-41 |
+| per-byte (a bit-error process) | 36.7 | 1.2e-16 |
+| per-second, at A's rate | 746.2 | ~0 |
+
+The per-byte row is the one that settles it: **run B put 22% more bytes on the
+wire than run A and produced nothing.** This is not a shorter or smaller run
+that failed to accumulate exposure; it is a larger one. The confidence
+intervals do not overlap, giving a suppression of at least **21×**.
+
+Run B is also the campaign's cleanest measurement of any kind: 82,472,968
+frames over 22.91 h with `tx_enqueued = tx_wire = TxOk = frames_rcvd =
+distinct_returns` exactly, zero qdisc drops, zero backpressure, **all 260
+per-slave ESC counter columns zero across 16,467 samples**, and no link event
+on any of the three host witnesses. Cadence held to 4.5×10⁻⁵ (3,728 disturbed
+cycles of 82.47M, mean 1000.03 µs).
+
+**The confound.** Utilisation and frame size were changed together, so which
+one matters is untested. The 2×2 is half-filled:
+
+| | saturated | 1 kHz |
+|---|---|---|
+| **1514 B** | run A — 30 events | untested |
+| **600 B** | **untested — do this one** | run B — 0 events |
+
+`600 B saturated` takes under an hour at ~19,900 fps and decides it. Given K is
+exponential with mean 240 B (§3), frame size seems the less likely driver, but
+that is a prediction, not a result.
+
+---
+
+## 6. Three device families
 
 ESC identity registers separate the modules cleanly:
 
@@ -278,7 +347,23 @@ Type `0x91` devices additionally carry `"EtherCAT"` / `"TB-TR-EV"` ASCII at
 Type `0x90` devices have none of those and half the process RAM.
 
 **The EVS-NET is byte-identical to the EVS-XCR** across every identity
-register — it is the XCR internals without the carrier.
+register — it is the XCR internals without the carrier. Re-confirmed on the
+ten-slave chain: positions 0–3 (EVS-XCR) and position 4 (M400 + EVS-NET) all
+read `91 00 00 00 08 08 10 0f cc 01` across `0x0000-0x0011`, identical in every
+byte.
+
+A **third** family appeared with the third-party slaves, which are not a
+variant of either Novanta type:
+
+```
+pos    device            Type   Rev   Build   RAM    Ports        Features
+6-9    third-party       0xA2   0x00  0x0000  60KB   3 x MII      0x01CC
+```
+
+Type `0xA2` is unfamiliar and not identified here. Their PDI holds the MII
+interface (`0x0517 = 0x01`), so no PHY answers the master and their DP83822
+registers cannot be read without taking the bus away from their firmware — a
+write, not attempted.
 
 `0x030D` (PDI error counter) write returns `wkc=0` on type-`0x90` devices only:
 a reliable one-command family fingerprint.
@@ -294,6 +379,51 @@ Visual inspection of an EVS-XCR shows a single BGA, which is consistent.
 What the registers do establish is that the two module types run **different
 ESC implementations**. Whether that is different silicon, different IP, or
 hard-IP-versus-firmware on the same family, these registers cannot say.
+
+### 6.2 The EVE-NET is the only device with Fast Link Drop armed
+
+DP83822 registers read over ESC MII management, ten-slave chain, both PHYs of
+each device. Decoded against **SNLS505H Table 8-11/8-12/8-23/8-25 and §7.4.11**,
+not from memory:
+
+| register | EVS-XCR (p0-3) | EVS-NET (p4) | **EVE-NET (p5)** | meaning of the difference |
+|---|---|---|---|---|
+| **CR3 0x0B** | 0x1000 | 0x1000 | **0x1009** | **Fast Link Drop ENABLED** |
+| CR2 0x0A bit 1 | 0 | 0 | **1** | odd-nibble TX-error detection **disabled** |
+| CR2 0x0A bit 5 | 0 | 0 | **1** | extended full-duplex ability enabled |
+| RCSR 0x17 bit 6 | 1 | 1 | **0** | RMII recovered-clock async FIFO bypassed |
+| RCSR 0x17 [1:0] | 01 (2-bit, ≤2400 B) | 01 | **00** (14-bit, ≤16800 B) | RX elasticity buffer |
+
+`CR3 = 0x1009` arms two criteria (Table 8-12):
+
+- **bit 3 — RX Error count**: link dropped when **32 RX_ER occur in a 10 µs
+  window**
+- **bit 0 — Signal/Energy Loss**: link dropped when the energy detector
+  indicates loss; *"typical reaction time is 10 µs"*
+
+Every other device in the chain reads `CR3 = 0x1000` — no criterion, FLD off.
+TI's own note on the mode: *"Because this mode enables extremely quick reaction
+time, the mode is more exposed to temporary bad link-quality scenarios."*
+
+**CR3 is firmware-set, and it differs between Novanta product families.** This
+is the sharpest question the register sweep produced for Novanta: *is Fast Link
+Drop armed on the firmware revision running in the field EVS-NET units?* The
+field symptom is link loss; here the EVS-NET has FLD disabled and the EVE-NET
+has it enabled. If the field units are armed, a documented 10 µs link-drop
+mechanism becomes a direct candidate for that symptom (§11).
+
+Two caveats. All four PHYs report **MII mode** (RCSR bit 5 = 0), so the
+RMII-specific rows are configured but probably inactive. And PHYCR bit 5 also
+differs between the families — it is **LED configuration** (Table 8-25) and is
+not relevant; it is recorded here only because an earlier pass flagged it.
+
+The odd-nibble bit is worth a second look. Per Table 8-11, detection *"extends
+TX_EN by one additional TX_CLK cycle and behaves as if TX_ER is asserted during
+that additional cycle"* — the XCRs have it on, the EVE-NET has it off. That is a
+transmit-path difference on the one device that emits damaged frames *without*
+asserting RX_ER (§7.3), so it may explain the **silence**. It does not explain
+the damage: K is an exact integer byte count and the payload PRNG matches
+byte-for-byte, so nothing is nibble-shifted. Hypothesis only.
 
 ---
 
@@ -350,6 +480,37 @@ does — as expected, since they are the same ESC.
 
 ---
 
+### 7.3 Confirmed independently at the PHY layer
+
+Everything above was read from ESC counters over EtherCAT. The DP83822's own
+16-bit receive-error counter (`RECR`, 0x15), read over MDIO during run A's 28
+triggered probes, reproduces it exactly:
+
+| pos | phy | Σ RECR (PHY, MDIO) | ESC `rxerr` (EtherCAT) | device |
+|---|---|---|---|---|
+| 0 | 1 | 29 | 29 | EVS-XCR |
+| 1 | 1 | 29 | 29 | EVS-XCR |
+| 2 | 1 | 29 | 29 | EVS-XCR |
+| 3 | 1 | **30** | **30** | EVS-XCR |
+| 4 | 0, 1 | **0** | 0 | EVS-NET |
+| 5 | 1, 3 | **0** | 0 | **EVE-NET** |
+
+Two independent instruments, two independent transports, agreement to the
+single count — including the 30-versus-29 asymmetry at slave 3.
+
+The decisive row is **position 4, PHY 1** — the receiver facing the EVE-NET.
+`RECR = 0` across all 336 readings, while its ESC recorded 29 invalid frames.
+**The EVE-NET puts damaged frames on the wire without asserting RX_ER.** Slave
+4 receives a short, unmarked, invalid frame; marks it on forwarding; and from
+slave 3 onward every device sees RX_ER at both layers. §7, §7.1 and §7.2 were
+inferred from ESC counters alone; this confirms them at the physical layer.
+
+Both EVE-NET PHYs also read `RECR = 0` on **receive**, consistent with §8: its
+receivers see clean symbols. Whatever goes wrong is on its transmit side or
+inside the device, not at its inputs.
+
+---
+
 ## 8. What has been ruled out
 
 Each of these was a working hypothesis that the data killed.
@@ -359,7 +520,7 @@ Each of these was a working hypothesis that the data killed.
 | **Duplex mismatch** | Controlled A-test with mismatch verified present (PHYSTS bit2 = 0) produced zero loss in 5.37 M frames. |
 | **Frame duplication** | Across 393,971 RX and 393,942 TX frames in a full `ETH_P_ALL` capture, every sequence number appears exactly once. No frame ever returned twice. |
 | **EEE / LPI wake, or any fixed timing constant** | K is exponentially distributed, not clustered. Events landed 6.3–18.7 s after the nearest idle gap, with the previous frame only 20–134 µs earlier — the wire was saturated. |
-| **Fast Link Down firing** | `FLDS = 0x0000` on all 8,676 probe reads over 8.25 h. Every ESC lost-link counter zero. Host carrier transitions zero. |
+| **Fast Link Down firing** | `FLDS = 0x0000` on all 8,676 probe reads over 8.25 h, on all 336 probe reads of run A, and after a **22.9 h / 82.5 M-frame window in which nothing read the register at all** (run B had no `-F`, and FLDS is read-clear — so that zero covers the whole run uninterrupted). Every ESC lost-link counter zero; host carrier transitions zero. Note this negative holds *even though FLD is armed on the EVE-NET* (§6.2). |
 | **Signal integrity at the faulting hop** | `RECR = 0` on both EVE-NET PHYs across 723 probes / 8.25 h, while slaves 0/1/2 recorded thousands. The counter was proven working on that exact PHY by a deliberate shorted-pair test (`RECR = 67`, `FLDS = 0x08`). The PHYs see clean symbols; the damage is downstream of the PHY, inside the device. |
 | **Emission scales with downstream device count** | Run F: four devices downstream, predicted 0.3–0.5 /s, measured 0.011 /s. Non-monotonic against runs D and E. The earlier trend came from saturated counters (§5). |
 | **The fault is an artefact of the EVS-XCRs, the M400 carrier, or the rig** | `allXCR+CN long`: no EVE-NET, 409,620,857 frames over 14 h, every counter on all nine slaves zero. An EVE-NET is necessary. |
@@ -370,31 +531,78 @@ Each of these was a working hypothesis that the data killed.
 
 ## 9. The `0x0E00` vendor register block
 
-Present **only** on type-`0x90` devices, absent on type-`0x91`:
+Present **only** on type-`0x90` devices. A full `0x0E00-0x0FFF` sweep of the
+ten-slave chain confirms it: zero across the whole range on the EVS-XCRs and
+the EVS-NET, and on the third-party slaves only a small signature (`0x0E00 = 1`,
+ASCII `"MPH"` at `0x0E08`). Above `0x0E23` the EVE-NET does not acknowledge the
+read (`wkc = 0`) — a sparse register space, consistent with a firmware-modelled
+ESC rather than a hardware one.
+
+The block is now fully mapped, and **only two registers move**:
 
 ```
-0x0E00 : 32-bit frame counter   <- confirmed
-0x0E04 : 32-bit counter, tracks 0x0E00 exactly under clean traffic
-0x0E08 : 0x00800301
-0x0E10 : 0x0098 / 0x0098
-0x0E18 : 0x20000201
-0x0E1C : 0x000000FF
-0x0E20 : 117,184,368
+0x0E00 : 32-bit LE frame counter, +1 per frame      <- LIVE
+0x0E04 : 32-bit LE counter, +1 per frame            <- LIVE
+0x0E08 : 0x00800301      static
+0x0E0C : 0x00000000      static
+0x0E10 : 0x0098 / 0x0098 static
+0x0E14 : 0x00000000      static
+0x0E18 : 0x20000201      static
+0x0E1C : 0x000000FF      static
+0x0E20 : 117,184,368     static  <- NOT a counter
 ```
 
-`0x0E00` is **confirmed to the single frame**, three times. In one test it
-advanced by 421,595 on all three devices against a run of 421,592 frames plus
-exactly 3 single-frame register reads. In another, increments between dumps
-matched the 6-frame cost of each intervening `ecat_regdump` exactly.
+Two 512-byte dumps of the whole range differ in **one 16-byte row of 32**, and
+only in `0x0E00`/`0x0E04`. `0x0E20` reads **identically to the value recorded
+days and hundreds of millions of frames earlier**: it is frame-counter-shaped
+but frozen, and an earlier draft's suspicion that it might be counting is now
+settled — it is not.
 
-It is 32-bit (will not saturate for months), readable with plain APRD, and
-costs one frame to sample.
+### 9.1 Calibrated on a silent wire
 
-`0x0E04` tracks `0x0E00` one-for-one while nothing goes wrong; the gap grows
-only during damage (one run: +1,416 / +748 / +0 across three devices, ordered
-the same way as the ESC gradient). **Its exact definition is not established** —
-the growth is 20–70× larger than the invalid-frame counts, so it is not simply
-a bad-frame counter.
+Five consecutive single-datagram reads on an **idle** chain — the only frames on
+the wire being the probe's own — give a controlled increment that no run can:
+
+| read | 0x0E00 | 0x0E04 | Δ | offset |
+|---|---|---|---|---|
+| 1 | 122,555,734 | 122,554,948 | — | 786 |
+| 2 | 122,555,735 | 122,554,949 | +1 | 786 |
+| 3 | 122,555,736 | 122,554,950 | +1 | 786 |
+| 4 | 122,555,737 | 122,554,951 | +1 | 786 |
+| 5 | 122,555,738 | 122,554,952 | +1 | 786 |
+
+Both counters advance by exactly the predicted one-frame cost of each
+invocation. Two seconds elapsed between reads and the counters moved by one, so
+they are **frame-driven, not time-driven**. Across four separate tool
+invocations afterwards, every probe frame was accounted for with **zero
+unexplained increments** — including frames addressed to *other* slaves, which
+it counts as they pass.
+
+**`0x0E04` tracks `0x0E00` one-for-one with provably zero damage.** Earlier
+drafts stated this from clean runs; it is now tested against a baseline where
+nothing at all was happening.
+
+### 9.2 The offset is the instrument
+
+`0x0E00 − 0x0E04` was **786** across all seven reads and did not move on an idle
+wire. It is not a drift or a rate mismatch — it is an accumulated count of
+discrete events, frozen when nothing is happening. The natural reading is that
+the two registers sample the same frame stream at two points in the datapath and
+the offset counts frames that entered one and never reached the other. **That is
+a hypothesis; the definition is still unestablished** — the historical growth is
+20–70× larger than the invalid-frame counts, so it is not simply a bad-frame
+counter. (For scale: 786 ÷ 30 damaged frames in run A = 26.2, inside that band,
+but the device's power-on time is unknown so this is a consistency check, not a
+measurement.)
+
+What matters is that it is usable **now, with no code change**: 32-bit,
+non-saturating, readable in one frame, on the origin device, and apparently
+~26× more sensitive than the 8-bit ESC counters. Bracket a run with two reads
+and the change in the offset is the measurement — which is exactly what run B's
+flat zero across every 8-bit counter could not provide.
+
+Headroom to 32-bit wrap from the current value: 4.17×10⁹ frames — 143 h
+saturated, 1,159 h at 1 kHz.
 
 ---
 
@@ -456,18 +664,31 @@ At ~1.4 events/s a 90-second run stays comfortably under the ceiling.
    The 6-slave point is the most informative: a jump straight to ~1e-05 means
    presence, not depth, and the next question is whether any device will do.
    A value in between means cumulative, and points at round-trip time.
-2. **Why does an EVS-XCR on port 1 raise the rate ~10× (§5.3)?** EVS-XCR and
+2. **Is it utilisation or frame size (§5.5)?** The two were changed together.
+   `600 B saturated` fills the missing cell of the 2×2 in under an hour and
+   decides it. If utilisation is the driver, the next question is what about
+   continuous transmission provokes the device — inter-packet gap, sustained
+   PHY activity, or something thermal.
+3. **Why does an EVS-XCR on port 1 raise the rate ~10× (§5.3)?** EVS-XCR and
    EVS-NET are the same ESC differing only in carrier, yet differ tenfold.
    Confounded with unit identity and cable; swap the position-1↔2 cable, then
    try a second EVS-XCR, to separate them.
-2. **What is `0x0E04`?** Behaves like a damage-related counter but the
-   magnitudes do not match any known quantity.
-3. **What is the trailing `0x50` byte?** Constant across every damaged frame
-   ever captured. Presumed part of the bad-frame marking; not confirmed.
-4. **Is the field link-drop symptom the same fault?** This corruption is Poisson
+4. **Is Fast Link Drop armed on the field EVS-NET firmware (§6.2)?** In this
+   chain FLD is enabled only on the EVE-NET, and the field link-loss symptom is
+   reported on EVS-NET units. `CR3` is firmware-set. If the field units are
+   armed, a documented 10 µs link-drop mechanism — which TI warn is "more
+   exposed to temporary bad link-quality scenarios" — becomes a direct
+   candidate for that symptom. One register read answers it.
+5. **What is `0x0E04`?** Behaves like a damage-related counter but the
+   magnitudes do not match any known quantity. Now bracketable per-run (§9.2),
+   so this is answerable rather than merely open.
+6. **What is the trailing `0x50` byte?** Constant across every damaged frame
+   ever captured — including all 28 in the ten-slave run. Presumed part of the
+   bad-frame marking; not confirmed.
+7. **Is the field link-drop symptom the same fault?** This corruption is Poisson
    and has never once dropped a link. The field report describes regular-interval
    link drops. They may be unrelated.
-5. **Does the M400 carrier make it worse?** The fault occurs without it. A
+8. **Does the M400 carrier make it worse?** The fault occurs without it. A
    controlled A/B at matched downstream depth has not been run.
 
 ---
@@ -512,3 +733,30 @@ Read afterwards:
 
 Use 300 s rather than 90 at low event rates: ~30 events gives a comparable rate
 while staying far below the 255 ceiling.
+
+### 12.1 Bracket every run with the read-only instruments
+
+Three registers that the 8-bit ESC counters cannot substitute for. All are
+read-only; run this **before and after** each measurement run:
+
+```bash
+sudo ./ecat_regdump -i enp2s0 -p 5 -r 0x0E00-0x0E07   # frame counter + offset
+sudo ./ecat_phy     -i enp2s0 -p 5 -r 0x0F            # FLDS: did FLD ever fire?
+sudo ./ecat_phy     -i enp2s0 -p 4 -r 0x15            # RECR facing the EVE-NET
+```
+
+Substitute the EVE-NET's chain position for `-p 5` and its upstream neighbour's
+for `-p 4`.
+
+- **`0x0E00 − 0x0E04`** — 32-bit, non-saturating, ~26× more sensitive than the
+  ESC counters (§9.2). The one instrument that can grade a run the 8-bit
+  counters report as flat zero.
+- **`FLDS`** is read-clear, so a reading only covers the interval since it was
+  last read. `-F` probes read it on every trigger; without `-F` nothing does,
+  which is what made run B's zero cover 22.9 h uninterrupted.
+- **`RECR` at the upstream neighbour** should stay at zero while the EVE-NET
+  keeps emitting damage unmarked (§7.3). A non-zero reading there would be new.
+
+Baseline as of the last idle sweep: `0x0E00 = 122,555,744`, offset `786`,
+`FLDS = 0x0000` on both EVE-NET PHYs, `RECR = 0` at position 4, and **all 40
+ESC diagnostic bytes zero on all ten slaves**.
