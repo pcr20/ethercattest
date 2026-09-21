@@ -62,7 +62,8 @@ static void try_realtime(int prio) {
 void *tx_thread(void *arg) {
     ThreadCtx *ctx = (ThreadCtx *)arg;
     pin_to_core(ctx->tx_core);
-    try_realtime(80);
+    if (pace_tx_wants_realtime(ctx->rate_hz))   /* paced only — see pace.h */
+        try_realtime(80);
 
     uint8_t  tx_buf[MAX_FRAME];
     uint64_t seq          = 0;

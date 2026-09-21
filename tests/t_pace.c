@@ -86,7 +86,7 @@ int main(void)
         CHECK(p.missed == 200, "200 ms stall at 1 kHz = 200 missed, got %lu", p.missed);
         CHECK(dl == after + MS,
               "must resync one period ahead (burst guard), got %lu vs %lu",
-              dl, after + MS);
+              (unsigned long)dl, (unsigned long)(after + MS));
         CHECK(dl > after, "resync deadline must be in the FUTURE — a deadline in "
                           "the past is exactly what produces a catch-up burst");
         /* and the gap across the stall must not pollute the interval stats */
@@ -117,6 +117,29 @@ int main(void)
               before, p.count);
         if (fails == f0) printf("T5 PASS: a pause resyncs cleanly — not counted as "
                                 "missed, not measured as an interval\n");
+    }
+
+    /* ── T6: TX runs real-time only when paced ───────────────────────────
+     * In saturate mode a SCHED_FIFO TX thread spins without ever sleeping and
+     * starves lower-priority RT kernel threads on its core (the WiFi IRQ
+     * thread, twice, ending in an rtnl_lock deadlock). The decision must track
+     * the pacer exactly: RT if and only if pace_init actually paces, so the two
+     * can never disagree about which mode we are in. */
+    {
+        int f0 = fails;
+        CHECK(!pace_tx_wants_realtime(0),
+              "saturate (-r 0) must run at normal priority");
+        CHECK(pace_tx_wants_realtime(1000), "-r 1000 must keep SCHED_FIFO");
+        long rates[] = { -5, -1, 0, 1, 10, 500, 1000, 8000, 100000 };
+        for (size_t i = 0; i < sizeof rates / sizeof *rates; i++) {
+            PaceState q; pace_init(&q, rates[i], 0);
+            int paced = q.interval_ns != 0;
+            CHECK(pace_tx_wants_realtime(rates[i]) == paced,
+                  "rate %ld: realtime=%d but pacer paced=%d — must agree",
+                  rates[i], pace_tx_wants_realtime(rates[i]), paced);
+        }
+        if (fails == f0) printf("T6 PASS: TX is real-time iff paced — saturate "
+                                "runs at normal priority\n");
     }
 
     printf("\n%s\n", fails ? "*** PACE FAILURES ***" : "ALL PACE TESTS PASS");

@@ -65,6 +65,26 @@ static inline void pace_on_sent(PaceState *p, uint64_t now) {
 
 /* A pause transmits nothing; the deadline is stale on resume. Resynchronise
  * without counting the paused period as missed cycles — it was deliberate. */
+/* Should the TX thread run SCHED_FIFO? Only when paced.
+ *
+ * Paced (-r): the thread sleeps to each deadline, so real-time priority is
+ * what gets it woken on time, and it cannot starve anything because it is
+ * asleep almost all the time.
+ *
+ * Saturate: the thread offers ~26x what the wire can carry and the qdisc drops
+ * the excess, so priority cannot put one extra frame on the wire — the NIC
+ * ring (256 frames, ~13 ms at 600 B) plus the qdisc backlog covers any
+ * normal-priority scheduling gap. But with small frames send() never returns
+ * EAGAIN, so the thread never sleeps: at SCHED_FIFO 80 it starved every
+ * lower-priority RT kernel thread on its core. Observed twice: the WiFi IRQ
+ * thread (FIFO 50, same core) starved, the rtw88 driver wedged holding a lock,
+ * NetworkManager blocked on it holding rtnl_lock, and our main thread blocked
+ * on rtnl_lock reading NIC stats — uninterruptible, so SIGTERM did nothing. */
+static inline int pace_tx_wants_realtime(long rate_hz)
+{
+    return rate_hz > 0;
+}
+
 static inline void pace_resume(PaceState *p, uint64_t now) {
     if (!p->interval_ns) return;
     p->next_send_ns = now + p->interval_ns;

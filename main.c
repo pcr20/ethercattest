@@ -1,6 +1,7 @@
 #include "ecat_common.h"
 #include "crc.h"
 #include "frame.h"
+#include "pace.h"
 #include "stats.h"
 #include "nic.h"
 #include "threads.h"
@@ -357,6 +358,9 @@ int main(int argc, char *argv[]) {
                tx_core, rx_core, errq_core, ncpu);
     else
         printf("Pinning: disabled (only %ld CPUs online)\n", ncpu);
+    printf("TX priority: %s\n", pace_tx_wants_realtime(rate_hz)
+           ? "SCHED_FIFO 80 (paced: wake-up latency matters)"
+           : "normal (saturate: cannot starve kernel threads on its core)");
 
     ThreadCtx ctx;
     memset(&ctx, 0, sizeof(ctx));
