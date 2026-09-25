@@ -1,0 +1,201 @@
+/* ecat_master frame construction, checked against ground truth.
+ *
+ * tests/twincat_seq.h holds every write TwinCAT issued to bring two Everest
+ * NET drives to OP, extracted datagram by datagram from the capture of
+ * 2026-09-23. A master that writes almost the right bytes is worse than one
+ * that fails loudly, so the test is byte equality against what actually
+ * worked on real hardware — not against our own reading of the spec. */
+#include "crc.c"
+#include "stats.c"
+#include "ecat_master.c"
+#include "twincat_seq.h"
+
+static int fails = 0;
+#define CHECK(c, ...) do { if(!(c)) { printf("FAIL: "); printf(__VA_ARGS__); \
+                                      printf("\n"); fails++; } } while (0)
+
+static const uint8_t MAC[6] = {0xc8,0xf7,0x50,0x50,0xa0,0xff};
+
+/* Pull the datagram fields back out of a frame we built. */
+static int split(const uint8_t *f, int len, uint8_t *cmd, uint16_t *adp,
+                 uint16_t *ado, uint16_t *dlen, const uint8_t **data)
+{
+    *cmd = 0; *adp = 0; *ado = 0; *dlen = 0; *data = NULL;
+    if (len < ETH_HDR_LEN + ECAT_HDR_LEN + ECAT_DG_HDR_LEN) return -1;
+    if (f[12] != 0x88 || f[13] != 0xA4) return -1;
+    int p = ETH_HDR_LEN + ECAT_HDR_LEN;
+    *cmd = f[p]; *adp = le16get(f + p + 2); *ado = le16get(f + p + 4);
+    *dlen = le16get(f + p + 6) & 0x07FF; *data = f + p + ECAT_DG_HDR_LEN;
+    return 0;
+}
+
+static uint8_t cmd_code(const char *s)
+{
+    if (!strcmp(s, "APWR")) return ECAT_CMD_APWR_M;
+    if (!strcmp(s, "FPWR")) return ECAT_CMD_FPWR_M;
+    if (!strcmp(s, "BWR"))  return ECAT_CMD_BWR_M;
+    return 0xFF;
+}
+
+int main(void)
+{
+    crc32c_init();
+
+    /* ── T1: every captured write is reproducible byte for byte ──────────── */
+    {
+        int f0 = fails, checked = 0;
+        uint8_t buf[1600];
+        for (int i = 0; i < TC_STARTUP_N; i++) {
+            const TcStep *s = &tc_startup[i];
+            uint8_t code = cmd_code(s->cmd);
+            CHECK(code != 0xFF, "T1: unknown command %s in fixture", s->cmd);
+            int n = op_build_frame(buf, sizeof buf, MAC, code, 0x11,
+                                   s->adp, s->ado, s->data, s->len);
+            CHECK(n > 0, "T1: step %d (%s 0x%04X len %u) would not build",
+                  i, s->cmd, s->ado, s->len);
+            if (n <= 0) continue;
+            uint8_t c; uint16_t adp, ado, dlen; const uint8_t *d;
+            CHECK(split(buf, n, &c, &adp, &ado, &dlen, &d) == 0,
+                  "T1: step %d produced an unparseable frame", i);
+            CHECK(c == code,     "T1: step %d cmd 0x%02X, want 0x%02X", i, c, code);
+            CHECK(adp == s->adp, "T1: step %d ADP %u, want %u", i, adp, s->adp);
+            CHECK(ado == s->ado, "T1: step %d ADO 0x%04X, want 0x%04X", i, ado, s->ado);
+            CHECK(dlen == s->len,"T1: step %d len %u, want %u", i, dlen, s->len);
+            if (dlen == s->len)
+                CHECK(memcmp(d, s->data, s->len) == 0,
+                      "T1: step %d (%s 0x%04X) payload differs from TwinCAT's",
+                      i, s->cmd, s->ado);
+            checked++;
+        }
+        if (fails == f0)
+            printf("T1 PASS: all %d captured TwinCAT writes reproduced byte for byte\n",
+                   checked);
+    }
+
+    /* ── T2: the CoE mailbox framing matches TwinCAT's ────────────────────
+     * The fixture's 0x1000 writes are complete SDO downloads. Take the index
+     * and payload back out of TwinCAT's own bytes, feed them to our builder,
+     * and the whole mailbox — header, CoE header, command specifier, size
+     * field — must come back identical. Anything we got wrong about the
+     * layout shows up here rather than as a silent abort on the drive. */
+    {
+        int f0 = fails, n_sdo = 0;
+        for (int i = 0; i < TC_STARTUP_N; i++) {
+            const TcStep *s = &tc_startup[i];
+            if (s->ado != REG_MBX_OUT || s->len < 16) continue;
+            uint8_t  cs       = s->data[8];
+            uint16_t index    = (uint16_t)(s->data[9] | (s->data[10] << 8));
+            uint8_t  subindex = s->data[11];
+            uint8_t  counter  = (uint8_t)(s->data[5] >> 4);
+            int      expedited = (cs & 0x02) != 0;
+            /* Expedited: the four "size" bytes ARE the data. Normal: they are
+             * the length, and the payload follows. */
+            uint16_t plen = expedited ? (uint16_t)(4 - ((cs >> 2) & 3))
+                                      : (uint16_t)(s->data[12] | (s->data[13] << 8));
+            const uint8_t *pl = expedited ? s->data + 12 : s->data + 16;
+            CHECK((expedited ? 16 : 16 + plen) == s->len,
+                  "T2: captured SDO 0x%04X: cs 0x%02X, %u payload bytes, "
+                  "%u-byte mailbox", index, cs, plen, s->len);
+            uint8_t mine[128];
+            int n = op_build_sdo_download(mine, sizeof mine, index, subindex,
+                                          pl, plen, counter);
+            CHECK(n == (int)s->len, "T2: SDO 0x%04X built %d bytes, TwinCAT sent %u",
+                  index, n, s->len);
+            if (n == (int)s->len)
+                CHECK(memcmp(mine, s->data, s->len) == 0,
+                      "T2: SDO 0x%04X differs from TwinCAT's mailbox bytes", index);
+            n_sdo++;
+        }
+        CHECK(n_sdo >= 8, "T2: expected at least 8 SDO downloads, found %d", n_sdo);
+        if (fails == f0)
+            printf("T2 PASS: %d CoE mailbox downloads match TwinCAT byte for byte\n"
+                   "         (both forms: expedited 0x33 and normal 0x31, counter advancing)\n",
+                   n_sdo);
+    }
+
+    /* ── T3: the cyclic frame carries process data AND every slave's
+     * diagnostic block, in one frame. That is the whole point: the drives
+     * stay in OP while all 11 slaves are sampled every cycle. ───────────── */
+    {
+        int f0 = fails;
+        uint8_t buf[1600], pd[22];
+        memset(pd, 0xA5, sizeof pd);
+        const int chain = 11;
+        int n = op_build_cyclic(buf, sizeof buf, MAC, 0x20, 0x01000000u,
+                                pd, sizeof pd, chain);
+        CHECK(n > 0, "T3: cyclic frame would not build");
+
+        int p = ETH_HDR_LEN + ECAT_HDR_LEN, seen = 0, more = 1;
+        uint16_t lrw_adp = 0, lrw_ado = 0;
+        while (more && p + ECAT_DG_HDR_LEN <= n) {
+            uint8_t cmd = buf[p], idx = buf[p + 1];
+            uint16_t lf = le16get(buf + p + 6), dl = lf & 0x07FF;
+            more = (lf & 0x8000) != 0;
+            if (seen == 0) {
+                CHECK(cmd == ECAT_CMD_LRW_M, "T3: first datagram must be LRW");
+                CHECK(idx == 0x20, "T3: LRW index %u, want 0x20", idx);
+                CHECK(dl == sizeof pd, "T3: LRW carries %u bytes, want %zu",
+                      dl, sizeof pd);
+                lrw_adp = le16get(buf + p + 2); lrw_ado = le16get(buf + p + 4);
+                CHECK(memcmp(buf + p + ECAT_DG_HDR_LEN, pd, sizeof pd) == 0,
+                      "T3: process data not copied into the LRW");
+            } else {
+                int s = seen - 1;
+                CHECK(cmd == ECAT_CMD_APRD, "T3: datagram %d must be APRD", seen);
+                CHECK(idx == (uint8_t)(0x20 + 1 + s),
+                      "T3: slave %d index %u, want %u — the response could not "
+                      "be demultiplexed", s, idx, (uint8_t)(0x20 + 1 + s));
+                CHECK(le16get(buf + p + 2) == (uint16_t)(-(int16_t)s),
+                      "T3: slave %d ADP wrong for auto-increment", s);
+                CHECK(le16get(buf + p + 4) == ESC_DIAG_BASE,
+                      "T3: slave %d must read 0x0300", s);
+                CHECK(dl == ESC_DIAG_LEN, "T3: slave %d reads %u bytes, want %d",
+                      s, dl, ESC_DIAG_LEN);
+            }
+            p += ECAT_DG_HDR_LEN + dl + 2;
+            seen++;
+        }
+        CHECK(seen == chain + 1, "T3: %d datagrams, want %d (LRW + one per slave)",
+              seen, chain + 1);
+        /* The 32-bit logical address is split across ADP and ADO. */
+        CHECK(((uint32_t)lrw_ado << 16 | lrw_adp) == 0x01000000u,
+              "T3: logical address reassembles to 0x%08X, want 0x01000000",
+              (uint32_t)lrw_ado << 16 | lrw_adp);
+        CHECK(!more, "T3: the last datagram must clear the 'more' bit");
+        if (fails == f0)
+            printf("T3 PASS: one cyclic frame = LRW + %d diagnostic reads, "
+                   "indices demultiplexable\n", chain);
+    }
+
+    /* ── T4: a cyclic frame that cannot fit must be refused, not truncated ─ */
+    {
+        uint8_t small[200];
+        CHECK(op_build_cyclic(small, sizeof small, MAC, 0, 0x01000000u,
+                              NULL, 0, 11) < 0,
+              "T4: an 11-slave cyclic frame must not be built into 200 bytes");
+        CHECK(op_build_cyclic(small, sizeof small, MAC, 0, 0x01000000u,
+                              NULL, 0, OP_MAX_SLAVES + 1) < 0,
+              "T4: a chain longer than OP_MAX_SLAVES must be refused");
+        printf("T4 PASS: oversized cyclic frames are refused, not truncated\n");
+    }
+
+    /* ── T5: AL status codes decode, and an unknown one says so ──────────── */
+    {
+        int f0 = fails;
+        CHECK(strstr(op_al_code_name(0x0016), "mailbox") != NULL,
+              "T5: 0x0016 should name the mailbox configuration");
+        CHECK(strstr(op_al_code_name(0x001B), "watchdog") != NULL,
+              "T5: 0x001B should name the watchdog");
+        CHECK(strstr(op_al_code_name(0xABCD), "unlisted") != NULL,
+              "T5: an unknown code must say it is unlisted, not invent a name");
+        for (unsigned code = 0; code < 0x40; code++)
+            CHECK(op_al_code_name((uint16_t)code) != NULL,
+                  "T5: code 0x%04X returned NULL", code);
+        if (fails == f0)
+            printf("T5 PASS: AL status codes decode; unknown ones are not guessed\n");
+    }
+
+    if (fails) { printf("\n*** OP SEQUENCE FAILURES ***\n"); return 1; }
+    printf("\nALL OP SEQUENCE TESTS PASS\n");
+    return 0;
+}

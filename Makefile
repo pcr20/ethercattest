@@ -6,6 +6,7 @@ LDFLAGS = -flto -lm -lpthread
 OBJS    = crc.o stats.o frame.o nic.o threads.o main.o faultcap.o escreg.o escmii.o
 
 DUMP_OBJS = escreg.o nic.o regdump_main.o
+OP_OBJS   = escreg.o escmii.o nic.o faultcap.o ecat_master.o op_main.o
 # ecat_phy WRITES to the slave (ESC MII management). It links escmii.o; the
 # read-only ecat_regdump deliberately does NOT.
 PHY_OBJS  = escreg.o escmii.o nic.o phy_main.o
@@ -13,7 +14,7 @@ PHY_OBJS  = escreg.o escmii.o nic.o phy_main.o
 # read-only by construction and links neither escmii.o nor this main.
 RESET_OBJS = escreg.o escmii.o nic.o escreset_main.o
 
-all: ecat_ber ecat_regdump ecat_phy ecat_escreset
+all: ecat_ber ecat_regdump ecat_phy ecat_escreset ecat_op
 
 ecat_ber: $(OBJS)
 	$(CC) -o $@ $(OBJS) $(LDFLAGS)
@@ -31,10 +32,13 @@ ecat_phy: $(PHY_OBJS) stats.o crc.o
 ecat_escreset: $(RESET_OBJS) stats.o crc.o
 	$(CC) -o $@ $(RESET_OBJS) stats.o crc.o $(LDFLAGS)
 
+ecat_op: $(OP_OBJS) stats.o crc.o
+	$(CC) -o $@ $(OP_OBJS) stats.o crc.o $(LDFLAGS)
+
 %.o: %.c ecat_common.h crc.h stats.h frame.h nic.h threads.h escreg.h escmii.h phy_regs.h faultcap.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
-TESTS = t_escframe t_miiframe t_physweep t_hostrx t_escclear t_pause t_faultcap t_wirefmt t_framesz t_txok t_crc t_resid3 t_escgate t_plsem t_ring t_pace t_escpanel
+TESTS = t_escframe t_miiframe t_physweep t_hostrx t_escclear t_pause t_faultcap t_wirefmt t_framesz t_txok t_crc t_resid3 t_escgate t_plsem t_ring t_pace t_escpanel t_opseq
 test: $(TESTS:%=tests/%)
 	@for t in $(TESTS); do ./tests/$$t || exit 1; done
 	@echo "ALL TEST SUITES PASS"
@@ -43,6 +47,6 @@ tests/%: tests/%.c crc.c stats.c frame.c nic.c escreg.c escmii.c faultcap.c ecat
 	$(CC) -D_GNU_SOURCE -O2 -Wall -std=c11 -msse4.2 -I. -o $@ $< -lm -lpthread
 
 clean:
-	rm -f ecat_ber ecat_regdump ecat_phy ecat_escreset $(OBJS) $(DUMP_OBJS) $(PHY_OBJS) $(RESET_OBJS) $(TESTS:%=tests/%)
+	rm -f ecat_ber ecat_regdump ecat_phy ecat_escreset ecat_op $(OBJS) $(OP_OBJS) $(DUMP_OBJS) $(PHY_OBJS) $(RESET_OBJS) $(TESTS:%=tests/%)
 
 .PHONY: all test clean
