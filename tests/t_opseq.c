@@ -322,6 +322,72 @@ int main(void)
                    "none) are distinct\n");
     }
 
+    /* ── T9: our cyclic frame is TwinCAT's cyclic frame ───────────────────
+     * The capture's cyclic frame is 77 bytes: LRD over the 1-byte mailbox
+     * state + LRW over 22 bytes of process data + BRD 0x0130. If ours is not
+     * the same size with the same datagrams, the traffic shape we are trying
+     * to reproduce is not reproduced. ──────────────────────────────────── */
+    {
+        int f0 = fails;
+        uint8_t buf[1600], pd[22]; memset(pd, 0, sizeof pd);
+        int n = op_build_cyc_frame(buf, sizeof buf, MAC, 0x40,
+                                   0x09000000u, 0x01000000u, pd, 22, 1);
+        CHECK(n == 77, "T9: cyclic frame is %d bytes, TwinCAT's is 77", n);
+
+        /* And it must match a real captured cyclic frame datagram for
+         * datagram. Walk ours and check the three commands and addresses. */
+        int p = ETH_HDR_LEN + ECAT_HDR_LEN, seen = 0, more = 1;
+        struct { uint8_t cmd; uint32_t log; uint16_t len; } want[3] = {
+            { ECAT_CMD_LRD_M, 0x09000000u, 1  },
+            { ECAT_CMD_LRW_M, 0x01000000u, 22 },
+            { ECAT_CMD_BRD,   0x00000130u, 2  },
+        };
+        while (more && p + ECAT_DG_HDR_LEN <= n && seen < 3) {
+            uint8_t cmd = buf[p];
+            uint32_t a = (uint32_t)le16get(buf + p + 2) |
+                         ((uint32_t)le16get(buf + p + 4) << 16);
+            uint16_t lf = le16get(buf + p + 6), dl = lf & 0x07FF;
+            more = (lf & 0x8000) != 0;
+            CHECK(cmd == want[seen].cmd, "T9: datagram %d is cmd 0x%02X, want 0x%02X",
+                  seen, cmd, want[seen].cmd);
+            CHECK(dl == want[seen].len, "T9: datagram %d is %u bytes, want %u",
+                  seen, dl, want[seen].len);
+            if (seen < 2)
+                CHECK(a == want[seen].log, "T9: datagram %d logical address "
+                      "0x%08X, want 0x%08X", seen, a, want[seen].log);
+            p += ECAT_DG_HDR_LEN + dl + 2;
+            seen++;
+        }
+        CHECK(seen == 3, "T9: %d datagrams, want 3", seen);
+        CHECK(!more, "T9: the last datagram must clear the 'more' bit");
+        if (fails == f0)
+            printf("T9 PASS: cyclic frame is 77 B — LRD(mbx) + LRW(pd) + BRD, "
+                   "same as TwinCAT's\n");
+    }
+
+    /* ── T10: a burst carries the frames it was given, in order ─────────── */
+    {
+        int f0 = fails;
+        OpBurst b; memset(&b, 0, sizeof b);
+        uint8_t f[1600];
+        int n1 = op_build_cyc_frame(f, sizeof f, MAC, 0x10, 0x09000000u,
+                                    0x01000000u, NULL, 22, 1);
+        CHECK(op_burst_add(&b, f, n1, 0x10) == 0, "T10: first frame rejected");
+        int n2 = op_build_diag_frame(f, sizeof f, MAC, 0x20, 11);
+        CHECK(n2 > 0, "T10: diagnostic frame would not build");
+        CHECK(op_burst_add(&b, f, n2, 0x20) == 0, "T10: second frame rejected");
+        CHECK(b.n == 2, "T10: burst holds %d frames, want 2", b.n);
+        CHECK(b.len[0] == 77, "T10: burst kept the wrong length for frame 0");
+        CHECK(b.idx[1] == 0x20, "T10: burst lost the index of frame 1");
+
+        while (b.n < OP_BURST_MAX) op_burst_add(&b, f, n2, 0x30);
+        CHECK(op_burst_add(&b, f, n2, 0x31) == -1,
+              "T10: a full burst must refuse more, not overrun");
+        if (fails == f0)
+            printf("T10 PASS: bursts preserve frames, lengths and indices, and "
+                   "refuse overflow\n");
+    }
+
     if (fails) { printf("\n*** OP SEQUENCE FAILURES ***\n"); return 1; }
     printf("\nALL OP SEQUENCE TESTS PASS\n");
     return 0;

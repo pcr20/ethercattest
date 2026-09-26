@@ -645,3 +645,138 @@ int op_cycle(OpMaster *m, OpCycle *c, uint32_t log_addr)
     m->ctx.timeouts++;
     return -1;
 }
+
+/* ── TwinCAT-shaped traffic ───────────────────────────────────────────────*/
+
+/* Append one datagram. Returns the new write position. */
+static int dg_put(uint8_t *buf, int pos, uint8_t cmd, uint8_t idx,
+                  uint16_t adp, uint16_t ado, const uint8_t *data,
+                  uint16_t len, int more)
+{
+    buf[pos++] = cmd;
+    buf[pos++] = idx;
+    le16put(buf + pos, adp); pos += 2;
+    le16put(buf + pos, ado); pos += 2;
+    le16put(buf + pos, (uint16_t)((len & 0x07FF) | (more ? 0x8000 : 0)));
+    pos += 2;
+    buf[pos++] = 0; buf[pos++] = 0;                    /* IRQ               */
+    if (data && len) memcpy(buf + pos, data, len); else memset(buf + pos, 0, len);
+    pos += len;
+    buf[pos++] = 0; buf[pos++] = 0;                    /* WKC               */
+    return pos;
+}
+
+static int frame_finish(uint8_t *buf, int pos, int buflen)
+{
+    int ecat_len = pos - ETH_HDR_LEN - ECAT_HDR_LEN;
+    le16put(buf + ETH_HDR_LEN, (uint16_t)((ecat_len & 0x07FF) | (0x1 << 12)));
+    if (pos > buflen) { fprintf(stderr, "FATAL: frame overrun\n"); abort(); }
+    return pos < ETH_MIN_FRAME ? ETH_MIN_FRAME : pos;
+}
+
+static int frame_start(uint8_t *buf, int buflen, const uint8_t *src_mac)
+{
+    memset(buf, 0, (size_t)buflen < 128 ? (size_t)buflen : 128);
+    memset(buf, 0xFF, 6);
+    memcpy(buf + 6, src_mac, 6);
+    buf[12] = (ETHERTYPE_ECAT >> 8) & 0xFF;
+    buf[13] =  ETHERTYPE_ECAT       & 0xFF;
+    return ETH_HDR_LEN + ECAT_HDR_LEN;
+}
+
+int op_build_cyc_frame(uint8_t *buf, int buflen, const uint8_t *src_mac,
+                       uint8_t idx_base, uint32_t log_mbx, uint32_t log_pd,
+                       const uint8_t *pd, uint16_t pd_len, int n_mbx_bytes)
+{
+    if (buflen < 128) return -1;
+    memset(buf, 0, 128);
+    int pos = frame_start(buf, buflen, src_mac);
+    /* LRD over the mailbox-state image: one bit per slave, via FMMU 2. */
+    pos = dg_put(buf, pos, ECAT_CMD_LRD_M, idx_base,
+                 (uint16_t)(log_mbx & 0xFFFF), (uint16_t)(log_mbx >> 16),
+                 NULL, (uint16_t)n_mbx_bytes, 1);
+    /* LRW over the process data. */
+    pos = dg_put(buf, pos, ECAT_CMD_LRW_M, (uint8_t)(idx_base + 1),
+                 (uint16_t)(log_pd & 0xFFFF), (uint16_t)(log_pd >> 16),
+                 pd, pd_len, 1);
+    /* BRD of AL status, as TwinCAT does every cycle. */
+    pos = dg_put(buf, pos, ECAT_CMD_BRD, (uint8_t)(idx_base + 2),
+                 0, REG_AL_STATUS, NULL, 2, 0);
+    return frame_finish(buf, pos, buflen);
+}
+
+int op_build_diag_frame(uint8_t *buf, int buflen, const uint8_t *src_mac,
+                        uint8_t idx_base, int chain_len)
+{
+    int need = ETH_HDR_LEN + ECAT_HDR_LEN
+             + chain_len * (ECAT_DG_OVERHEAD + ESC_DIAG_LEN);
+    if (need > buflen || chain_len > OP_MAX_SLAVES) return -1;
+    memset(buf, 0, (size_t)need);
+    int pos = frame_start(buf, buflen, src_mac);
+    for (int i = 0; i < chain_len; i++)
+        pos = dg_put(buf, pos, ECAT_CMD_APRD, (uint8_t)(idx_base + i),
+                     (uint16_t)(-(int16_t)i), ESC_DIAG_BASE, NULL,
+                     ESC_DIAG_LEN, i != chain_len - 1);
+    return frame_finish(buf, pos, buflen);
+}
+
+int op_burst_add(OpBurst *b, const uint8_t *frame, int len, uint8_t idx)
+{
+    if (b->n >= OP_BURST_MAX || len <= 0) return -1;
+    memcpy(b->buf[b->n], frame, (size_t)len);
+    b->len[b->n] = len; b->idx[b->n] = idx; b->n++;
+    return 0;
+}
+
+/* Send the whole burst with nothing between the send() calls, then collect.
+ * Writing them consecutively is the point: the NIC emits them at minimum
+ * inter-packet gap, which is the traffic shape TwinCAT produces and ours
+ * previously never did. */
+int op_burst_run(OpMaster *m, OpBurst *b, uint8_t *diag_out, int chain_len,
+                 uint16_t *diag_wkc, uint16_t *pd_wkc)
+{
+    for (int i = 0; i < b->n; i++) {
+        if (send(m->ctx.sock, b->buf[i], (size_t)b->len[i], 0) < 0) return -1;
+        m->ctx.frames_sent++;
+    }
+    int got = 0;
+    uint8_t rx[2048];
+    uint64_t deadline = now_ns() + (uint64_t)m->ctx.timeout_ms * 1000000ULL;
+    while (got < b->n && now_ns() < deadline) {
+        ssize_t r = recv(m->ctx.sock, rx, sizeof rx, MSG_DONTWAIT);
+        if (r < (ssize_t)(ETH_HDR_LEN + ECAT_HDR_LEN + ECAT_DG_HDR_LEN)) {
+            if (r < 0) { struct timespec ts = {0, 20000}; nanosleep(&ts, NULL); }
+            continue;
+        }
+        if (rx[12] != ((ETHERTYPE_ECAT >> 8) & 0xFF) ||
+            rx[13] !=  (ETHERTYPE_ECAT & 0xFF)) continue;
+        int p = ETH_HDR_LEN + ECAT_HDR_LEN, more = 1;
+        int mine = 0;
+        for (int i = 0; i < b->n; i++) if (rx[p + 1] == b->idx[i]) mine = 1;
+        if (!mine) continue;
+        got++;
+        while (more && p + ECAT_DG_HDR_LEN <= r) {
+            uint8_t cmd = rx[p], idx = rx[p + 1];
+            uint16_t lf = le16get(rx + p + 6), dl = lf & 0x07FF;
+            more = (lf & 0x8000) != 0;
+            if (p + ECAT_DG_HDR_LEN + dl + 2 > r) break;
+            const uint8_t *dat = rx + p + ECAT_DG_HDR_LEN;
+            uint16_t wkc = le16get(dat + dl);
+            if (cmd == ECAT_CMD_LRW_M && pd_wkc) *pd_wkc = wkc;
+            if (cmd == ECAT_CMD_APRD && diag_out && dl >= ESC_DIAG_LEN) {
+                int s = (int)(uint8_t)(idx - b->idx[0]);
+                /* The diagnostic frame indexes slaves from its own base. */
+                for (int i = 0; i < b->n; i++)
+                    if (idx >= b->idx[i] && idx < (uint8_t)(b->idx[i] + chain_len))
+                        s = idx - b->idx[i];
+                if (s >= 0 && s < chain_len) {
+                    memcpy(diag_out + (size_t)s * ESC_DIAG_LEN, dat, ESC_DIAG_LEN);
+                    if (diag_wkc) diag_wkc[s] = wkc;
+                }
+            }
+            p += ECAT_DG_HDR_LEN + dl + 2;
+        }
+        m->ctx.frames_matched++;
+    }
+    return got;
+}

@@ -51,6 +51,7 @@
 #define ECAT_CMD_FPRD_M  0x04
 #define ECAT_CMD_FPWR_M  0x05
 #define ECAT_CMD_BWR_M   0x08
+#define ECAT_CMD_LRD_M   0x0A
 #define ECAT_CMD_LRW_M   0x0C
 
 /* AL states (register 0x0120 control / 0x0130 status, low nibble). */
@@ -203,6 +204,54 @@ typedef struct {
     uint8_t  pd[128];                                  /* process data      */
     uint16_t pd_len;
 } OpCycle;
+
+/* ── TwinCAT-shaped traffic ───────────────────────────────────────────────
+ * Measured from the capture, steady state, 9.8 s clean window:
+ *
+ *   496 cycles/s (2.016 ms), TWO slots per cycle. Each slot is one cyclic
+ *   frame followed by whatever acyclic frames that slot's queue holds, and
+ *   the whole cycle goes out contiguously at minimum inter-packet gap:
+ *
+ *       |<------------- 2.016 ms ------------->|
+ *       [C][a..][C][a..]          idle ...
+ *
+ *   88.7% of bursts are 2 frames, 3.5% are 4, and 5 and 6 occur when several
+ *   acyclic jobs fall due together. Acyclic frames sit BETWEEN the two cyclic
+ *   frames as often as after them, which is why they are scheduled per slot
+ *   rather than appended to the cycle.
+ *
+ * The cyclic frame is LRD (mailbox state) + LRW (process data) + BRD 0x0130,
+ * which for two drives is exactly 77 bytes — the same as TwinCAT's. */
+#define OP_BURST_MAX 8
+
+typedef struct {
+    uint8_t buf[OP_BURST_MAX][1600];
+    int     len[OP_BURST_MAX];
+    uint8_t idx[OP_BURST_MAX];     /* first datagram index, for matching    */
+    int     n;
+} OpBurst;
+
+/* Build TwinCAT's cyclic frame. log_mbx is the logical address of the
+ * mailbox-state image (one bit per slave), log_pd that of the process data.
+ * Returns the frame length. */
+int op_build_cyc_frame(uint8_t *buf, int buflen, const uint8_t *src_mac,
+                       uint8_t idx_base, uint32_t log_mbx, uint32_t log_pd,
+                       const uint8_t *pd, uint16_t pd_len, int n_mbx_bytes);
+
+/* Build the diagnostic frame: one APRD over 0x0300-0x0327 per slave in the
+ * chain, whatever state each is in. Sent as an acyclic frame a few times a
+ * second, exactly as TwinCAT polls its own counters. */
+int op_build_diag_frame(uint8_t *buf, int buflen, const uint8_t *src_mac,
+                        uint8_t idx_base, int chain_len);
+
+/* Add a built frame to a burst. Returns 0, or -1 if the burst is full. */
+int op_burst_add(OpBurst *b, const uint8_t *frame, int len, uint8_t idx);
+
+/* Send every frame of the burst back to back, then collect the returns.
+ * Frames go out with no gap beyond the minimum the NIC inserts, which is the
+ * property being reproduced. Returns the number of frames that came back. */
+int op_burst_run(OpMaster *m, OpBurst *b, uint8_t *diag_out, int chain_len,
+                 uint16_t *diag_wkc, uint16_t *pd_wkc);
 
 /* Build the cyclic frame. Exposed for tests. Returns the frame length. */
 int op_build_cyclic(uint8_t *buf, int buflen, const uint8_t *src_mac,

@@ -28,10 +28,13 @@ static void usage(const char *p)
 {
     printf("Usage: %s -i <iface> -s <chain> --op <positions> [options]\n"
            "  -i <iface>        interface (required)\n"
-           "  -s <n>            total slaves in the chain, all monitored\n"
+           "  -s <n>            total slaves in the chain; every one has its\n"
+           "                    0x0300-0x0327 block polled ~10 times a second\n"
            "  --op <list>       positions to drive to OP, e.g. --op 5,6\n"
            "                    (always explicit; never inferred)\n"
-           "  -r <hz>           cycle rate, default 500 (2 ms, as TwinCAT)\n"
+           "  -r <hz>           cycle rate, default 496 (2.016 ms, as TwinCAT)\n"
+           "  --burst <n>       pad every cycle to n frames back to back,\n"
+           "                    to test whether burst length drives the fault\n"
            "  -d <sec>          duration, default 3600\n"
            "  -F <dir>          fault capture: PHY probe on a lost link\n"
            "  --observe         reserved. TwinCAT's recovery is not implemented\n"
@@ -92,12 +95,14 @@ static int diff_diag(int s, const uint8_t *d, uint64_t t, uint64_t t0)
 int main(int argc, char **argv)
 {
     const char *iface = NULL, *faultdir = NULL;
-    int chain = 0, rate = 500, dur = 3600, observe = 0, verbose = 0, tmo = 50;
+    int chain = 0, rate = 496, dur = 3600, observe = 0, verbose = 0, tmo = 50;
+    int min_burst = 0;   /* --burst: pad every cycle to this many frames */
     int op_pos[OP_MAX_SLAVES], n_op = 0;
 
     static struct option lo[] = {
         {"op",      required_argument, 0, 1},
         {"observe", no_argument,       0, 2},
+        {"burst",   required_argument, 0, 3},
         {"help",    no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
@@ -118,6 +123,7 @@ int main(int argc, char **argv)
             }
             break; }
         case 2: observe = 1; break;
+        case 3: min_burst = atoi(optarg); break;
         default: usage(argv[0]); return c == 'h' ? 0 : 1;
         }
     }
@@ -142,12 +148,15 @@ int main(int argc, char **argv)
 
     printf("EtherCAT OP driver\n");
     printf("Interface:  %s\n", iface);
-    printf("Chain:      %d slave(s), all monitored every cycle\n", chain);
+    printf("Chain:      %d slave(s), counters polled ~10/s (as TwinCAT does)\n",
+           chain);
     printf("Driven OP:  ");
     for (int i = 0; i < n_op; i++)
         printf("%d%s", op_pos[i], i + 1 < n_op ? "," : "");
     printf("   (station %d..%d)\n", 1001, 1000 + n_op);
-    printf("Cycle:      %d Hz (%.2f ms)\n", rate, 1000.0 / rate);
+    printf("Cycle:      %d Hz (%.3f ms), TwinCAT-shaped bursts\n",
+           rate, 1000.0 / rate);
+    if (min_burst) printf("Burst:      padded to %d frames per cycle\n", min_burst);
     printf("Duration:   %d s\n", dur);
     printf("On a drop:  probe FLDS/RECR, log it, keep watching\n");
     printf("            TwinCAT's recovery (close port, wait 2 s, reopen,\n");
@@ -189,13 +198,30 @@ int main(int argc, char **argv)
 
     printf("\nCyclic exchange running. Ctrl-C to stop.\n\n");
 
-    OpCycle cyc; memset(&cyc, 0, sizeof cyc);
-    cyc.pd_len = (uint16_t)(EVEREST_PD_BYTES * n_op); /* controlword 0: disabled */
+    /* ── The cycle, shaped like TwinCAT's ─────────────────────────────────
+     * Two slots per cycle. Each slot sends one cyclic frame and then any
+     * acyclic frames due in that slot, and the whole cycle goes out with no
+     * gap between send() calls. Job periods are in cycles, chosen to land on
+     * the rates measured in the capture at 496 cycles/s:
+     *
+     *   link status  every   5 cycles ->  99/s   (TwinCAT 101/s)
+     *   diagnostics  every  50 cycles ->  10/s   (TwinCAT 6.7-8.7/s)
+     *   AL status    every 180 cycles -> 2.8/s   (TwinCAT 2.7/s)
+     *
+     * Diagnostics carry the whole 0x0300-0x0327 block for every slave in the
+     * chain, so all 11 stay monitored while the cyclic frame stays the same
+     * 77 bytes TwinCAT sends. */
+    uint8_t pd[128]; memset(pd, 0, sizeof pd);     /* controlword 0 = disabled */
+    uint16_t pd_len = (uint16_t)(EVEREST_PD_BYTES * n_op);
+    int n_mbx_bytes = (n_op + 7) / 8;
+    uint8_t  diag[OP_MAX_SLAVES * ESC_DIAG_LEN];
+    uint16_t diag_wkc[OP_MAX_SLAVES], pd_wkc = 0;
 
     PaceState pace; uint64_t t0 = now_ns();
     pace_init(&pace, rate, t0);
     uint64_t end = t0 + (uint64_t)dur * 1000000000ULL;
-    uint64_t cycles = 0, timeouts = 0, wkc_bad = 0;
+    uint64_t cycles = 0, short_burst = 0, wkc_bad = 0;
+    uint64_t burst_hist[OP_BURST_MAX + 1]; memset(burst_hist, 0, sizeof burst_hist);
     uint16_t wkc_expected = 0xFFFF;
 
     while (g_run && now_ns() < end) {
@@ -203,37 +229,80 @@ int main(int argc, char **argv)
         uint64_t dl  = pace_deadline(&pace, now);
         if (dl > now) sleep_until_ns(dl);
 
-        if (op_cycle(&m, &cyc, m.sl[0].log_addr) != 0) {
-            timeouts++;
-        } else {
-            cycles++;
-            if (wkc_expected == 0xFFFF && cycles > 10) {
-                wkc_expected = cyc.lrw_wkc;         /* learn it, don't assume */
-                printf("  steady-state process-data WKC = %u\n", wkc_expected);
-            } else if (wkc_expected != 0xFFFF && cyc.lrw_wkc != wkc_expected) {
-                wkc_bad++;
-                if (wkc_bad < 20)
-                    printf("  [%8.3f] process-data WKC %u (expected %u) — a slave "
-                           "stopped answering\n", (double)(now_ns() - t0) / 1e9,
-                           cyc.lrw_wkc, wkc_expected);
+        OpBurst burst; memset(&burst, 0, sizeof burst);
+        uint8_t f[1600]; int fl; uint8_t base = m.ctx.idx_seq;
+        int diag_due = (cycles % 50) == 0;
+        memset(diag_wkc, 0, sizeof diag_wkc);
+
+        for (int slot = 0; slot < 2; slot++) {
+            fl = op_build_cyc_frame(f, sizeof f, m.ctx.src_mac, base,
+                                    0x09000000u, m.sl[0].log_addr,
+                                    pd, pd_len, n_mbx_bytes);
+            if (fl > 0) op_burst_add(&burst, f, fl, base);
+            base = (uint8_t)(base + 3);
+
+            /* Slot 0 carries the link-status poll, slot 1 the slower jobs —
+             * the capture shows acyclic work split between the two slots,
+             * not all appended to the end of the cycle. */
+            if (slot == 0 && (cycles % 5) == 0) {
+                fl = op_build_frame(f, sizeof f, m.ctx.src_mac, ECAT_CMD_FPRD_M,
+                                    base, m.sl[0].station, REG_DL_STATUS_P, NULL, 1);
+                if (fl > 0) op_burst_add(&burst, f, fl, base);
+                base++;
             }
+            if (slot == 1 && diag_due) {
+                fl = op_build_diag_frame(f, sizeof f, m.ctx.src_mac, base, chain);
+                if (fl > 0) op_burst_add(&burst, f, fl, base);
+                base = (uint8_t)(base + chain);
+            }
+            if (slot == 1 && (cycles % 180) == 0) {
+                fl = op_build_frame(f, sizeof f, m.ctx.src_mac, ECAT_CMD_FPRD_M,
+                                    base, m.sl[0].station, REG_AL_STATUS, NULL, 2);
+                if (fl > 0) op_burst_add(&burst, f, fl, base);
+                base++;
+            }
+        }
+        /* --burst: pad with further cyclic frames so the cycle is exactly n
+         * frames back to back. The padding is real process data, so the
+         * drives are unaffected; only the wire pattern changes. */
+        while (burst.n < min_burst && burst.n < OP_BURST_MAX) {
+            fl = op_build_cyc_frame(f, sizeof f, m.ctx.src_mac, base,
+                                    0x09000000u, m.sl[0].log_addr,
+                                    pd, pd_len, n_mbx_bytes);
+            if (fl <= 0) break;
+            op_burst_add(&burst, f, fl, base);
+            base = (uint8_t)(base + 3);
+        }
+        m.ctx.idx_seq = base;
+
+        int got = op_burst_run(&m, &burst, diag, chain, diag_wkc, &pd_wkc);
+        cycles++;
+        burst_hist[burst.n <= OP_BURST_MAX ? burst.n : OP_BURST_MAX]++;
+        if (got < burst.n) short_burst++;
+
+        if (wkc_expected == 0xFFFF && cycles > 20 && pd_wkc) {
+            wkc_expected = pd_wkc;
+            printf("  steady-state process-data WKC = %u\n", wkc_expected);
+        } else if (wkc_expected != 0xFFFF && pd_wkc && pd_wkc != wkc_expected) {
+            wkc_bad++;
+            if (wkc_bad < 20)
+                printf("  [%8.3f] process-data WKC %u (expected %u)\n",
+                       (double)(now_ns() - t0) / 1e9, pd_wkc, wkc_expected);
+        }
+
+        if (diag_due) {
             int dropped = 0;
             for (int s = 0; s < chain; s++)
-                if (cyc.diag_wkc[s] >= 1)
-                    dropped |= diff_diag(s, cyc.diag[s], now_ns(), t0);
-
+                if (diag_wkc[s] >= 1)
+                    dropped |= diff_diag(s, diag + (size_t)s * ESC_DIAG_LEN,
+                                         now_ns(), t0);
             if (dropped && faultdir) {
                 faultcap_flush();
                 int np = faultcap_probe(iface, now_ns() - t0);
                 printf("  -> probed %d position(s) for FLDS/RECR\n", np);
             }
-            /* TwinCAT's recovery — close the port, wait for the link, wait a
-             * further second, reopen, re-init — is not reproduced here. It
-             * cannot have caused the FIRST drop, which is the one we are
-             * hunting, and driving it badly would provoke drops of our own.
-             * The banner says so; --observe is reserved for when it exists. */
-            (void)observe;
         }
+        (void)observe;
         pace_on_sent(&pace, now_ns());
     }
 
@@ -244,7 +313,11 @@ int main(int argc, char **argv)
     printf("\n── Summary ────────────────────────────────────────────────\n");
     printf("  Elapsed:        %.1f s\n", secs);
     printf("  Cycles:         %lu  (%.0f Hz achieved)\n", cycles, cycles / secs);
-    printf("  Frame timeouts: %lu\n", timeouts);
+    printf("  Cycles with a frame unreturned: %lu\n", short_burst);
+    printf("  Burst size (frames per cycle):");
+    for (int i = 1; i <= OP_BURST_MAX; i++)
+        if (burst_hist[i]) printf("  %d:%lu", i, burst_hist[i]);
+    printf("\n");
     printf("  WKC mismatches: %lu\n", wkc_bad);
     printf("  Cycle interval: mean %.1f us  min %.1f  max %.1f  late %lu  missed %lu\n",
            pace.count ? (double)pace.sum_ns / pace.count / 1000.0 : 0.0,
