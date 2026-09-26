@@ -9,6 +9,7 @@
 #include "stats.c"
 #include "ecat_master.c"
 #include "twincat_seq.h"
+#include "everest_pdo.h"
 
 static int fails = 0;
 #define CHECK(c, ...) do { if(!(c)) { printf("FAIL: "); printf(__VA_ARGS__); \
@@ -243,6 +244,64 @@ int main(void)
         if (fails == f0)
             printf("T6 PASS: stale, foreign, empty and aborted mailbox responses "
                    "are all rejected\n");
+    }
+
+    /* ── T7: the PDO maps we send ARE the ones TwinCAT sent ───────────────
+     * The first version of these was hand-written from a truncated hex dump.
+     * Four of eight were wrong, the input map totalled 9 bytes against a
+     * SyncManager configured for 11, and the drive refused SAFEOP with AL
+     * code 0x001E. T1 and T2 could not catch it: they feed the capture's own
+     * payload back through the builder, so they check framing, not content.
+     * This checks the content. ──────────────────────────────────────────── */
+    {
+        int f0 = fails, matched = 0;
+        for (int i = 0; i < EVEREST_PDO_N; i++) {
+            const PdoObj *o = &everest_pdo[i];
+            const TcStep *found = NULL;
+            for (int j = 0; j < TC_STARTUP_N; j++) {
+                const TcStep *s = &tc_startup[j];
+                if (s->ado != REG_MBX_OUT || s->len < 16) continue;
+                if ((uint16_t)(s->data[9] | (s->data[10] << 8)) != o->index) continue;
+                found = s; break;
+            }
+            CHECK(found != NULL, "T7: 0x%04X is not in the captured sequence at all",
+                  o->index);
+            if (!found) continue;
+            int expedited = (found->data[8] & 0x02) != 0;
+            uint16_t plen = expedited ? (uint16_t)(4 - ((found->data[8] >> 2) & 3))
+                                      : (uint16_t)(found->data[12] | (found->data[13] << 8));
+            const uint8_t *pl = expedited ? found->data + 12 : found->data + 16;
+            CHECK(o->len == plen, "T7: 0x%04X is %u bytes, TwinCAT sent %u",
+                  o->index, o->len, plen);
+            if (o->len == plen)
+                CHECK(memcmp(o->data, pl, plen) == 0,
+                      "T7: 0x%04X mapping differs from the one the drive accepted",
+                      o->index);
+            matched++;
+        }
+        CHECK(matched == EVEREST_PDO_N, "T7: only %d of %d objects checked",
+              matched, EVEREST_PDO_N);
+
+        /* The maps must add up to the process-data size the SyncManagers and
+         * FMMUs are configured for. This is the arithmetic the drive did when
+         * it rejected SAFEOP. */
+        for (int which = 0; which < 2; which++) {
+            uint16_t want = which ? 0x1A00 : 0x1600;
+            unsigned bits = 0;
+            for (int i = 0; i < EVEREST_PDO_N; i++) {
+                if (everest_pdo[i].index != want) continue;
+                const uint8_t *p = everest_pdo[i].data;
+                unsigned n = (unsigned)(p[0] | (p[1] << 8));
+                for (unsigned e = 0; e < n; e++) bits += p[2 + 4 * e];
+            }
+            CHECK(bits == EVEREST_PD_BYTES * 8u,
+                  "T7: 0x%04X maps %u bits = %u bytes, but the SyncManagers are "
+                  "set to %d bytes — this mismatch is AL code 0x001E",
+                  want, bits, bits / 8, EVEREST_PD_BYTES);
+        }
+        if (fails == f0)
+            printf("T7 PASS: all %d PDO objects match the capture, and both maps "
+                   "total %d bytes\n", matched, EVEREST_PD_BYTES);
     }
 
     if (fails) { printf("\n*** OP SEQUENCE FAILURES ***\n"); return 1; }

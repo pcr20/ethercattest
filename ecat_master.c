@@ -1,6 +1,7 @@
 /* Minimal EtherCAT master. WRITES TO THE SLAVE — see ecat_master.h. */
 #include "ecat_master.h"
 #include "nic.h"
+#include "everest_pdo.h"
 
 #define ETH_MIN_FRAME 60
 
@@ -384,20 +385,9 @@ static int op_sdo_write(OpMaster *m, OpSlave *s, uint16_t index,
     return -1;
 }
 
-/* PDO mapping exactly as captured from TwinCAT. Each entry is a complete-
- * access write: the first two bytes are the number of sub-entries, followed
- * by 32-bit mapping entries of (index<<16 | subindex<<8 | bit length). */
-static const uint8_t map_1a00[] = {0x04,0x00, 0x10,0x00,0x41,0x60, 0x20,0x00,0x64,0x60,
-                                   0x10,0x00,0x77,0x60, 0x08,0x00,0x61,0x60};
-static const uint8_t map_1a01[] = {0x02,0x00, 0x10,0x00,0x41,0x60, 0x20,0x00,0x64,0x60};
-static const uint8_t map_1a02[] = {0x02,0x00, 0x10,0x00,0x41,0x60, 0x20,0x00,0x64,0x60};
-static const uint8_t map_1600[] = {0x04,0x00, 0x10,0x00,0x40,0x60, 0x20,0x00,0x7A,0x60,
-                                   0x10,0x00,0x71,0x60, 0x08,0x00,0x60,0x60};
-static const uint8_t map_1601[] = {0x02,0x00, 0x10,0x00,0x40,0x60, 0x20,0x00,0x7A,0x60};
-static const uint8_t map_1602[] = {0x02,0x00, 0x10,0x00,0x40,0x60, 0x20,0x00,0x7A,0x60};
-static const uint8_t map_1c12[] = {0x01,0x00, 0x00,0x16};
-static const uint8_t map_1c13[] = {0x01,0x00, 0x00,0x1A};
-
+/* The PDO mapping comes from everest_pdo.h, generated from the capture.
+ * It is NOT written out here: the hand-written version was wrong in four of
+ * eight objects and cost a hardware run. */
 int op_bring_up(OpMaster *m, OpSlave *s)
 {
     uint8_t  sm[16], fmmu[16];
@@ -437,17 +427,11 @@ int op_bring_up(OpMaster *m, OpSlave *s)
 
     /* PDO mapping. Order matters: the assignment objects 0x1C12/0x1C13 are
      * written last, after the maps they refer to exist. */
-    struct { uint16_t idx; const uint8_t *d; uint16_t n; } sdo[] = {
-        {0x1A00, map_1a00, sizeof map_1a00}, {0x1A01, map_1a01, sizeof map_1a01},
-        {0x1A02, map_1a02, sizeof map_1a02}, {0x1600, map_1600, sizeof map_1600},
-        {0x1601, map_1601, sizeof map_1601}, {0x1602, map_1602, sizeof map_1602},
-        {0x1C12, map_1c12, sizeof map_1c12}, {0x1C13, map_1c13, sizeof map_1c13},
-    };
-    for (size_t i = 0; i < sizeof sdo / sizeof sdo[0]; i++)
-        if (op_sdo_write(m, s, sdo[i].idx, 0, sdo[i].d, sdo[i].n,
-                         (uint8_t)i) < 0) {
+    for (int i = 0; i < EVEREST_PDO_N; i++)
+        if (op_sdo_write(m, s, everest_pdo[i].index, 0, everest_pdo[i].data,
+                         everest_pdo[i].len, (uint8_t)i) < 0) {
             fprintf(stderr, "  position %d: PDO mapping failed at 0x%04X\n",
-                    s->position, sdo[i].idx);
+                    s->position, everest_pdo[i].index);
             return -1;
         }
 

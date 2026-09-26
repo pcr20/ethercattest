@@ -17,6 +17,7 @@
 #include "faultcap.h"
 #include "pace.h"
 #include "nic.h"
+#include "everest_pdo.h"
 #include <getopt.h>
 #include <signal.h>
 
@@ -134,8 +135,8 @@ int main(int argc, char **argv)
     for (int i = 0; i < n_op; i++) {
         m.sl[i].position = op_pos[i];
         m.sl[i].station  = (uint16_t)(1001 + i);
-        m.sl[i].log_addr = 0x01000000u + (uint32_t)(11 * i);
-        m.sl[i].log_len  = 11;             /* as TwinCAT mapped these drives */
+        m.sl[i].log_addr = 0x01000000u + (uint32_t)(EVEREST_PD_BYTES * i);
+        m.sl[i].log_len  = EVEREST_PD_BYTES;   /* from the captured maps */
         m.sl[i].mbx_bit  = (uint8_t)i;
     }
 
@@ -179,7 +180,7 @@ int main(int argc, char **argv)
     printf("\nCyclic exchange running. Ctrl-C to stop.\n\n");
 
     OpCycle cyc; memset(&cyc, 0, sizeof cyc);
-    cyc.pd_len = (uint16_t)(11 * n_op);     /* controlword stays 0: disabled */
+    cyc.pd_len = (uint16_t)(EVEREST_PD_BYTES * n_op); /* controlword 0: disabled */
 
     PaceState pace; uint64_t t0 = now_ns();
     pace_init(&pace, rate, t0);
