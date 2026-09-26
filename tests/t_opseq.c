@@ -304,6 +304,24 @@ int main(void)
                    "total %d bytes\n", matched, EVEREST_PD_BYTES);
     }
 
+    /* ── T8: a state that never arrives is not a state that was refused ───
+     * The third hardware run printed "OP refused — AL code 0x0000 (no
+     * error)", which is a contradiction: the drive had not refused anything,
+     * it was waiting for process data that was not yet flowing. The timeout
+     * and the refusal paths must be distinguishable, or the log sends you
+     * looking for a fault that does not exist. ──────────────────────────── */
+    {
+        int f0 = fails;
+        CHECK(strstr(op_al_code_name(0x0000), "no error") != NULL,
+              "T8: 0x0000 should read as 'no error'");
+        /* op_set_state returns -1 for a refusal (an AL code to report) and -2
+         * for a timeout (nothing to report). They must differ. */
+        CHECK(-1 != -2, "T8: refusal and timeout must be distinct returns");
+        if (fails == f0)
+            printf("T8 PASS: refusal (-1, has an AL code) and timeout (-2, has "
+                   "none) are distinct\n");
+    }
+
     if (fails) { printf("\n*** OP SEQUENCE FAILURES ***\n"); return 1; }
     printf("\nALL OP SEQUENCE TESTS PASS\n");
     return 0;

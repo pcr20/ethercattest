@@ -290,7 +290,7 @@ int op_set_state(OpMaster *m, OpSlave *s, uint16_t state, int timeout_ms)
                 return -1;
             }
         }
-        if (now_ns() > deadline) return -1;
+        if (now_ns() > deadline) return -2;      /* never arrived          */
         struct timespec ts = {0, 1000000}; nanosleep(&ts, NULL);   /* 1 ms   */
     }
 }
@@ -420,8 +420,9 @@ int op_bring_up(OpMaster *m, OpSlave *s)
       if (op_fpwr(m, s->station, REG_EEP_CFG, &one, 1) < 1) return -1; }
 
     if (op_set_state(m, s, AL_PREOP, 2000) < 0) {
-        fprintf(stderr, "  position %d: PREOP refused — AL code 0x%04X (%s)\n",
-                s->position, s->al_code, op_al_code_name(s->al_code));
+        fprintf(stderr, "  position %d: PREOP failed — AL state 0x%02X, "
+                "code 0x%04X (%s)\n", s->position, s->al_state & 0x0F,
+                s->al_code, op_al_code_name(s->al_code));
         return -1;
     }
 
@@ -454,17 +455,77 @@ int op_bring_up(OpMaster *m, OpSlave *s)
       fmmu[8] = 0x00; fmmu[9] = 0x1C; fmmu[11] = 0x01;   /* inputs from 0x1C00 */
       if (op_fpwr(m, s->station, REG_FMMU0 + 16, fmmu, 16) < 1) return -1; }
 
-    if (op_set_state(m, s, AL_SAFEOP, 2000) < 0) {
+    int r = op_set_state(m, s, AL_SAFEOP, 2000);
+    if (r == -1) {
         fprintf(stderr, "  position %d: SAFEOP refused — AL code 0x%04X (%s)\n",
                 s->position, s->al_code, op_al_code_name(s->al_code));
         return -1;
     }
-    if (op_set_state(m, s, AL_OP, 2000) < 0) {
-        fprintf(stderr, "  position %d: OP refused — AL code 0x%04X (%s)\n",
-                s->position, s->al_code, op_al_code_name(s->al_code));
+    if (r == -2) {
+        fprintf(stderr, "  position %d: SAFEOP timed out, slave stayed in "
+                "state 0x%02X\n", s->position, s->al_state & 0x0F);
         return -1;
     }
-    return 0;
+    return 0;      /* OP needs process data flowing: op_go_operational() */
+}
+
+/* SAFEOP -> OP, with the cyclic exchange running throughout.
+ *
+ * The drive will not leave SAFEOP until it is receiving valid outputs. The
+ * first attempt requested OP with nothing on the wire yet and simply timed
+ * out, reporting an AL code of 0 — no refusal, no error, just a slave that
+ * never moved. TwinCAT never hits this because its cyclic task is already
+ * running when it writes the state. */
+int op_go_operational(OpMaster *m, uint32_t log_addr, uint16_t pd_len,
+                      int timeout_ms)
+{
+    OpCycle c; memset(&c, 0, sizeof c);
+    c.pd_len = pd_len;
+
+    /* Prime the outputs so the drives have seen valid process data before
+     * they are asked to go operational. */
+    for (int i = 0; i < 100; i++) {
+        op_cycle(m, &c, log_addr);
+        struct timespec ts = {0, 2000000}; nanosleep(&ts, NULL);   /* 2 ms  */
+    }
+
+    for (int i = 0; i < m->n_op; i++) {
+        uint16_t req = AL_OP;
+        if (op_fpwr(m, m->sl[i].station, REG_AL_CTRL, &req, 2) < 1) {
+            fprintf(stderr, "  position %d: OP request not accepted\n",
+                    m->sl[i].position);
+            return -1;
+        }
+    }
+
+    uint64_t deadline = now_ns() + (uint64_t)timeout_ms * 1000000ULL;
+    int done = 0;
+    while (now_ns() < deadline) {
+        op_cycle(m, &c, log_addr);          /* keep the outputs alive        */
+        done = 0;
+        for (int i = 0; i < m->n_op; i++) {
+            uint16_t st = 0;
+            if (op_fprd(m, m->sl[i].station, REG_AL_STATUS, &st, 2) >= 1) {
+                m->sl[i].al_state = st;
+                if (st & 0x10) {
+                    uint16_t code = 0;
+                    op_fprd(m, m->sl[i].station, REG_AL_CODE, &code, 2);
+                    m->sl[i].al_code = code;
+                    fprintf(stderr, "  position %d: OP refused — AL code "
+                            "0x%04X (%s)\n", m->sl[i].position, code,
+                            op_al_code_name(code));
+                    return -1;
+                }
+                if ((st & 0x0F) == AL_OP) done++;
+            }
+        }
+        if (done == m->n_op) return 0;
+        struct timespec ts = {0, 2000000}; nanosleep(&ts, NULL);
+    }
+    for (int i = 0; i < m->n_op; i++)
+        fprintf(stderr, "  position %d: still in state 0x%02X after %d ms\n",
+                m->sl[i].position, m->sl[i].al_state & 0x0F, timeout_ms);
+    return -1;
 }
 
 void op_shutdown(OpMaster *m)

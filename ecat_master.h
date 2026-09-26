@@ -153,13 +153,27 @@ int op_bus_reset(OpMaster *m, int chain_len);
  * type-0x90 device. Returns 0 if all pass. */
 int op_check_identity(OpMaster *m);
 
-/* Full bring-up of one slave: station address, mailbox SyncManagers, PDO
- * mapping by SDO, process-data SyncManagers, FMMUs, PREOP -> SAFEOP -> OP.
- * Returns 0 on success; on failure the slave's al_code says why. */
+/* Bring one slave up as far as SAFEOP: station address, mailbox
+ * SyncManagers, PDO mapping by SDO, process-data SyncManagers, FMMUs,
+ * PREOP -> SAFEOP. Returns 0 on success; on failure al_code says why.
+ *
+ * It stops at SAFEOP deliberately. A drive will not enter OP until valid
+ * process data is already arriving, so the last step needs the cyclic
+ * exchange running — see op_go_operational(). */
 int op_bring_up(OpMaster *m, OpSlave *s);
 
-/* Request a state and wait for the slave to report it. Returns 0 on success;
- * on an AL error the code is read into s->al_code. */
+/* Take every configured slave from SAFEOP to OP, cycling throughout.
+ * Primes the outputs with process data first, requests OP, and keeps the
+ * cyclic exchange running while waiting — which is what the drives require
+ * and what TwinCAT does, its cyclic task never having stopped. Returns 0 when
+ * all reach OP. */
+int op_go_operational(OpMaster *m, uint32_t log_addr, uint16_t pd_len,
+                      int timeout_ms);
+
+/* Request a state and wait for the slave to report it. Returns 0 on success,
+ * -1 if the slave signalled an AL error (code in s->al_code), or -2 if it
+ * simply never got there — the two need different messages, because an AL
+ * code of 0 on a timeout means "nothing was refused", not "no error". */
 int op_set_state(OpMaster *m, OpSlave *s, uint16_t state, int timeout_ms);
 
 /* Validate a CoE SDO download response sitting in a mailbox buffer.

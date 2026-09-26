@@ -169,13 +169,23 @@ int main(int argc, char **argv)
         fprintf(stderr, "  bus reset failed\n"); esc_close(&m.ctx); return 1; }
 
     for (int i = 0; i < n_op; i++) {
-        printf("Bringing position %d to OP...\n", m.sl[i].position);
+        printf("Bringing position %d to SAFEOP...\n", m.sl[i].position);
         if (op_bring_up(&m, &m.sl[i]) != 0) {
             fprintf(stderr, "  FAILED — leaving the bus in INIT\n");
             op_shutdown(&m); esc_close(&m.ctx); return 1;
         }
-        printf("  position %d is in OP\n", m.sl[i].position);
+        printf("  position %d is in SAFEOP\n", m.sl[i].position);
     }
+
+    /* OP needs process data already flowing, so this cycles throughout. */
+    printf("Priming process data and requesting OP...\n");
+    if (op_go_operational(&m, m.sl[0].log_addr,
+                          (uint16_t)(EVEREST_PD_BYTES * n_op), 5000) != 0) {
+        fprintf(stderr, "  FAILED — leaving the bus in INIT\n");
+        op_shutdown(&m); esc_close(&m.ctx); return 1;
+    }
+    for (int i = 0; i < n_op; i++)
+        printf("  position %d is in OP\n", m.sl[i].position);
 
     printf("\nCyclic exchange running. Ctrl-C to stop.\n\n");
 
