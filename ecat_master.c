@@ -294,44 +294,93 @@ int op_set_state(OpMaster *m, OpSlave *s, uint16_t state, int timeout_ms)
     }
 }
 
+/* Validate a CoE SDO download response. See ecat_master.h. */
+int op_parse_sdo_response(const uint8_t *mbx, int len, uint16_t expect_index,
+                          uint32_t *abort_out)
+{
+    if (abort_out) *abort_out = 0;
+    if (len < 16) return -2;
+    uint16_t mbx_len = le16get(mbx);
+    if (mbx_len == 0) return -2;                 /* empty buffer            */
+    if ((mbx[5] & 0x0F) != 0x03) return -2;      /* not CoE                 */
+    uint16_t index = (uint16_t)(mbx[9] | (mbx[10] << 8));
+    uint8_t  cs    = mbx[8];
+    if (cs == 0x80) {                            /* SDO abort               */
+        if (abort_out)
+            *abort_out = (uint32_t)mbx[12] | ((uint32_t)mbx[13] << 8) |
+                         ((uint32_t)mbx[14] << 16) | ((uint32_t)mbx[15] << 24);
+        return -1;
+    }
+    /* A download response is command specifier 0x60. Anything else, or an
+     * answer about a different object, is not the confirmation we asked for:
+     * treating a stale buffer as success is how the first version of this
+     * function walked past a full mailbox and wedged the drive. */
+    if (index != expect_index) return -2;
+    if ((cs & 0xE0) != 0x60) return -2;
+    return 0;
+}
+
 /* Write one CoE SDO into the mailbox and wait for the slave to answer.
+ *
  * The payload goes into SM0's buffer at 0x1000; the final byte of the buffer
- * (0x107F) is then written separately, which is what marks the mailbox full —
- * exactly what TwinCAT does, and necessary because the SDO is shorter than
- * the 0x80-byte buffer. */
+ * (0x107F) is then written separately, which is what marks the mailbox full.
+ *
+ * The response MUST be read as the full 0x80-byte buffer. A SyncManager
+ * buffer is only released when the access ends at its last byte, so a short
+ * read leaves the mailbox full, the slave cannot queue its next response, and
+ * it stops acknowledging further requests — which is exactly how the first
+ * version of this failed on hardware at the third object, silently.
+ *
+ * The working counter doubles as the "is there anything there" flag: reading
+ * a buffer that is not full is not acknowledged, so WKC 0 means "not yet"
+ * and needs no guess about SyncManager status bits. */
+#define MBX_BUF_LEN 128
+
 static int op_sdo_write(OpMaster *m, OpSlave *s, uint16_t index,
                         uint8_t subindex, const uint8_t *payload, uint16_t plen,
                         uint8_t counter)
 {
-    uint8_t mbx[128];
+    uint8_t mbx[MBX_BUF_LEN];
     int n = op_build_sdo_download(mbx, (int)sizeof mbx, index, subindex,
                                   payload, plen, counter);
     if (n < 0) return -1;
-    if (op_fpwr(m, s->station, REG_MBX_OUT, mbx, (uint16_t)n) < 1) return -1;
 
+    int wkc = op_fpwr(m, s->station, REG_MBX_OUT, mbx, (uint16_t)n);
+    if (wkc < 1) {
+        fprintf(stderr, "  SDO 0x%04X: mailbox write not accepted (wkc %d) — "
+                "the mailbox is probably still full\n", index, wkc);
+        return -1;
+    }
     uint8_t trigger = 0;
-    if (op_fpwr(m, s->station, REG_MBX_OUT_END, &trigger, 1) < 1) return -1;
+    wkc = op_fpwr(m, s->station, REG_MBX_OUT_END, &trigger, 1);
+    if (wkc < 1) {
+        fprintf(stderr, "  SDO 0x%04X: mailbox trigger not accepted (wkc %d)\n",
+                index, wkc);
+        return -1;
+    }
 
-    /* Read the response. An SDO download response carries command specifier
-     * 0x60; 0x80 is an abort, whose four-byte code says why. */
-    for (int attempt = 0; attempt < 200; attempt++) {
-        uint8_t in[128]; memset(in, 0, sizeof in);
-        int wkc = op_fprd(m, s->station, REG_MBX_IN, in, 32);
-        if (wkc >= 1 && le16get(in) != 0) {
-            uint8_t cs = in[8];
-            if (cs == 0x60) return 0;
-            if (cs == 0x80) {
-                uint32_t abort = (uint32_t)in[12] | ((uint32_t)in[13] << 8) |
-                                 ((uint32_t)in[14] << 16) | ((uint32_t)in[15] << 24);
-                fprintf(stderr, "  SDO 0x%04X:%u ABORTED, code 0x%08X\n",
-                        index, subindex, abort);
+    for (int attempt = 0; attempt < 400; attempt++) {
+        uint8_t in[MBX_BUF_LEN];
+        memset(in, 0, sizeof in);
+        /* Full-buffer read: releases the buffer AND tells us, via the WKC,
+         * whether there was anything in it. */
+        int rwkc = op_fprd(m, s->station, REG_MBX_IN, in, MBX_BUF_LEN);
+        if (rwkc >= 1) {
+            uint32_t abort_code = 0;
+            int r = op_parse_sdo_response(in, MBX_BUF_LEN, index, &abort_code);
+            if (r == 0) return 0;
+            if (r == -1) {
+                fprintf(stderr, "  SDO 0x%04X:%u ABORTED by the drive, "
+                        "code 0x%08X\n", index, subindex, abort_code);
                 return -1;
             }
-            return 0;   /* answered with something else; treat as accepted   */
+            /* Something else was in the buffer. It is now released, so keep
+             * waiting for our own answer rather than calling this a success. */
         }
         struct timespec ts = {0, 500000}; nanosleep(&ts, NULL);   /* 0.5 ms  */
     }
-    fprintf(stderr, "  SDO 0x%04X:%u — no mailbox response\n", index, subindex);
+    fprintf(stderr, "  SDO 0x%04X:%u — no mailbox response in 200 ms\n",
+            index, subindex);
     return -1;
 }
 

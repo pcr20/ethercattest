@@ -195,6 +195,56 @@ int main(void)
             printf("T5 PASS: AL status codes decode; unknown ones are not guessed\n");
     }
 
+    /* ── T6: a stale or foreign mailbox response must not count as success
+     * On hardware the first version read only 32 of the mailbox's 128 bytes,
+     * so the buffer was never released; the slave could not queue its next
+     * answer and stopped acknowledging requests. The short read was invisible
+     * because ANY non-empty buffer was accepted — the second object was
+     * "confirmed" by the first one's stale response. Both halves are pinned
+     * here: the parser must reject an answer about a different object, and
+     * only a download response counts. ─────────────────────────────────── */
+    {
+        int f0 = fails; uint32_t ab = 0;
+        uint8_t ok[128] = {0};
+        le16put(ok, 10); ok[5] = 0x33;           /* counter 3, CoE          */
+        le16put(ok + 6, 0x3000);                 /* SDO response service    */
+        ok[8] = 0x60;                            /* download response       */
+        le16put(ok + 9, 0x1A02);
+
+        CHECK(op_parse_sdo_response(ok, sizeof ok, 0x1A02, &ab) == 0,
+              "T6: a valid download response for the expected object must pass");
+        CHECK(ab == 0, "T6: a success must not report an abort code");
+
+        CHECK(op_parse_sdo_response(ok, sizeof ok, 0x1A01, &ab) == -2,
+              "T6: a response about a DIFFERENT object must be rejected — this "
+              "is the stale-buffer case that wedged the drive");
+
+        uint8_t empty[128] = {0};
+        CHECK(op_parse_sdo_response(empty, sizeof empty, 0x1A02, &ab) == -2,
+              "T6: an empty buffer must be rejected");
+
+        uint8_t notcoe[128] = {0};
+        le16put(notcoe, 10); notcoe[5] = 0x02;   /* EoE, not CoE            */
+        le16put(notcoe + 9, 0x1A02); notcoe[8] = 0x60;
+        CHECK(op_parse_sdo_response(notcoe, sizeof notcoe, 0x1A02, &ab) == -2,
+              "T6: a non-CoE mailbox message must be rejected");
+
+        uint8_t abrt[128] = {0};
+        le16put(abrt, 10); abrt[5] = 0x03; le16put(abrt + 6, 0x3000);
+        abrt[8] = 0x80; le16put(abrt + 9, 0x1A02);
+        abrt[12] = 0x30; abrt[13] = 0x00; abrt[14] = 0x07; abrt[15] = 0x06;
+        CHECK(op_parse_sdo_response(abrt, sizeof abrt, 0x1A02, &ab) == -1,
+              "T6: an SDO abort must be reported as an abort");
+        CHECK(ab == 0x06070030,
+              "T6: abort code reassembled as 0x%08X, want 0x06070030", ab);
+
+        CHECK(op_parse_sdo_response(ok, 8, 0x1A02, &ab) == -2,
+              "T6: a truncated buffer must be rejected, not read past");
+        if (fails == f0)
+            printf("T6 PASS: stale, foreign, empty and aborted mailbox responses "
+                   "are all rejected\n");
+    }
+
     if (fails) { printf("\n*** OP SEQUENCE FAILURES ***\n"); return 1; }
     printf("\nALL OP SEQUENCE TESTS PASS\n");
     return 0;

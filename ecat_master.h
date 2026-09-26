@@ -162,6 +162,13 @@ int op_bring_up(OpMaster *m, OpSlave *s);
  * on an AL error the code is read into s->al_code. */
 int op_set_state(OpMaster *m, OpSlave *s, uint16_t state, int timeout_ms);
 
+/* Validate a CoE SDO download response sitting in a mailbox buffer.
+ * Returns 0 on success, -1 on an SDO abort (code in *abort_out), -2 if the
+ * buffer holds something that is not our answer — a stale response from an
+ * earlier request, or a non-CoE message. Pure; unit-tested. */
+int op_parse_sdo_response(const uint8_t *mbx, int len, uint16_t expect_index,
+                          uint32_t *abort_out);
+
 /* Decode an AL status code into a short phrase. Never returns NULL. */
 const char *op_al_code_name(uint16_t code);
 
