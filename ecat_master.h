@@ -229,7 +229,22 @@ typedef struct {
     int     len[OP_BURST_MAX];
     uint8_t idx[OP_BURST_MAX];     /* first datagram index, for matching    */
     int     n;
+    /* The diagnostic frame's index range, recorded explicitly. Working it
+     * out by searching the other frames' ranges does not work: datagram
+     * indices are 8-bit and the ranges overlap, so a returning APRD can be
+     * attributed to the wrong slave. That produced counter totals of 30,000
+     * on a run where two frames were actually damaged. */
+    int     has_diag;
+    uint8_t diag_base;
+    int     diag_n;
 } OpBurst;
+
+/* Which slave does a returning datagram index belong to? Returns the chain
+ * position, or -1 if the index is not part of the diagnostic frame. Pure. */
+int op_burst_slave_of(const OpBurst *b, uint8_t idx);
+
+/* Record that the frame just added is the diagnostic frame. */
+void op_burst_mark_diag(OpBurst *b, uint8_t base, int n);
 
 /* Build TwinCAT's cyclic frame. log_mbx is the logical address of the
  * mailbox-state image (one bit per slave), log_pd that of the process data.

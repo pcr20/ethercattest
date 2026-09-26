@@ -229,51 +229,57 @@ int main(int argc, char **argv)
         uint64_t dl  = pace_deadline(&pace, now);
         if (dl > now) sleep_until_ns(dl);
 
+        /* Fixed, non-overlapping datagram indices within a cycle: slot 0
+         * cyclic 0-2, slot 1 cyclic 3-5, link poll 6, AL status 7, padding
+         * 8-19, diagnostics 20 upward. Rolling bases let the ranges overlap,
+         * which is what mis-attributed the diagnostic reads. */
         OpBurst burst; memset(&burst, 0, sizeof burst);
-        uint8_t f[1600]; int fl; uint8_t base = m.ctx.idx_seq;
+        uint8_t f[1600]; int fl; uint8_t base;
         int diag_due = (cycles % 50) == 0;
         memset(diag_wkc, 0, sizeof diag_wkc);
 
         for (int slot = 0; slot < 2; slot++) {
+            base = (uint8_t)(slot * 3);
             fl = op_build_cyc_frame(f, sizeof f, m.ctx.src_mac, base,
                                     0x09000000u, m.sl[0].log_addr,
                                     pd, pd_len, n_mbx_bytes);
             if (fl > 0) op_burst_add(&burst, f, fl, base);
-            base = (uint8_t)(base + 3);
 
             /* Slot 0 carries the link-status poll, slot 1 the slower jobs —
              * the capture shows acyclic work split between the two slots,
              * not all appended to the end of the cycle. */
-            if (slot == 0 && (cycles % 5) == 0) {
+            /* TwinCAT polls link status in BOTH slots, which is why its
+             * busy cycles are bursts of 4 rather than 3. */
+            if ((cycles % 10) == 0) {
                 fl = op_build_frame(f, sizeof f, m.ctx.src_mac, ECAT_CMD_FPRD_M,
-                                    base, m.sl[0].station, REG_DL_STATUS_P, NULL, 1);
-                if (fl > 0) op_burst_add(&burst, f, fl, base);
-                base++;
+                                    (uint8_t)(6 + slot), m.sl[0].station,
+                                    REG_DL_STATUS_P, NULL, 1);
+                if (fl > 0) op_burst_add(&burst, f, fl, (uint8_t)(6 + slot));
             }
             if (slot == 1 && diag_due) {
-                fl = op_build_diag_frame(f, sizeof f, m.ctx.src_mac, base, chain);
-                if (fl > 0) op_burst_add(&burst, f, fl, base);
-                base = (uint8_t)(base + chain);
+                fl = op_build_diag_frame(f, sizeof f, m.ctx.src_mac, 20, chain);
+                if (fl > 0) {
+                    op_burst_add(&burst, f, fl, 20);
+                    op_burst_mark_diag(&burst, 20, chain);
+                }
             }
             if (slot == 1 && (cycles % 180) == 0) {
                 fl = op_build_frame(f, sizeof f, m.ctx.src_mac, ECAT_CMD_FPRD_M,
-                                    base, m.sl[0].station, REG_AL_STATUS, NULL, 2);
-                if (fl > 0) op_burst_add(&burst, f, fl, base);
-                base++;
+                                    7, m.sl[0].station, REG_AL_STATUS, NULL, 2);
+                if (fl > 0) op_burst_add(&burst, f, fl, 7);
             }
         }
         /* --burst: pad with further cyclic frames so the cycle is exactly n
          * frames back to back. The padding is real process data, so the
          * drives are unaffected; only the wire pattern changes. */
         while (burst.n < min_burst && burst.n < OP_BURST_MAX) {
-            fl = op_build_cyc_frame(f, sizeof f, m.ctx.src_mac, base,
+            uint8_t pb = (uint8_t)(8 + 3 * (burst.n - 2));
+            fl = op_build_cyc_frame(f, sizeof f, m.ctx.src_mac, pb,
                                     0x09000000u, m.sl[0].log_addr,
                                     pd, pd_len, n_mbx_bytes);
             if (fl <= 0) break;
-            op_burst_add(&burst, f, fl, base);
-            base = (uint8_t)(base + 3);
+            op_burst_add(&burst, f, fl, pb);
         }
-        m.ctx.idx_seq = base;
 
         int got = op_burst_run(&m, &burst, diag, chain, diag_wkc, &pd_wkc);
         cycles++;
@@ -329,8 +335,13 @@ int main(int argc, char **argv)
                 printf("    slave %2d port %d: invalid %lu  rxerr %lu  fwderr %lu  "
                        "lostlink %lu\n", s, p, tot_invalid[s][p], tot_rxerr[s][p],
                        tot_fwd[s][p], tot_lost[s][p]);
-    if (!lost_events)
-        printf("    no counter moved on any slave\n");
+    {   int any = 0;
+        for (int s = 0; s < chain; s++)
+            for (int p = 0; p < 4; p++)
+                if (tot_invalid[s][p] || tot_rxerr[s][p] || tot_fwd[s][p] ||
+                    tot_lost[s][p]) any = 1;
+        if (!any) printf("    no counter moved on any slave\n");
+    }
 
     if (faultdir) faultcap_close();
     esc_close(&m.ctx);

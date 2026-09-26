@@ -720,6 +720,16 @@ int op_build_diag_frame(uint8_t *buf, int buflen, const uint8_t *src_mac,
     return frame_finish(buf, pos, buflen);
 }
 
+int op_burst_slave_of(const OpBurst *b, uint8_t idx)
+{
+    if (!b->has_diag) return -1;
+    int s = (int)(uint8_t)(idx - b->diag_base);
+    return (s >= 0 && s < b->diag_n) ? s : -1;
+}
+
+void op_burst_mark_diag(OpBurst *b, uint8_t base, int n)
+{   b->has_diag = 1; b->diag_base = base; b->diag_n = n; }
+
 int op_burst_add(OpBurst *b, const uint8_t *frame, int len, uint8_t idx)
 {
     if (b->n >= OP_BURST_MAX || len <= 0) return -1;
@@ -735,13 +745,21 @@ int op_burst_add(OpBurst *b, const uint8_t *frame, int len, uint8_t idx)
 int op_burst_run(OpMaster *m, OpBurst *b, uint8_t *diag_out, int chain_len,
                  uint16_t *diag_wkc, uint16_t *pd_wkc)
 {
+    /* Drop anything still queued from the previous cycle: indices are fixed
+     * per cycle, so a straggler would otherwise be read as this cycle's. */
+    { uint8_t junk[2048];
+      while (recv(m->ctx.sock, junk, sizeof junk, MSG_DONTWAIT) > 0) ; }
+
     for (int i = 0; i < b->n; i++) {
         if (send(m->ctx.sock, b->buf[i], (size_t)b->len[i], 0) < 0) return -1;
         m->ctx.frames_sent++;
     }
     int got = 0;
     uint8_t rx[2048];
-    uint64_t deadline = now_ns() + (uint64_t)m->ctx.timeout_ms * 1000000ULL;
+    /* A cycle must not wait longer than a cycle. The 50 ms transaction
+     * timeout used during bring-up stalled the loop for 50 ms whenever a
+     * frame went missing -- two such stalls cost 47 missed cycles. */
+    uint64_t deadline = now_ns() + 1500000ULL;          /* 1.5 ms          */
     while (got < b->n && now_ns() < deadline) {
         ssize_t r = recv(m->ctx.sock, rx, sizeof rx, MSG_DONTWAIT);
         if (r < (ssize_t)(ETH_HDR_LEN + ECAT_HDR_LEN + ECAT_DG_HDR_LEN)) {
@@ -764,11 +782,7 @@ int op_burst_run(OpMaster *m, OpBurst *b, uint8_t *diag_out, int chain_len,
             uint16_t wkc = le16get(dat + dl);
             if (cmd == ECAT_CMD_LRW_M && pd_wkc) *pd_wkc = wkc;
             if (cmd == ECAT_CMD_APRD && diag_out && dl >= ESC_DIAG_LEN) {
-                int s = (int)(uint8_t)(idx - b->idx[0]);
-                /* The diagnostic frame indexes slaves from its own base. */
-                for (int i = 0; i < b->n; i++)
-                    if (idx >= b->idx[i] && idx < (uint8_t)(b->idx[i] + chain_len))
-                        s = idx - b->idx[i];
+                int s = op_burst_slave_of(b, idx);
                 if (s >= 0 && s < chain_len) {
                     memcpy(diag_out + (size_t)s * ESC_DIAG_LEN, dat, ESC_DIAG_LEN);
                     if (diag_wkc) diag_wkc[s] = wkc;

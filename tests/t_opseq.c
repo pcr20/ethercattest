@@ -388,6 +388,46 @@ int main(void)
                    "refuse overflow\n");
     }
 
+    /* ── T11: diagnostic datagrams map to the right slave ─────────────────
+     * The first version searched every frame's index range to decide which
+     * slave a returning APRD belonged to. Indices are 8-bit and the ranges
+     * overlap, so reads were attributed to the wrong slave; the counters then
+     * appeared to oscillate between two values and the run reported 30,976
+     * invalid frames where two frames had actually been damaged. Only the
+     * diagnostic frame's own range may be consulted. ───────────────────── */
+    {
+        int f0 = fails;
+        OpBurst b; memset(&b, 0, sizeof b);
+        uint8_t f[1600];
+        /* Two cyclic frames whose index ranges deliberately straddle the
+         * diagnostic frame's, exactly as the rolling-base version produced. */
+        int n = op_build_cyc_frame(f, sizeof f, MAC, 18, 0x09000000u,
+                                   0x01000000u, NULL, 22, 1);
+        op_burst_add(&b, f, n, 18);
+        op_burst_add(&b, f, n, 21);
+        int dn = op_build_diag_frame(f, sizeof f, MAC, 20, 11);
+        CHECK(dn > 0, "T11: diagnostic frame would not build");
+        op_burst_add(&b, f, dn, 20);
+
+        CHECK(op_burst_slave_of(&b, 20) == -1,
+              "T11: before marking, nothing may be claimed as diagnostic");
+        op_burst_mark_diag(&b, 20, 11);
+
+        for (int s = 0; s < 11; s++)
+            CHECK(op_burst_slave_of(&b, (uint8_t)(20 + s)) == s,
+                  "T11: index %d must map to slave %d, got %d",
+                  20 + s, s, op_burst_slave_of(&b, (uint8_t)(20 + s)));
+        CHECK(op_burst_slave_of(&b, 19) == -1,
+              "T11: index 19 is a cyclic frame's, not slave -1");
+        CHECK(op_burst_slave_of(&b, 31) == -1,
+              "T11: index 31 is past the end of the chain");
+        CHECK(op_burst_slave_of(&b, 18) == -1,
+              "T11: a cyclic frame's index must never map to a slave");
+        if (fails == f0)
+            printf("T11 PASS: only the diagnostic frame's own index range maps "
+                   "to slaves\n");
+    }
+
     if (fails) { printf("\n*** OP SEQUENCE FAILURES ***\n"); return 1; }
     printf("\nALL OP SEQUENCE TESTS PASS\n");
     return 0;
