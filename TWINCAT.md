@@ -333,14 +333,36 @@ Read that last frame carefully:
 
 ### 6.3 What is *not* there
 
-Across all three drops, the twelve preceding returning frames are
-**byte-identical**: working counters 2/6/2, AL status `0x0800`, process data
-`5002aa0a000000000000ff` twice over. 63.6% of every returning cyclic frame in
-the capture matches that pattern exactly; within healthy operation it is
-essentially 100%.
+The ten frames before a drop are not merely *similar* to ordinary traffic.
+**They are the only frame TwinCAT ever sends.** Masking the one index byte,
+all **15,424** healthy returning cyclic frames in the capture reduce to
+**exactly one distinct 77-byte frame** — same working counters 2/6/2, same AL
+status `0x0800`, same process data `5002aa0a000000000000ff` twice over. The
+transmitted frames are likewise identical apart from the counter: controlword
+0, target position and velocity 0, every cycle.
 
-**There is no precursor.** No degraded frame, no working-counter blip, no
-status bit, no counter movement. And in the whole capture:
+So the answer to "how often does that ten-frame sequence occur?" is: **every
+ten-frame window in the healthy capture**, about 15,400 of them.
+
+That converts a weak claim into a strong one. It is not that we looked for a
+precursor and found none — **the traffic contains one distinct frame, so a
+precursor cannot exist in it.** There is no information in the EtherCAT
+stream, outside a counter, that differs before a drop from any other moment.
+
+The index also confirms nothing was lost at the drop itself. Indices step by
++1 across all three, with no gap:
+
+```
+drop 1:  185, 186, 187 -> 188, 189, 190
+drop 2:   94,  95,  96 ->  97,  98,  99
+drop 3:   18,  19,  20 ->  21,  22,  23
+```
+
+Every frame went out and came back; drive 2 stopped contributing to them
+mid-cycle. The index values at the drops show no pattern — no wrap boundary.
+
+No degraded frame, no working-counter blip, no status bit, no counter
+movement. And in the whole capture:
 
 - invalid-frame counters (`0x0300`): **zero**
 - RX-error counters (`0x0301`): **zero**
@@ -424,6 +446,11 @@ between frames would trip FLD without incrementing any ESC counter — which is
 exactly what is observed: a link that vanishes with every error counter at
 zero.
 
+**No further analysis of this capture, or any capture like it, can find the
+trigger** (§6.3): the traffic holds a single repeated frame. Any precursor
+lies outside the EtherCAT layer — in the PHY's own state, in symbol errors
+during the IDLE stream between frames, or in the electrical domain.
+
 **The evidence that would identify the cause is not visible at the EtherCAT
 layer at all.** It is in `FLDS` (`0x000F`) on the PHY, which latches which
 criterion fired. TwinCAT never reads that register. `ecat_op` probes it within
@@ -465,6 +492,7 @@ and the same traps will recur.
 | "A fourth drop on the master link" | The operator stop, §5.4. |
 | "One drop per 14.2 s" | Divided by 42.64 s including 8.5 s when nothing ran. Correct rate **one per 8.5 s**. |
 | "Bursts of 4 match TwinCAT" | 98% of cycles are 2 frames. A burst of 4 needs two acyclic jobs to coincide, ~1.6% of cycles. |
+| "63.6% of returning frames match the pre-drop pattern" | Diluted by outage frames, and "byte-identical" ignored the index byte. Within healthy operation it is **100%** — one distinct frame, 15,424 times. |
 
 ---
 
