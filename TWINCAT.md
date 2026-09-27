@@ -67,41 +67,58 @@ because the averages spanned an 8.5 s period when the master was stopped and
 8.7 s before it started. *If a protocol carries a per-frame counter, read it
 before reasoning about rates.*
 
-### 2.3 The order test — proof the two cyclic frames are back-to-back
+### 2.3 The capture is two streams, merged — and what that invalidates
 
-Timestamps alone cannot prove two frames were sent together, because the
-capture path re-times them (§2.5). The ordering can:
+An earlier draft argued that the two cyclic frames must be back-to-back
+because the capture shows both going out before either response returns
+(`TX TX RX RX`), and a capture may mis-timestamp but does not reorder.
 
-```
-16.054861 TX cyclic
-16.054862 TX cyclic
-16.054877 RX cyclic
-16.054878 RX cyclic
-```
-
-Both frames go out **before either response returns**. EtherCAT is
-cut-through, so a response follows its frame by ~14 µs. Had the two frames
-been a millisecond apart, the order would be TX, RX, TX, RX. A capture may
-mis-timestamp, but it does not reorder.
-
-### 2.4 The response-latency test — spotting mis-attributed frames
-
-Some acyclic frames appear at the tail of a burst but their responses arrive
-2 ms later, with the *next* burst:
+**That reasoning is wrong.** Grouping frames into batches and looking at the
+direction pattern:
 
 ```
-16.056991 TX  FPRD 0x0111   ->  response 16.059087   (2.096 ms)
-16.056990 TX  cyclic        ->  response 16.057005   (14 µs)
+   TTRR          10882
+   TTTTRRRR       1085
+   TTRRR           215
+   ...
+   12921 of 12922 batches (100.0%) direction-grouped, never interleaved
 ```
 
-A slave cannot hold a frame for 2 ms. Those frames were transmitted in the
-following cycle and the capture attributed them to the previous burst.
+On the wire TX and RX must alternate — send, ~14 µs later it returns, send
+the next: `T R T R`. The capture shows `T T R R` in **100%** of batches. That
+is impossible as wire order, and proves the file is **two separate streams
+merged**: the tap has one port per direction, the capture host reads them as
+independent sources and timestamps them at read time in per-direction blocks.
 
-This test overturned a result that was about to be reported: all three link
-drops appeared to occur in a burst carrying a link-status poll, a shape
-occurring 56 times in 13,515 bursts, p ≈ 7×10⁻⁸. The poll **follows** each
-drop. The apparent association was an artefact, and the impossible denominator
-that exposed it — zero healthy bursts contain such a poll — is in §4.2.
+Consequences, all of them limiting:
+
+- **The apparent index "lag" is this artefact, not protocol.** `IDX` is a
+  master-only field — ETG.1000.4 says slaves shall not change it, and the
+  capture confirms it: 25,177 returning frames, every one carrying an index
+  the master sent, zero unmatched. A response with index 185 *is* the
+  response to request 185. The TX block of a batch simply holds frames
+  186-187 while its RX block holds the returns for 185-186.
+- **Round-trip times are unusable.** Exactly 1,991 frames show a sensible
+  13.5 µs and exactly 1,991 are inflated by precisely one cycle (2012.6 µs),
+  a perfect 50/50 split by index parity. The same frame's `LRD` and `BRD`
+  datagrams show 14.6 µs while its `LRW` shows 1014 µs — one frame cannot
+  have two round trips.
+- **The relative order of any TX and any RX frame is meaningless.** Every TX
+  in a batch precedes every RX in the file regardless of what happened on the
+  wire.
+- **Intra-cycle structure is unresolvable.** 992 cyclic frames/s is the solid
+  number, from counting. Whether that is two frames back-to-back every
+  2.016 ms or one frame every ~1.008 ms **cannot be determined from this
+  file**, and TwinCAT's own "973 frames/s" is consistent with either.
+
+### 2.4 The response-latency test — withdrawn
+
+An earlier draft used response latency to argue that acyclic frames appearing
+at the tail of a burst were really transmitted in the next cycle, and used it
+to dismiss an association between the drops and a link-status poll (§6.7).
+Given that half of all round-trip times are inflated by exactly one cycle as
+an artefact of §2.3, the test has no force. The association it dismissed is
+addressed properly in §6.7.
 
 ### 2.5 What the capture cannot tell us
 
@@ -164,8 +181,11 @@ which independently confirms the mapping decode.
 
 ### 4.1 The cycle
 
-**2.016 ms, two cyclic frames back to back.** 992 cyclic frames/s, matching
-the 973/s TwinCAT reports in its own counters.
+**992 cyclic frames/s**, matching the 973/s TwinCAT reports in its own
+counters. Frames appear in the capture as pairs 2.016 ms apart, but §2.3
+shows the capture cannot resolve the spacing *within* a pair: this is equally
+consistent with two frames back-to-back every 2.016 ms or one frame every
+~1.008 ms. The frame rate is solid; the cycle time is not.
 
 Each cyclic frame is **77 bytes** and carries three datagrams:
 
@@ -434,6 +454,37 @@ Two constants, both to the millisecond:
 Total outage **3.00 s** every time. During it, TwinCAT polls `0x0111` every
 cycle and drives the remaining slave normally.
 
+### 6.7 The link-status poll adjacent to every drop
+
+In all three drops the last frame the master sends before the drop frame is
+`FPRD 1001/0x0111`, a single-datagram 60-byte read of drive 1's DL status —
+at −0.014, −0.020 and −0.014 ms. Nothing else in the preceding 20 frames is
+anything but the cyclic frame.
+
+It is a real association and it deserves care, because TwinCAT sends
+`0x0111` **only** when a link is down: 3,052 of them in the capture, all
+inside the three outage windows, **none at all in steady state**. The first
+poll of each outage therefore sits adjacent to its drop.
+
+**The capture cannot order the poll against the drop.** They are 14–20 µs
+apart, and §2.3 shows that every TX frame in a batch is listed before every
+RX frame regardless of wire order. The poll is a TX frame, the drop is an RX
+frame, they share a batch — so the poll would appear first *even if it had
+been sent afterwards*. No re-analysis of this file can resolve it.
+
+What can be said:
+
+- **The poll alone does not cause drops.** `ecat_op` sent 178,560 of them to
+  station 1001 — the first EVE-NET — in the 1,800 s run, with zero drops.
+- **A reaction explains it economically**: the IRQ flag arrives with the
+  cyclic response (§6.4), TwinCAT reads `0x0111` on learning of it, and that
+  is why the poll rate is zero except during outages.
+
+Settling it needs a capture with **wire-accurate timestamps and a single
+merged stream** — a passive tap into a NIC with hardware timestamping, or a
+logic analyser on a PHY's MII pins. The mirror used here cannot.
+
+
 ---
 
 ## 7. What it means, and what it rules out
@@ -492,6 +543,8 @@ and the same traps will recur.
 | "A fourth drop on the master link" | The operator stop, §5.4. |
 | "One drop per 14.2 s" | Divided by 42.64 s including 8.5 s when nothing ran. Correct rate **one per 8.5 s**. |
 | "Bursts of 4 match TwinCAT" | 98% of cycles are 2 frames. A burst of 4 needs two acyclic jobs to coincide, ~1.6% of cycles. |
+| "Both cyclic frames go out before either response returns, so they are back to back" | The capture is two streams merged: 100% of batches are direction-grouped `TTRR`, never interleaved. TX-versus-RX order carries no information, and the cycle time is unresolvable. |
+| "The 2 ms response latency proves the poll was sent a cycle later" | Half of all round trips are inflated by exactly one cycle as the same artefact. Test withdrawn; see §6.7. |
 | "63.6% of returning frames match the pre-drop pattern" | Diluted by outage frames, and "byte-identical" ignored the index byte. Within healthy operation it is **100%** — one distinct frame, 15,424 times. |
 
 ---
