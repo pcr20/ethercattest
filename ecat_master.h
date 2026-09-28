@@ -259,6 +259,21 @@ int op_build_cyc_frame(uint8_t *buf, int buflen, const uint8_t *src_mac,
 int op_build_diag_frame(uint8_t *buf, int buflen, const uint8_t *src_mac,
                         uint8_t idx_base, int chain_len);
 
+/* Build a frame of n datagrams of the same command, register and length, one
+ * per address in adp[]. Covers TwinCAT's FPRD 0x0300 pair (station addresses)
+ * and its APRD 0x0310 pair (auto-increment), and lets us extend the latter
+ * across the whole chain. Returns the frame length. */
+int op_build_multi(uint8_t *buf, int buflen, const uint8_t *src_mac,
+                   uint8_t cmd, uint8_t idx_base, const uint16_t *adp,
+                   uint16_t ado, uint16_t len, int n);
+
+/* One returning datagram, as collected by op_burst_run. */
+typedef struct {
+    uint8_t  cmd, idx;
+    uint16_t adp, ado, wkc, len;
+    uint8_t  data[64];
+} OpResult;
+
 /* Add a built frame to a burst. Returns 0, or -1 if the burst is full. */
 int op_burst_add(OpBurst *b, const uint8_t *frame, int len, uint8_t idx);
 
@@ -267,6 +282,11 @@ int op_burst_add(OpBurst *b, const uint8_t *frame, int len, uint8_t idx);
  * property being reproduced. Returns the number of frames that came back. */
 int op_burst_run(OpMaster *m, OpBurst *b, uint8_t *diag_out, int chain_len,
                  uint16_t *diag_wkc, uint16_t *pd_wkc);
+
+/* Send the burst and collect every returning datagram into res[]. Returns the
+ * number stored, or -1 if nothing came back. Supersedes the diag_out form for
+ * callers that send more than one kind of acyclic frame. */
+int op_burst_collect(OpMaster *m, OpBurst *b, OpResult *res, int max);
 
 /* Build the cyclic frame. Exposed for tests. Returns the frame length. */
 int op_build_cyclic(uint8_t *buf, int buflen, const uint8_t *src_mac,

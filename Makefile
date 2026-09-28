@@ -38,7 +38,7 @@ ecat_op: $(OP_OBJS) stats.o crc.o
 %.o: %.c ecat_common.h crc.h stats.h frame.h nic.h threads.h escreg.h escmii.h phy_regs.h faultcap.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
-TESTS = t_escframe t_miiframe t_physweep t_hostrx t_escclear t_pause t_faultcap t_wirefmt t_framesz t_txok t_crc t_resid3 t_escgate t_plsem t_ring t_pace t_escpanel t_opseq
+TESTS = t_escframe t_miiframe t_physweep t_hostrx t_escclear t_pause t_faultcap t_wirefmt t_framesz t_txok t_crc t_resid3 t_escgate t_plsem t_ring t_pace t_escpanel t_opseq t_acyclic
 test: $(TESTS:%=tests/%)
 	@for t in $(TESTS); do ./tests/$$t || exit 1; done
 	@echo "ALL TEST SUITES PASS"

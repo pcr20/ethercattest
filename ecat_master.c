@@ -794,3 +794,60 @@ int op_burst_run(OpMaster *m, OpBurst *b, uint8_t *diag_out, int chain_len,
     }
     return got;
 }
+
+int op_build_multi(uint8_t *buf, int buflen, const uint8_t *src_mac,
+                   uint8_t cmd, uint8_t idx_base, const uint16_t *adp,
+                   uint16_t ado, uint16_t len, int n)
+{
+    int need = ETH_HDR_LEN + ECAT_HDR_LEN + n * (ECAT_DG_OVERHEAD + len);
+    if (n <= 0 || need > buflen) return -1;
+    memset(buf, 0, (size_t)(need > ETH_MIN_FRAME ? need : ETH_MIN_FRAME));
+    int pos = frame_start(buf, buflen, src_mac);
+    for (int i = 0; i < n; i++)
+        pos = dg_put(buf, pos, cmd, (uint8_t)(idx_base + i), adp[i], ado,
+                     NULL, len, i != n - 1);
+    return frame_finish(buf, pos, buflen);
+}
+
+int op_burst_collect(OpMaster *m, OpBurst *b, OpResult *res, int max)
+{
+    { uint8_t junk[2048];
+      while (recv(m->ctx.sock, junk, sizeof junk, MSG_DONTWAIT) > 0) ; }
+    for (int i = 0; i < b->n; i++) {
+        if (send(m->ctx.sock, b->buf[i], (size_t)b->len[i], 0) < 0) return -1;
+        m->ctx.frames_sent++;
+    }
+    int got = 0, frames = 0;
+    uint8_t rx[2048];
+    uint64_t deadline = now_ns() + 1500000ULL;          /* 1.5 ms          */
+    while (frames < b->n && now_ns() < deadline) {
+        ssize_t r = recv(m->ctx.sock, rx, sizeof rx, MSG_DONTWAIT);
+        if (r < (ssize_t)(ETH_HDR_LEN + ECAT_HDR_LEN + ECAT_DG_HDR_LEN)) {
+            if (r < 0) { struct timespec ts = {0, 20000}; nanosleep(&ts, NULL); }
+            continue;
+        }
+        if (rx[12] != ((ETHERTYPE_ECAT >> 8) & 0xFF) ||
+            rx[13] !=  (ETHERTYPE_ECAT & 0xFF)) continue;
+        int p = ETH_HDR_LEN + ECAT_HDR_LEN, mine = 0;
+        for (int i = 0; i < b->n; i++) if (rx[p + 1] == b->idx[i]) mine = 1;
+        if (!mine) continue;
+        frames++;
+        int more = 1;
+        while (more && p + ECAT_DG_HDR_LEN <= r && got < max) {
+            uint16_t lf = le16get(rx + p + 6), dl = lf & 0x07FF;
+            more = (lf & 0x8000) != 0;
+            if (p + ECAT_DG_HDR_LEN + dl + 2 > r) break;
+            const uint8_t *dat = rx + p + ECAT_DG_HDR_LEN;
+            OpResult *o = &res[got++];
+            o->cmd = rx[p]; o->idx = rx[p + 1];
+            o->adp = le16get(rx + p + 2); o->ado = le16get(rx + p + 4);
+            o->len = dl < sizeof o->data ? dl : (uint16_t)sizeof o->data;
+            memcpy(o->data, dat, o->len);
+            o->wkc = le16get(dat + dl);
+            p += ECAT_DG_HDR_LEN + dl + 2;
+        }
+        m->ctx.frames_matched++;
+    }
+    if (frames < b->n) m->ctx.timeouts++;
+    return got;
+}
