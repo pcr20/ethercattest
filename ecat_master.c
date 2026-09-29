@@ -183,7 +183,12 @@ void op_print_write_warning(const OpMaster *m)
     printf("  Broadcast to ALL %d slave(s) in the chain:\n", m->chain_len);
     printf("    0x0101  port loop control      0x0103  DL control\n");
     printf("    0x0200  interrupt mask         0x0010  station address (cleared)\n");
-    printf("    0x0300  error counters CLEARED ONCE at start (then never again)\n");
+    if (m->clear_counters)
+        printf("    0x0300  error counters CLEARED at start AND every ~104 ms\n"
+               "            (as TwinCAT does; 0x0310 lost-link is NOT cleared,\n"
+               "             so the link-drop evidence survives)\n");
+    else
+        printf("    0x0300  error counters CLEARED ONCE at start (--no-clear)\n");
     printf("    0x0600  all FMMUs cleared      0x0800  all SyncManagers cleared\n");
     printf("    0x0910/0x0930/0x0934/0x0981  distributed-clock registers\n");
     printf("\n");
@@ -199,7 +204,12 @@ void op_print_write_warning(const OpMaster *m)
     printf("\n");
     printf("  Deviations from the captured TwinCAT sequence (deliberate):\n");
     printf("    - no SII identity read; ESC type at 0x0000 is used instead\n");
-    printf("    - no periodic 0x0300 clear; it would erase the evidence\n");
+    if (!m->clear_counters)
+        printf("    - no periodic 0x0300 clear (--no-clear); TwinCAT sends one\n"
+               "      every ~104 ms\n");
+    if (m->chain_len > m->n_op)
+        printf("    - 0x0310 read across all %d slaves, not just the %d driven\n",
+               m->chain_len, m->n_op);
     printf("\n");
 }
 

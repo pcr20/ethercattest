@@ -28,10 +28,12 @@
  *      configure anything that is not a type-0x90 device, and avoids
  *      contending with the drive firmware for the EEPROM interface.
  *
- *   2. No periodic BWR 0x0300. TwinCAT broadcasts a counter clear about
- *      twelve times a second. Doing that would erase the evidence this whole
- *      exercise exists to collect. The one-off clear during bus reset is kept
- *      (we baseline after it).
+ *   2. None. An earlier build omitted TwinCAT's periodic BWR 0x0300 counter
+ *      clear; it is now sent at the measured 103.8 ms period, because a
+ *      hypothesis is live that something the master SENDS provokes the link
+ *      drops, and that write is the one frame type we had never put on the
+ *      wire. --no-clear suppresses it when the invalid-frame and RX-error
+ *      counts are themselves the evidence wanted.
  *
  * Both deviations are printed at startup so a run's log states what it did.
  *
@@ -102,6 +104,7 @@ typedef struct {
     int       n_op;           /* slaves being driven to OP                   */
     int       chain_len;      /* total slaves present, for diagnostics       */
     int       verbose;
+    int       clear_counters;  /* sends BWR 0x0300 ~9.6/s (not --no-clear) */
 } OpMaster;
 
 /* ── Frame construction (pure; exposed for tests) ──────────────────────────

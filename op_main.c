@@ -117,6 +117,7 @@ int main(int argc, char **argv)
 
     OpMaster m; memset(&m, 0, sizeof m);
     m.chain_len = chain; m.n_op = n_op; m.verbose = verbose;
+    m.clear_counters = !no_clear;
     for (int i = 0; i < n_op; i++) {
         m.sl[i].position = op_pos[i];
         m.sl[i].station  = (uint16_t)(1001 + i);
