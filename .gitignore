@@ -9,3 +9,4 @@ tests/t_*
 # Run output
 *.csv
 *.zip
+soem_check
