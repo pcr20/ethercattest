@@ -5,7 +5,9 @@ read by someone who has not followed the day-to-day work. Every number here
 comes from a run on the rig; where something is inferred rather than measured,
 it says so.
 
-Status: **mechanism characterised, origin attributed, root cause not yet found.**
+Status: **frame corruption — mechanism characterised, origin attributed, root
+cause not yet found. Link drops — a separate fault, never reproduced here;
+master-side causes excluded, remaining candidates physical (§10).**
 
 ---
 
@@ -38,12 +40,21 @@ utilisation — same chain, same rig, 22% *more* bytes on the wire — it is
 **≤3.6×10⁻⁸**, a suppression of at least 21× with disjoint confidence
 intervals. Per-frame, per-byte and per-second models are all refuted by many
 orders of magnitude. Utilisation and frame size were varied together, so the
-two are not yet separated (§11).
+two are not yet separated (§12).
 
 **No link has ever dropped.** Across 31 hours of measurement in total:
 Fast Link Down never fired, every ESC lost-link counter stayed at zero, and the
-host NIC logged no carrier transitions. The reported field symptom of
-intermittent *link drops* has not been reproduced and may be a different fault.
+host NIC logged no carrier transitions. The field symptom of intermittent
+*link drops* is **a second, distinct fault** and has never been reproduced here
+(§10).
+
+That is now a decisive negative rather than an absence of evidence. TwinCAT
+drops the link every 8.46 s; replaying its traffic byte for byte, with both
+drives in OP, our rig ran **6,144.7 s** and saw **zero** drops against 726
+expected — P = 1×10⁻³¹⁵, a 242× separation. OP state, traffic shape, burst
+structure and bring-up sequence are therefore all excluded. What remains is
+topology, that particular cable and pair of units, and the electrical
+installation (§10.3).
 
 That negative is sharper than it first appears, because **the EVE-NET is the
 only device in the chain with Fast Link Drop armed** (§6.2) — an aggressive
@@ -276,12 +287,12 @@ An earlier reading of the 12-slave run suggested emission scaling with the
 number of downstream devices. That was withdrawn: run F (EVE-NET first, four
 downstream) measured 6.3e-07 against a predicted 0.3–0.5/s. Two reasons it
 should not have been trusted — three of its five points came from saturated
-counters (§10.2), and every rate then measured was underpowered.
+counters (§11.2), and every rate then measured was underpowered.
 
 Condition 2 does resemble that idea, but it is not the same claim: what has been
 demonstrated is a **step from below-detection to ~1e-05**, not a scaling law. Whether the
 rate grows with the number of devices beyond the port-1 partner, or saturates at
-the first one, is untested — see §11.
+the first one, is untested — see §12.
 
 ### 5.5 The rate depends on link utilisation
 
@@ -410,7 +421,7 @@ is the sharpest question the register sweep produced for Novanta: *is Fast Link
 Drop armed on the firmware revision running in the field EVS-NET units?* The
 field symptom is link loss; here the EVS-NET has FLD disabled and the EVE-NET
 has it enabled. If the field units are armed, a documented 10 µs link-drop
-mechanism becomes a direct candidate for that symptom (§11).
+mechanism becomes a direct candidate for that symptom (§12).
 
 Two caveats. All four PHYs report **MII mode** (RCSR bit 5 = 0), so the
 RMII-specific rows are configured but probably inactive. And PHYCR bit 5 also
@@ -606,12 +617,162 @@ saturated, 1,159 h at 1 kHz.
 
 ---
 
-## 10. Instrumentation corrections
+## 10. The link drops are a second, distinct fault
+
+Everything above concerns **frame corruption**: prefix loss from EVE-NET
+modules, reproducible on our rig, dependent on link utilisation. The fault
+reported from the field, and the one TwinCAT recorded, is a **link drop**: the
+link between two adjacent drives goes down and comes back, with every error
+counter reading zero.
+
+These are two different faults. Our rig reproduces the first and, despite
+sustained effort, has **never once produced the second**.
+
+The reference behaviour — what TwinCAT sends, how the drops appear in the
+capture, and the packet-level detail around each one — is a separate memo,
+`TWINCAT.md`. This section records only what our own rig has *excluded*.
+
+### 10.1 The reference rate
+
+From the 2026-09-23 capture (`TWINCAT.md` §6): **three drops in 25.39 s** of
+at-risk time — 33.93 s of cyclic traffic minus an 8.54 s operator stop —
+giving **0.118 drops/s, one every 8.46 s**. Both drives in OP, exchanging
+process data at 1 kHz, one frame per cycle. All three drops on the
+drive-to-drive link. All three with zero error counters.
+
+That rate is the yardstick: it is fast enough that a negative on our rig
+becomes statistically decisive within minutes.
+
+### 10.2 `ecat_op` — what an OP-state master excluded
+
+`ecat_op` exists to answer one question: does the drop require the drives to be
+in OP, exchanging process data, at TwinCAT's cadence? Our earlier runs had the
+chain in INIT or SAFEOP, which is a real difference from the field rig.
+
+Three runs are on disk. All drove positions 5 and 6 (two EVE-NETs, station
+`1001`/`1002`) of the 11-slave chain to OP and held them there:
+
+| log | cycle | traffic shape | elapsed | expected drops | observed | P(0 drops) |
+|---|---|---|---|---|---|---|
+| `opdrop4.log` | 496 Hz | bursts of 4 frames/cycle | 1,800.0 s | 213 | **0** | 1×10⁻⁹² |
+| `opdrop8.log` | 496 Hz | bursts of 8 frames/cycle | 3,600.0 s | 425 | **0** | 1×10⁻¹⁸⁵ |
+| `opdrop.log` | 1000 Hz | TwinCAT's own pattern | 744.7 s | 88 | **0** | 1×10⁻³⁸ |
+| **pooled** | | | **6,144.7 s** | **726** | **0** | **1×10⁻³¹⁵** |
+
+In all three: `WKC` mismatches 0, every ESC lost-link counter `0x0310`
+unmoved on every slave, no `FLDS` probe ever fired.
+
+The exact one-sided 95% upper bound on our drop rate over the pooled time is
+**4.9×10⁻⁴/s**, against TwinCAT's 0.118/s — a separation of **242×**. Whatever
+provokes the field fault, it is at least two orders of magnitude weaker on our
+rig, and most likely absent.
+
+**The last row is the important one.** `opdrop.log` is not an approximation of
+TwinCAT's traffic; it is a byte-level replay of it (`TWINCAT.md` §4): 1 kHz,
+one 77-byte `LRD`+`LRW`+`BRD` frame per cycle, plus the three acyclic jobs at
+their measured periods — read `0x0300` and clear it every 104 ms, poll
+`0x0310` every 203 ms — each on its own PRNG with ±5 ms of jitter to reproduce
+the spread the capture shows. The burst histogram
+(`1:733890 2:3647 3:7142 4:22`) is the acyclic jobs landing on cyclic cycles,
+which is exactly how the capture looks. Bring-up was TwinCAT's own 86 writes,
+byte-identical, verified by test T1.
+
+So the traffic is right, the state is right, and the drop does not happen.
+
+### 10.3 What this leaves
+
+Excluded by the above:
+
+- **OP state.** Both drives operational, process data flowing, `WKC` correct.
+- **Traffic shape.** One frame per cycle at 1 kHz, TwinCAT's frame layout,
+  TwinCAT's acyclic jobs with TwinCAT's jitter.
+- **Burst structure.** Tested at 1, 4 and 8 frames per cycle. No dependence.
+- **Bring-up sequence.** The same 86 writes in the same order.
+- **Master-side provocation in general.** The capture holds a single repeated
+  frame; there is no precursor to find at the EtherCAT layer (`TWINCAT.md`
+  §6.3).
+
+Not excluded, in rough order of promise:
+
+1. **Topology.** TwinCAT's two drives sat directly on the master. Ours sat at
+   positions 5 and 6, so traffic reached them after five hops through
+   EVS-XCRs, each re-timing it with its own PHY. This is the largest remaining
+   difference and the cheapest to remove — see §10.4.
+2. **The cable** between the two drives, and those two particular units.
+3. **Power, grounding and the physical installation.**
+4. **`CR3` on the field drives.** In our chain Fast Link Drop is armed only on
+   the EVE-NET (§6.2). Whether the field units are armed is unconfirmed and is
+   one register read: `./ecat_phy -i <iface> -p 0 -r 0x0B`. `0x1009` would put
+   a documented 10 µs link-drop mechanism directly in the frame.
+
+### 10.4 The topology run — performed, result not recorded
+
+A 2-slave run was started on 2026-09-30 to remove difference 1 above:
+
+```
+sudo ./ecat_op -i enp2s0 -s 2 --op 0,1 --random 5 -d 7200 -F opdrop
+```
+
+Two EVE-NETs directly on the master, no EVS-XCR hops — the field topology. It
+reached OP with `WKC = 6` and was observed running for at least 1,486 s before
+being stopped.
+
+**Its summary was not recovered.** `ecat_op` writes its log at exit, and
+nothing was written to `opdrop.log` or `opdrop/` during the run's lifetime;
+the files on disk still describe the earlier 11-slave run. No lost-link event
+was reported to the console while it was watched, but *observed for 1,486 s
+with no console event* is not the same evidence as a summary line, and it is
+not counted in the table in §10.2.
+
+This run needs repeating, and the result captured. `-d 7200` at 0.118/s
+expects 850 drops.
+
+### 10.5 A second codebase, not yet run
+
+Every negative above comes from one master implementation, written here, and
+validated against a capture analysed here. A shared blind spot in both would
+look exactly like these results.
+
+`soem_check` is the control for that. It is SOEM driving the same two drives
+**its own way** — PDO mapping read from the object dictionary rather than our
+eight captured SDO downloads, its own `LRW` cyclic frame rather than the
+77-byte `LRD`+`LRW`+`BRD`, its own bring-up state machine, and none of the
+mailbox `LRD`, per-cycle `BRD 0x0130` or `BWR 0x0300` clear. The only things
+held in common are the ones under test: both drives in OP, process data, 1 ms.
+Lost links are detected identically — `APRD 0x0310` at 5/s, differenced, and
+nothing either master does clears that register.
+
+It compiles and prints its banner. **It has never opened a socket**, because
+the NIC was occupied. Four `ecat_op` defects were each caught only by
+hardware, so the first run should be treated as a debugging run.
+
+- No drops under both codebases → the master is excluded independently twice,
+  and what remains is physical.
+- Drops under SOEM only → something in `ecat_op` is *protective*, and the
+  difference between the two becomes the most interesting object in the
+  investigation.
+
+Build: `tools/soem_setup.sh` then `make soem_check`. The setup script exists
+because `include/soem/ec_options.h` is normally generated by CMake from
+`ec_options.h.in` plus the `CMakeLists.txt` defaults, and there is no cmake on
+this machine.
+
+### 10.6 Corrections to this section
+
+| earlier statement | correction |
+|---|---|
+| "Our OP runs expected 449 drops and saw zero (P = 6×10⁻¹⁹⁶)" (`TWINCAT.md` §7) | Written before `opdrop.log`. Re-derived from the three logs on disk: pooled 6,144.7 s, **726** expected, P = 1×10⁻³¹⁵. |
+| "At the faithful traffic shape we have only 114 s" (`TWINCAT.md` §7) | That 114 s run used *two* cyclic frames per cycle, which was the then-current reading of the capture. The 1 ms / one-frame correction makes `opdrop.log`'s **744.7 s** the faithful figure; the 114 s run is a different shape and is not pooled with it. |
+| "Pooled OP running 4,549 s" | Unreproducible from the logs on disk. Superseded by 6,144.7 s, which is the sum of the three `Elapsed:` lines. |
+
+---
+
+## 11. Instrumentation corrections
 
 Two defects in the measurement chain invalidated earlier data. Both are fixed;
 results from before them are not comparable with results after.
 
-### 10.1 The RX socket discarded 95% of the evidence
+### 11.1 The RX socket discarded 95% of the evidence
 
 The RX socket was bound to `ETH_P_ECAT`, so the kernel only delivered frames
 whose bytes 12–13 held `0x88A4`. A prefix-chopped frame has *payload* there, so
@@ -629,7 +790,7 @@ working the whole time; our own socket filter was the blind spot.
 
 **Consequence: corruption counts from before this fix undercount by ~20×.**
 
-### 10.2 ESC error counters saturate at 0xFF
+### 11.2 ESC error counters saturate at 0xFF
 
 The 8-bit counters peg at 255 and stop. In the 8.25 h run most saturated within
 the first 45 minutes, so **every ESC event count in that dataset is a floor,
@@ -646,7 +807,7 @@ At ~1.4 events/s a 90-second run stays comfortably under the ceiling.
 
 ---
 
-## 11. Open questions
+## 12. Open questions
 
 1. **Why must something lie beyond the port-1 partner (condition 2)?** The
    enabling devices are two or more hops away and record nothing. Accumulated
@@ -685,15 +846,20 @@ At ~1.4 events/s a 90-second run stays comfortably under the ceiling.
 6. **What is the trailing `0x50` byte?** Constant across every damaged frame
    ever captured — including all 28 in the ten-slave run. Presumed part of the
    bad-frame marking; not confirmed.
-7. **Is the field link-drop symptom the same fault?** This corruption is Poisson
-   and has never once dropped a link. The field report describes regular-interval
-   link drops. They may be unrelated.
+7. **What provokes the link drops?** Answered in part: not the master (§10).
+   With TwinCAT's traffic replayed byte for byte and both drives in OP, 6,144.7 s
+   produced zero drops against 726 expected. The two open threads are the
+   **topology run** — two EVE-NETs directly on the master, the field
+   arrangement, which was run on 2026-09-30 but whose summary was lost (§10.4) —
+   and **`soem_check`**, an independent master that would exclude a shared blind
+   spot in our own code (§10.5). Neither is expensive; both should be done
+   before anyone touches the hardware.
 8. **Does the M400 carrier make it worse?** The fault occurs without it. A
    controlled A/B at matched downstream depth has not been run.
 
 ---
 
-## 12. How to measure it
+## 13. How to measure it
 
 Standard configuration — run X/E, the cleanest rig that reproduces the fault
 (~1e-05 per frame, single non-zero ESC counter, no saturation):
@@ -734,7 +900,7 @@ Read afterwards:
 Use 300 s rather than 90 at low event rates: ~30 events gives a comparable rate
 while staying far below the 255 ceiling.
 
-### 12.1 Bracket every run with the read-only instruments
+### 13.1 Bracket every run with the read-only instruments
 
 Three registers that the 8-bit ESC counters cannot substitute for. All are
 read-only; run this **before and after** each measurement run:

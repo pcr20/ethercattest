@@ -508,14 +508,16 @@ criterion fired. TwinCAT never reads that register. `ecat_op` probes it within
 ~200 ms of a lost-link increment, which is the entire reason that tool exists.
 
 **What our own rig has ruled out.** At 0.118 drops/s, our OP runs expected
-449 drops and saw **zero** (P = 6×10⁻¹⁹⁶). That covers: both drives in OP,
-exchanging process data, at TwinCAT's cadence, with back-to-back bursts of 2
-and of 4. So neither the operational state nor the traffic shape is what
-provokes it.
+**726** drops and saw **zero** (P = 1×10⁻³¹⁵ over 6,144.7 s pooled; exact
+one-sided 95% upper bound 4.9×10⁻⁴/s, a 242× separation). That covers: both
+drives in OP, exchanging process data, at TwinCAT's cadence, with bursts of 1,
+4 and 8. So neither the operational state nor the traffic shape provokes it.
 
-At the *faithful* traffic shape specifically — two cyclic frames per cycle,
-no `--burst` padding — we have only **114 s**, which expected 14 drops and saw
-zero (P = 1.4×10⁻⁶). Suggestive, not yet conclusive.
+At the *faithful* traffic shape specifically — 1 kHz, one frame per cycle, the
+three acyclic jobs at their measured periods with ±5 ms jitter — we now have
+**744.7 s**, which expected 88 drops and saw zero (P = 1×10⁻³⁸). The full
+accounting, and the two experiments still outstanding, are in `FINDINGS.md`
+§10.
 
 **What is left.** The hardware is stated to be identical and from the same
 batch. The remaining differences between the two rigs are:
@@ -545,6 +547,8 @@ and the same traps will recur.
 | "Bursts of 4 match TwinCAT" | 98% of cycles are 2 frames. A burst of 4 needs two acyclic jobs to coincide, ~1.6% of cycles. |
 | "Both cyclic frames go out before either response returns, so they are back to back" | The capture is two streams merged: 100% of batches are direction-grouped `TTRR`, never interleaved. TX-versus-RX order carries no information, and the cycle time is unresolvable. |
 | "The 2 ms response latency proves the poll was sent a cycle later" | Half of all round trips are inflated by exactly one cycle as the same artefact. Test withdrawn; see §6.7. |
+| "Our OP runs expected 449 drops (P = 6×10⁻¹⁹⁶)" | Counted before `opdrop.log` and not reproducible from the logs on disk. Re-derived from the three `Elapsed:` lines: 6,144.7 s, **726** expected. |
+| "At the faithful traffic shape we have only 114 s" | That run sent *two* cyclic frames per cycle — the then-current reading of the capture. After the 1 ms / one-frame correction the faithful figure is `opdrop.log`'s **744.7 s**; the 114 s is a different shape and is not pooled with it. |
 | "63.6% of returning frames match the pre-drop pattern" | Diluted by outage frames, and "byte-identical" ignored the index byte. Within healthy operation it is **100%** — one distinct frame, 15,424 times. |
 
 ---
