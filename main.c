@@ -6,6 +6,7 @@
 #include "nic.h"
 #include "threads.h"
 #include "faultcap.h"
+#include "logbuf.h"
 
 /* ── Signal handler ─────────────────────────────────────────────────────── */
 /* Stop TX first; the main thread performs the drain barrier and then clears
@@ -75,6 +76,10 @@ static uint64_t wait_tx_drained(const char *iface) {
 
 /* ── Main ───────────────────────────────────────────────────────────────── */
 int main(int argc, char *argv[]) {
+    /* FIRST statement — see logbuf.h. ecat_ber runs for hours redirected to a
+     * file; without this the log lags by a buffer and a killed run loses it. */
+    log_line_buffered(stdout);   /* its return cannot detect lateness */
+
     const char *iface     = NULL;
     const char *csv_path  = "ber_results.csv";
     uint64_t    stop_after_errors = 128;   /* -N: stop after this many ESC error events */

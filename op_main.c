@@ -19,6 +19,7 @@
 #include "acyclic.h"
 #include "recovery.h"
 #include "atrisk.h"
+#include "logbuf.h"
 #include "nic.h"
 #include "everest_pdo.h"
 #include <getopt.h>
@@ -76,6 +77,12 @@ static uint64_t lost_events;
 
 int main(int argc, char **argv)
 {
+    /* FIRST statement: setvbuf is only honoured before anything is written to
+     * the stream (logbuf.h). Anything printed above this line silently pins
+     * stdout to full buffering, and a redirected log then stays empty until
+     * the run ends. */
+    log_line_buffered(stdout);   /* its return cannot detect lateness */
+
     const char *iface = NULL, *faultdir = NULL;
     int chain = 0, rate = 1000, dur = 3600, observe = 0, verbose = 0, tmo = 50;
     int jitter = 0, no_clear = 0;   /* --random N, --no-clear */
@@ -245,11 +252,6 @@ int main(int argc, char **argv)
     if (jitter)
         printf("Acyclic timers: +/-%d cycles, seeds 0x%016lX / 0x%016lX\n",
                jitter, job_rdclr.rng, job_lost.rng);
-
-    /* Line-buffered, so a run redirected to a file keeps its log up to the
-     * last line even if the process is killed. Fully-buffered stdout is how
-     * the 2026-09-29 two-slave run lost everything it had printed. */
-    setvbuf(stdout, NULL, _IOLBF, 0);
 
     PaceState pace; uint64_t t0 = now_ns();
     pace_init(&pace, rate, t0);
