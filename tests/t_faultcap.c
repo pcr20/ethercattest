@@ -184,6 +184,79 @@ int main(void)
                    "gated out of the foreign-frame test\n");
     }
 
+    /* ── T6: events.csv is written on the run's time base ────────────────
+     *
+     * Regression for the 2026-09-30 opdropsagentia4 run: the console printed
+     * the two link drops at 8.788 s and 32.708 s while events.csv recorded
+     * 855.799 and 879.718 — a constant 847.011 s offset, because the ESC
+     * event path passed an absolute CLOCK_MONOTONIC reading while the probe
+     * path subtracted the start itself. The files could not be laid alongside
+     * each other, which is the entire point of writing them together.
+     *
+     * The rule this pins: callers pass ABSOLUTE times, faultcap subtracts. */
+    {
+        int f0 = fails;
+        char edir[600], csv[700];
+        snprintf(edir, sizeof edir, "%s/epoch", dir);
+        CHECK(faultcap_open("lo", 2, edir) == 0, "T6: faultcap_open failed");
+
+        const uint64_t T0 = 1234567890000000000ULL;   /* an arbitrary boot age */
+        faultcap_set_epoch(T0);
+        faultcap_esc_event(T0 + 8788000000ULL,  1, 1, "lostlink", 2);
+        faultcap_esc_event(T0 + 32708000000ULL, 0, 1, "lostlink", 2);
+        faultcap_flush();
+
+        snprintf(csv, sizeof csv, "%s/events.csv", edir);
+        FILE *f = fopen(csv, "r");
+        CHECK(f != NULL, "T6: cannot reopen events.csv");
+        double t1 = -1, t2 = -1;
+        if (f) {
+            char line[512];
+            while (fgets(line, sizeof line, f)) {
+                double v; int sl, po;
+                if (sscanf(line, "%lf,esc,%d,%d,lostlink,", &v, &sl, &po) == 3) {
+                    if (t1 < 0) t1 = v; else if (t2 < 0) t2 = v;
+                }
+            }
+            fclose(f);
+        }
+        CHECK(t1 > 8.787 && t1 < 8.789,
+              "T6: first event logged at %.3f s, console says 8.788 — the CSV "
+              "is not on the run's time base", t1);
+        CHECK(t2 > 32.707 && t2 < 32.709,
+              "T6: second event logged at %.3f s, console says 32.708", t2);
+        CHECK(t2 - t1 > 23.919 && t2 - t1 < 23.921,
+              "T6: interval between events is %.3f s, want 23.920", t2 - t1);
+        faultcap_close();
+
+        /* And with no epoch set, timestamps stay absolute — existing callers
+         * that have not been converted must not silently shift. */
+        snprintf(edir, sizeof edir, "%s/noepoch", dir);
+        CHECK(faultcap_open("lo", 2, edir) == 0, "T6: second open failed");
+        faultcap_set_epoch(0);
+        faultcap_esc_event(5000000000ULL, 1, 1, "lostlink", 1);
+        faultcap_flush();
+        snprintf(csv, sizeof csv, "%s/events.csv", edir);
+        f = fopen(csv, "r");
+        double t3 = -1;
+        if (f) {
+            char line[512];
+            while (fgets(line, sizeof line, f)) {
+                double v; int sl, po;
+                if (sscanf(line, "%lf,esc,%d,%d,lostlink,", &v, &sl, &po) == 3)
+                    t3 = v;
+            }
+            fclose(f);
+        }
+        CHECK(t3 > 4.999 && t3 < 5.001,
+              "T6: with no epoch the timestamp should stay absolute (5.000), "
+              "got %.3f", t3);
+
+        if (fails == f0)
+            printf("T6 PASS: events.csv shares the console's time base "
+                   "(%.3f s, %.3f s) and is unshifted without an epoch\n", t1, t2);
+    }
+
     faultcap_close();
     if (fails) { printf("\n%d FAULTCAP CHECK(S) FAILED\n", fails); return 1; }
     printf("\nALL FAULTCAP TESTS PASS\n");

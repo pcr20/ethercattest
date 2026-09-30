@@ -42,6 +42,19 @@
 /* Open the capture set under dir/: frames.pcap, events.csv, probes.txt.
  * num_slaves positions are probed on each trigger. Returns 0 on success. */
 int  faultcap_open(const char *iface, int num_slaves, const char *dir);
+
+/* TIME BASE. Every t_ns handed to this module is an ABSOLUTE CLOCK_MONOTONIC
+ * reading; this is the one place the run's start is subtracted, so everything
+ * written out shares the time base the console log prints.
+ *
+ * It exists because both tools got this wrong in opposite directions: the ESC
+ * event path passed absolute while the probe path passed relative, so
+ * events.csv carried a constant offset against probes.txt and the log — 847 s
+ * in the 2026-09-30 run, enough to make the two files look unrelatable. Having
+ * callers subtract for themselves is what allowed them to disagree.
+ *
+ * Unset, the epoch is 0 and timestamps stay absolute. */
+void faultcap_set_epoch(uint64_t t0_ns);
 void faultcap_close(void);
 
 /* RX thread. Non-blocking. buf/len are the frame as received (including the
@@ -62,7 +75,8 @@ int  faultcap_burst_settled(uint64_t now_ns, uint64_t quiet_ns);
 /* Supervisor, blocking. Drains both rings to disk, then probes every position
  * and appends the perishable PHY registers to probes.txt. The caller MUST
  * have paused TX and muted RX accounting first — this puts frames on the same
- * wire. Returns the number of positions successfully probed. */
+ * wire. trigger_ns is ABSOLUTE, like every other time here. Returns the number
+ * of positions successfully probed. */
 int  faultcap_probe(const char *iface, uint64_t trigger_ns);
 
 /* Supervisor. Drain rings without probing (used at shutdown). */

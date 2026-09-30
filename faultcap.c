@@ -46,6 +46,16 @@ static void pcap_write_frame(FILE *f, uint64_t t_ns, const uint8_t *b, int len) 
     fwrite(b, 1, (size_t)len, f);
 }
 
+static uint64_t g_epoch = 0;
+
+void faultcap_set_epoch(uint64_t t0_ns) { g_epoch = t0_ns; }
+
+/* Absolute monotonic -> seconds since the run started. Saturates at 0 rather
+ * than wrapping, so a stray pre-epoch timestamp cannot print as ~1.8e10 s. */
+static double faultcap_rel(uint64_t t_ns) {
+    return t_ns > g_epoch ? (double)(t_ns - g_epoch) / 1e9 : 0.0;
+}
+
 int faultcap_open(const char *iface, int num_slaves, const char *dir) {
     (void)iface;
     char p[512];
@@ -125,10 +135,12 @@ void faultcap_flush(void) {
     uint64_t h = atomic_load_explicit(&g_fhead, memory_order_acquire);
     while (t < h) {
         FrameRec *r = &g_fring[t % FRAME_RING];
-        if (g_pcap) pcap_write_frame(g_pcap, r->t_ns, r->buf, r->len);
+        if (g_pcap)
+            pcap_write_frame(g_pcap, r->t_ns - (r->t_ns > g_epoch ? g_epoch : 0),
+                             r->buf, r->len);
         if (g_events_csv)
             fprintf(g_events_csv, "%.9f,frame,,,,,%u,0x%X\n",
-                    (double)r->t_ns / 1e9, r->len, r->reason);
+                    faultcap_rel(r->t_ns), r->len, r->reason);
         t++;
     }
     atomic_store_explicit(&g_ftail, t, memory_order_release);
@@ -139,7 +151,7 @@ void faultcap_flush(void) {
         EventRec *r = &g_ering[t % EVENT_RING];
         if (g_events_csv)
             fprintf(g_events_csv, "%.9f,esc,%d,%d,%s,%u,,\n",
-                    (double)r->t_ns / 1e9, r->slave, r->port, r->counter, r->delta);
+                    faultcap_rel(r->t_ns), r->slave, r->port, r->counter, r->delta);
         t++;
     }
     atomic_store_explicit(&g_etail, t, memory_order_release);
@@ -175,7 +187,7 @@ int faultcap_probe(const char *iface, uint64_t trigger_ns) {
 
     uint64_t seq = ++g_probe_seq;
     fprintf(g_probes, "\n═══ probe %lu, triggered at t=+%.6f s, after %lu event(s) ═══\n",
-            seq, (double)trigger_ns / 1e9, faultcap_event_count());
+            seq, faultcap_rel(trigger_ns), faultcap_event_count());
 
     int probed = 0;
     for (int pos = 0; pos < g_nslaves; pos++) {

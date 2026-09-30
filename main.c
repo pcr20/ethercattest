@@ -400,6 +400,7 @@ int main(int argc, char *argv[]) {
 
     if (faultdir) {
         if (faultcap_open(iface, num_slaves, faultdir) != 0) return 1;
+        faultcap_set_epoch(start_ns);
         printf("Fault capture: %s/ (frames.pcap, events.csv, probes.txt)\n"
                "  stop after %lu ESC error event(s)%s\n",
                faultdir, stop_after_errors,
@@ -532,7 +533,7 @@ int main(int argc, char *argv[]) {
                 uint64_t txok_before = read_nic_tx_packets(iface);
                 (void)drained;
 
-                int np = faultcap_probe(iface, now - start_ns);
+                int np = faultcap_probe(iface, now);
 
                 /* Same foreign-frame accounting as the external pause: we
                  * transmitted nothing, so every frame the NIC put on the wire

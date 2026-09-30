@@ -17,6 +17,7 @@
 #include "faultcap.h"
 #include "pace.h"
 #include "acyclic.h"
+#include "recovery.h"
 #include "nic.h"
 #include "everest_pdo.h"
 #include <getopt.h>
@@ -44,8 +45,12 @@ static void usage(const char *p)
            "                    to test whether burst length drives the fault\n"
            "  -d <sec>          duration, default 3600\n"
            "  -F <dir>          fault capture: PHY probe on a lost link\n"
-           "  --observe         reserved. TwinCAT's recovery is not implemented\n"
-           "                    yet, so watching is already the only behaviour\n"
+           "  --observe         do NOT recover from a link drop — probe and log\n"
+           "                    it, then leave the chain severed. At most one\n"
+           "                    drop per run is then measurable. This was the\n"
+           "                    only behaviour before recovery existed.\n"
+           "  --link-timeout <s> give up waiting for a dropped link to come back\n"
+           "                    after this long, default 30\n"
            "  -t <ms>           transaction timeout, default 50\n"
            "  -v                verbose\n"
            "\n"
@@ -71,6 +76,7 @@ int main(int argc, char **argv)
     const char *iface = NULL, *faultdir = NULL;
     int chain = 0, rate = 1000, dur = 3600, observe = 0, verbose = 0, tmo = 50;
     int jitter = 0, no_clear = 0;   /* --random N, --no-clear */
+    int link_timeout = 30;          /* --link-timeout, seconds */
     int min_burst = 0;   /* --burst: pad every cycle to this many frames */
     int op_pos[OP_MAX_SLAVES], n_op = 0;
 
@@ -80,6 +86,7 @@ int main(int argc, char **argv)
         {"burst",   required_argument, 0, 3},
         {"random",  required_argument, 0, 4},
         {"no-clear",no_argument,       0, 5},
+        {"link-timeout", required_argument, 0, 6},
         {"help",    no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
@@ -103,6 +110,7 @@ int main(int argc, char **argv)
         case 3: min_burst = atoi(optarg); break;
         case 4: jitter = atoi(optarg); break;
         case 5: no_clear = 1; break;
+        case 6: link_timeout = atoi(optarg); break;
         default: usage(argv[0]); return c == 'h' ? 0 : 1;
         }
     }
@@ -140,11 +148,18 @@ int main(int argc, char **argv)
            " lost-link 0x0310 every 203\n", no_clear ? " (clear suppressed)" : "");
     if (min_burst) printf("Burst:      padded to %d frames per cycle\n", min_burst);
     printf("Duration:   %d s\n", dur);
-    printf("On a drop:  probe FLDS/RECR, log it, keep watching\n");
-    printf("            TwinCAT's recovery (close port, wait 2 s, reopen,\n");
-    printf("            re-init) is NOT implemented in this build%s\n",
-           observe ? " — and --observe is the only behaviour there is"
-                   : ", so --observe is currently the only behaviour");
+    printf("On a drop:  probe FLDS/RECR, log it, then ");
+    if (observe)
+        printf("WATCH ONLY (--observe).\n"
+               "            The chain stays severed, so expect at most one\n"
+               "            measurable drop for the rest of the run.\n");
+    else
+        printf("recover as TwinCAT does:\n"
+               "            force the port closed (0x0101), wait for the physical\n"
+               "            link to return (TwinCAT saw 2.00 s; we wait, we do not\n"
+               "            assume), hold 1.000 s, reopen, re-init to OP.\n"
+               "            Give up on a link that stays down for %d s.\n",
+               link_timeout);
     op_print_write_warning(&m);
 
     if (esc_open(&m.ctx, iface, 0, tmo) != 0) return 1;
@@ -203,8 +218,19 @@ int main(int argc, char **argv)
         printf("Acyclic timers: +/-%d cycles, seeds 0x%016lX / 0x%016lX\n",
                jitter, job_rdclr.rng, job_lost.rng);
 
+    /* Line-buffered, so a run redirected to a file keeps its log up to the
+     * last line even if the process is killed. Fully-buffered stdout is how
+     * the 2026-09-29 two-slave run lost everything it had printed. */
+    setvbuf(stdout, NULL, _IOLBF, 0);
+
     PaceState pace; uint64_t t0 = now_ns();
     pace_init(&pace, rate, t0);
+    faultcap_set_epoch(t0);          /* events.csv on the same clock as this log */
+
+    RecCtx rec; rec_init(&rec, 1000000000ULL,
+                         (uint64_t)link_timeout * 1000000000ULL);
+    uint8_t rec_loop_base = 0xF4;    /* 0x0101 as found, restored on reopen */
+    uint64_t next_beat = t0 + 60000000000ULL;   /* heartbeat every 60 s */
     uint64_t end = t0 + (uint64_t)dur * 1000000000ULL;
     uint64_t cycles = 0, short_burst = 0, wkc_bad = 0;
     uint64_t burst_hist[OP_BURST_MAX + 1]; memset(burst_hist, 0, sizeof burst_hist);
@@ -262,7 +288,7 @@ int main(int argc, char **argv)
         burst_hist[burst.n <= OP_BURST_MAX ? burst.n : OP_BURST_MAX]++;
         if (n < 0) { short_burst++; pace_on_sent(&pace, now_ns()); continue; }
 
-        int dropped = 0;
+        int dropped = 0, drop_slave = -1, drop_port = -1;
         uint64_t tn = now_ns();
         for (int i = 0; i < n; i++) {
             OpResult *o = &res[i];
@@ -307,6 +333,7 @@ int main(int argc, char **argv)
                         if (have_prev[s] && c != prev_diag[s][16 + port]) {
                             unsigned dl2 = (uint8_t)(c - prev_diag[s][16 + port]);
                             tot_lost[s][port] += dl2; lost_events += dl2; dropped = 1;
+                            drop_slave = s; drop_port = port;
                             faultcap_esc_event(tn, s, port, "lostlink", dl2);
                             printf("  [%8.3f] slave %2d port %d  *** LOST LINK +%u "
                                    "(now %u) ***\n", (double)(tn - t0) / 1e9,
@@ -320,10 +347,88 @@ int main(int argc, char **argv)
         }
         if (dropped && faultdir) {
             faultcap_flush();
-            int np = faultcap_probe(iface, now_ns() - t0);
+            int np = faultcap_probe(iface, now_ns());
             printf("  -> probed %d position(s) for FLDS/RECR\n", np);
         }
-        (void)observe;
+
+        /* ── Recovery, as TwinCAT does it (TWINCAT.md §6.6) ───────────────
+         * Sequencing lives in recovery.h and is unit-tested; this performs
+         * the actions it asks for. Without it the first drop ends the
+         * experiment: the 2026-09-30 run spent 89% of its cycles on a severed
+         * chain and could not yield a rate. */
+        if (!observe && dropped)
+            if (rec_on_drop(&rec, tn, drop_slave, drop_port))
+                printf("  -> recovering slave %d port %d\n", drop_slave, drop_port);
+
+        if (!observe && rec_busy(&rec)) {
+            int link_up = 0;
+            if (rec.state == REC_CLOSED) {
+                uint8_t dl[2] = {0, 0};
+                if (op_aprd(&m, rec.slave, 0x0110, dl, 2) >= 1) {
+                    uint16_t v = (uint16_t)(dl[0] | (dl[1] << 8));
+                    link_up = rec_link_up(v, rec.port);
+                }
+            }
+            switch (rec_step(&rec, now_ns(), link_up)) {
+            case REC_ACT_CLOSE_PORT: {
+                uint8_t base = 0;
+                if (op_aprd(&m, rec.slave, REG_DL_CTRL_P, &base, 1) >= 1)
+                    rec_loop_base = base;        /* restore exactly what was there */
+                uint8_t shut = rec_loop_closed(rec_loop_base, rec.port);
+                int w = op_apwr(&m, rec.slave, REG_DL_CTRL_P, &shut, 1);
+                printf("  [%8.3f] port closed: 0x0101 0x%02X -> 0x%02X (wkc %d)\n",
+                       (double)(now_ns() - t0) / 1e9, rec_loop_base, shut, w);
+                break; }
+            case REC_ACT_OPEN_PORT: {
+                uint8_t open_b = rec_loop_auto(rec_loop_base, rec.port);
+                int w = op_apwr(&m, rec.slave, REG_DL_CTRL_P, &open_b, 1);
+                printf("  [%8.3f] link back after %.3f s, debounce done, "
+                       "port reopened 0x%02X (wkc %d)\n",
+                       (double)(now_ns() - t0) / 1e9,
+                       (double)(rec.t_link_back - rec.t_drop) / 1e9, open_b, w);
+                break; }
+            case REC_ACT_REINIT: {
+                int bad = 0;
+                for (int k = 0; k < n_op; k++) {
+                    if (m.sl[k].position <= rec.slave) continue;
+                    if (op_bring_up(&m, &m.sl[k]) != 0) {
+                        printf("  [%8.3f] re-init of position %d FAILED "
+                               "(AL code 0x%04X %s)\n",
+                               (double)(now_ns() - t0) / 1e9, m.sl[k].position,
+                               m.sl[k].al_code, op_al_code_name(m.sl[k].al_code));
+                        bad = 1;
+                    }
+                }
+                if (!bad && op_go_operational(&m, m.sl[0].log_addr, pd_len,
+                                              5000) != 0)
+                    bad = 1;
+                printf("  [%8.3f] *** RECOVERED in %.3f s%s ***\n",
+                       (double)(now_ns() - t0) / 1e9,
+                       (double)rec.outage_ns_max / 1e9,
+                       bad ? " — but the chain is NOT back in OP" : "");
+                /* The counters just re-read across a re-init would look like
+                 * fresh deltas; drop the baselines so the next poll re-seeds. */
+                for (int k = 0; k < chain; k++) have_prev[k] = 0;
+                break; }
+            case REC_ACT_GIVE_UP:
+                printf("  [%8.3f] *** link on slave %d port %d did not return "
+                       "in %d s — giving up, chain stays severed ***\n",
+                       (double)(now_ns() - t0) / 1e9, rec.slave, rec.port,
+                       link_timeout);
+                break;
+            case REC_ACT_NONE: break;
+            }
+        }
+
+        /* Heartbeat, so a killed run still leaves a record of how far it got
+         * and how many links dropped — which the 2026-09-29 run did not. */
+        if (now_ns() >= next_beat) {
+            next_beat += 60000000000ULL;
+            printf("  [%8.3f] .. %lu cycles, %lu lost-link event(s), "
+                   "%lu recovered, %lu abandoned\n",
+                   (double)(now_ns() - t0) / 1e9, cycles, lost_events,
+                   rec.recoveries, rec.timeouts);
+        }
         pace_on_sent(&pace, now_ns());
     }
 
@@ -346,6 +451,24 @@ int main(int argc, char **argv)
            pace.count ? (double)pace.sum_ns / pace.count / 1000.0 : 0.0,
            pace.min_ns / 1000.0, pace.max_ns / 1000.0, pace.late, pace.missed);
     printf("  *** LOST LINK events: %lu ***\n", lost_events);
+    if (observe) {
+        printf("  Recovery:       disabled (--observe)\n");
+    } else {
+        printf("  Recoveries:     %lu completed, %lu abandoned\n",
+               rec.recoveries, rec.timeouts);
+        if (rec.recoveries)
+            printf("  Outage:         mean %.3f s, max %.3f s  "
+                   "(TwinCAT's was 3.00 s every time)\n",
+                   (double)rec.outage_ns_total / rec.recoveries / 1e9,
+                   (double)rec.outage_ns_max / 1e9);
+        /* The at-risk time is what a rate must be divided by: OP time minus
+         * the outages, which is how TWINCAT.md §6.4 derives 0.118/s. */
+        double at_risk = secs - (double)rec.outage_ns_total / 1e9;
+        if (at_risk > 0)
+            printf("  At-risk time:   %.1f s -> %.4f drops/s  "
+                   "(TwinCAT on this hardware: 0.118/s)\n",
+                   at_risk, lost_events / at_risk);
+    }
     for (int s = 0; s < chain; s++)
         for (int p = 0; p < 4; p++)
             if (tot_invalid[s][p] || tot_rxerr[s][p] || tot_fwd[s][p] || tot_lost[s][p])
