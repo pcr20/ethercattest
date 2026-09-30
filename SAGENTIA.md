@@ -46,10 +46,10 @@ Across five four-slave runs the rate is **0.1049 drops/s**, 95% CI
 this same hardware. The intervals overlap comfortably: the rig reproduces the
 field fault at a rate indistinguishable from the field's.
 
-**The suspect is now one PHY.** Every Fast Link Drop firing recorded — six of
-them across four runs — has been on `#nolabel`'s port 1, facing `#17`, at
-three different positions in the chain (§4.4). No other PHY has ever latched
-`FLDS`.
+**Three different devices have dropped a link** — `#14`, `#16` and `#nolabel`
+— so this is not one faulty unit. But the six drops that latched a Fast Link
+Drop reason are all on `#nolabel`'s port 1 facing `#17`, at three different
+chain positions, and the two on other devices latched nothing (§4.4).
 
 The result does **not** reduce to a bad cable or a bad unit, and it is not a
 property of the field units. The link `#nolabel ↔ #17` was silent for 517.7 s
@@ -334,39 +334,69 @@ So chain position is excluded. A link that fails as position 0 also fails as
 position 2, and the two lab drives are just as effective at provoking it from
 in front as from behind.
 
-### 4.4 Every FLD firing is on one PHY
+### 4.4 Which links drop, and which latch a reason
 
 Tabulating all eight drop events by the *physical* link rather than the slave
-index:
+index. "Near PHY" is the one on the master side of the break — the only side
+still reachable once the link is down.
 
-| run | chain | link that dropped | `FLDS` on the near PHY |
-|---|---|---|---|
-| 1 | field | `#16 ↔ #nolabel` | `0x0000` |
-| 1 | field | `#14 ↔ #16` | `0x0000` |
-| 3 | field | **`#nolabel ↔ #17`** | **`0x0080`** |
-| 6 | mixed A | **`#nolabel ↔ #17`** | **`0x0080`** |
-| 7 | mixed A | **`#nolabel ↔ #17`** | **`0x0080`** |
-| 8 | mixed B | **`#nolabel ↔ #17`** | **`0x0080`** ×3 |
+| run | chain | link that dropped | near PHY | was it probed? | `FLDS` |
+|---|---|---|---|---|---|
+| 1 | field | `#16 ↔ #nolabel` | `#16` p1 | yes, link down | `0x0000` |
+| 1† | field | `#14 ↔ #16` | `#14` p1 | yes, link down | `0x0000` |
+| 3 | field | **`#nolabel ↔ #17`** | `#nolabel` p1 | yes, link down | **`0x0080`** |
+| 6 | mixed A | **`#nolabel ↔ #17`** | `#nolabel` p1 | yes | **`0x0080`** |
+| 7 | mixed A | **`#nolabel ↔ #17`** | `#nolabel` p1 | yes | **`0x0080`** |
+| 8 | mixed B | **`#nolabel ↔ #17`** ×3 | `#nolabel` p1 | yes ×3 | **`0x0080`** ×3 |
 
-Six of eight drops are the same link, and **every one of the six latched Fast
-Link Drop on the RX-error criterion**. The two that did not are the two on
-other links, and in both of those the near PHY latched nothing — consistent
-with §3.5 reading 1, that the far partner's FLD fired and it was unreachable
-by probe time.
+† this one happened 24 s *after* the chain had already severed, so it is not an
+independent at-risk observation — see below.
 
-The `#5 ↔ #0` link — the two lab drives — has **never dropped**, at either end
-of the chain. So those units are a necessary *enabler* and never a victim:
-their presence makes `#nolabel ↔ #17` fail, and they are fine themselves.
+**Three devices have dropped a link: `#14`, `#16` and `#nolabel`.** This is not
+one faulty unit, and none of the four is exonerated.
 
-That is the sharpest statement the data supports:
+What *is* specific to `#nolabel` is the latched reason. Six of six drops on its
+port 1 recorded `FLDS = 0x0080`; the two on `#14` and `#16` recorded nothing —
+and not because the register was unreachable. Both were probed, both showed
+their own link down (`BMSR = 0x7849`, `PHYSTS` bit 0 clear), and both read
+`FLDS = 0x0000`. So the near PHY genuinely did not fire.
 
-> `#nolabel`'s port-1 PHY drops its link on RX errors, but only when at least
-> two further devices are present in the chain — regardless of where they sit,
-> and regardless of whose they are.
+Two readings remain open, as in §3.5:
 
-The pair control remains the counterweight: the very same link, the same two
+1. **The far partner fired.** When `#16 ↔ #nolabel` breaks, `#nolabel`'s *port
+   0* is the far side and is unreachable. If its FLD fired, we could not have
+   seen it. Under this reading `#nolabel` is the only device that ever drops a
+   link, on whichever port, and the pattern is clean.
+2. **`#14` and `#16` dropped by the ordinary link-loss path**, not FLD, which
+   would mean two mechanisms.
+
+Nothing yet separates these. Recovery (§5.1) is what would: bring the far side
+back and probe it before its latch is cleared.
+
+**The `#5 ↔ #0` link has never dropped**, at either end of the chain, in three
+runs. Nor has `#17 ↔ #5` or `#0 ↔ #nolabel`. So the lab drives are a necessary
+*enabler* and never a victim: their presence makes `#nolabel ↔ #17` fail, and
+they are fine themselves.
+
+The most the data supports:
+
+> The `#nolabel ↔ #17` link is much the most fragile — six of eight drops —
+> and is the only one whose failures have a latched cause. But `#14 ↔ #16` and
+> `#16 ↔ #nolabel` have failed too, so fragility is not confined to one link
+> or one unit.
+
+The pair control remains the counterweight: `#nolabel ↔ #17`, the same two
 units and the same cable, ran 517.7 s in isolation without a single drop
 (§4.2).
+
+#### The `#14 ↔ #16` drop is a weaker observation than the rest
+
+It occurred at t = 32.708 s in run 1, 24 s after the `#16 ↔ #nolabel` break at
+8.689 s. From then on the master could reach only `#14` and `#16`; the other
+two were physically present and powered but cut off. So that drop happened
+under conditions no other run reproduces, and it is excluded from every rate
+in §4.1. It is recorded here because it bears on *which devices can drop a
+link* — which is the question this section answers — not on how often.
 
 ### 4.5 Relation to the corruption fault's condition 2
 
