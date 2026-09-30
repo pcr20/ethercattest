@@ -282,8 +282,37 @@ int op_check_identity(OpMaster *m)
 }
 
 /* ── State machine ────────────────────────────────────────────────────────*/
+int op_ack_error(OpMaster *m, OpSlave *s, int timeout_ms)
+{
+    uint16_t st = 0;
+    if (op_fprd(m, s->station, REG_AL_STATUS, &st, 2) < 1) return 0;
+    s->al_state = st;
+    if (!op_alack_needed(st)) return 0;              /* nothing latched      */
+
+    uint16_t code = 0;
+    op_fprd(m, s->station, REG_AL_CODE, &code, 2);
+    s->al_code = code;
+
+    uint16_t ack = op_alack_request(st);
+    if (op_fpwr(m, s->station, REG_AL_CTRL, &ack, 2) < 1) return -1;
+
+    uint64_t deadline = now_ns() + (uint64_t)timeout_ms * 1000000ULL;
+    for (;;) {
+        uint16_t now_st = 0;
+        if (op_fprd(m, s->station, REG_AL_STATUS, &now_st, 2) >= 1) {
+            s->al_state = now_st;
+            if (!op_alack_needed(now_st)) return 0;  /* cleared              */
+        }
+        if (now_ns() > deadline) return -1;          /* would not clear      */
+        struct timespec ts = {0, 1000000}; nanosleep(&ts, NULL);
+    }
+}
+
 int op_set_state(OpMaster *m, OpSlave *s, uint16_t state, int timeout_ms)
 {
+    /* A latched error makes every state request a no-op, so clear it first. */
+    op_ack_error(m, s, 200);
+
     uint16_t req = state;
     if (op_fpwr(m, s->station, REG_AL_CTRL, &req, 2) < 1) return -1;
 
@@ -403,6 +432,17 @@ int op_bring_up(OpMaster *m, OpSlave *s)
     uint8_t  sm[16], fmmu[16];
     uint16_t v2;
 
+    /* Start from a known state, so this is idempotent and can be re-run after
+     * a link drop. A slave that expired its SyncManager watchdog during an
+     * outage sits in SAFEOP with the error latched, and would reject the
+     * SyncManager reconfiguration below; clear the error, then drop it to
+     * INIT. On a first bring-up the bus reset has already left it in INIT and
+     * both calls are no-ops. */
+    if (s->station) {
+        op_ack_error(m, s, 200);
+        op_set_state(m, s, AL_INIT, 2000);
+    }
+
     /* Station address, so fixed addressing works from here on. */
     v2 = s->station;
     if (op_apwr(m, s->position, REG_STATION, &v2, 2) < 1) {
@@ -500,6 +540,9 @@ int op_go_operational(OpMaster *m, uint32_t log_addr, uint16_t pd_len,
     }
 
     for (int i = 0; i < m->n_op; i++) {
+        /* Same reason as op_set_state: a slave still holding an error from a
+         * previous outage would ignore this request silently. */
+        op_ack_error(m, &m->sl[i], 200);
         uint16_t req = AL_OP;
         if (op_fpwr(m, m->sl[i].station, REG_AL_CTRL, &req, 2) < 1) {
             fprintf(stderr, "  position %d: OP request not accepted\n",

@@ -428,6 +428,62 @@ int main(void)
                    "to slaves\n");
     }
 
+    /* ── T12: a latched AL error must be acknowledged, not re-requested ───
+     *
+     * Regression for run 6 of SAGENTIA.md. Recovery closed a port for 2.9 s;
+     * the three slaves behind it expired their SyncManager watchdogs (AL code
+     * 0x001B) and latched the error bit. op_set_state then wrote plain state
+     * requests, which a slave holding an error ignores, so all three re-inits
+     * failed and the chain ran 306 s with three of four slaves out of OP.
+     *
+     * The rule: while AL status bit 4 is set, the next write to AL control
+     * must carry bit 4 (acknowledge) and must keep the slave's CURRENT state
+     * in bits 3:0 — it clears the error, it does not request a transition. */
+    {
+        int f0 = fails;
+        /* SAFEOP + error, which is where a watchdog expiry leaves a drive */
+        CHECK(op_alack_needed(AL_SAFEOP | AL_ERR) == 1,
+              "T12: SAFEOP+error must need an acknowledge");
+        CHECK(op_alack_request(AL_SAFEOP | AL_ERR) == (AL_SAFEOP | AL_ERR_ACK),
+              "T12: acknowledge of SAFEOP+error was 0x%02X, want 0x%02X",
+              op_alack_request(AL_SAFEOP | AL_ERR), AL_SAFEOP | AL_ERR_ACK);
+
+        /* OP + error, and INIT + error */
+        CHECK(op_alack_request(AL_OP   | AL_ERR) == (AL_OP   | AL_ERR_ACK),
+              "T12: OP+error acknowledge wrong");
+        CHECK(op_alack_request(AL_INIT | AL_ERR) == (AL_INIT | AL_ERR_ACK),
+              "T12: INIT+error acknowledge wrong");
+
+        /* A healthy slave needs nothing, whatever state it is in. */
+        for (uint16_t st = AL_INIT; st <= AL_OP; st <<= 1)
+            CHECK(op_alack_needed(st) == 0,
+                  "T12: state 0x%02X with no error bit asked for an "
+                  "acknowledge", st);
+
+        /* The acknowledge must not smuggle in a state change: the state bits
+         * it writes are exactly the ones it read. */
+        CHECK((op_alack_request(AL_SAFEOP | AL_ERR) & 0x0F) == AL_SAFEOP,
+              "T12: the acknowledge changed the requested state — it must "
+              "only clear the error");
+        /* ...and it must not be confused with a plain request, which is what
+         * the bug was: the two differ by exactly bit 4. */
+        CHECK(op_alack_request(AL_SAFEOP | AL_ERR) != AL_SAFEOP,
+              "T12: the acknowledge is indistinguishable from the plain "
+              "request that the slave ignores");
+
+        /* High bits of AL status (vendor/reserved) must not leak into the
+         * write. A real status read returns more than the low nibble. */
+        CHECK(op_alack_request(0xFF00 | AL_SAFEOP | AL_ERR)
+                  == (AL_SAFEOP | AL_ERR_ACK),
+              "T12: high status bits leaked into the AL control write (0x%04X)",
+              op_alack_request(0xFF00 | AL_SAFEOP | AL_ERR));
+        if (fails == f0)
+            printf("T12 PASS: AL status 0x%02X (SAFEOP+ERR) is answered by "
+                   "AL control 0x%02X (SAFEOP+ACK), not by a bare 0x%02X\n",
+                   AL_SAFEOP | AL_ERR, op_alack_request(AL_SAFEOP | AL_ERR),
+                   AL_SAFEOP);
+    }
+
     if (fails) { printf("\n*** OP SEQUENCE FAILURES ***\n"); return 1; }
     printf("\nALL OP SEQUENCE TESTS PASS\n");
     return 0;

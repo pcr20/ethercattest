@@ -62,6 +62,26 @@
 #define AL_SAFEOP  0x04
 #define AL_OP      0x08
 #define AL_ERR_ACK 0x10   /* OR into a control write to acknowledge an error */
+#define AL_ERR     0x10   /* same bit in AL STATUS: the slave has latched one */
+
+/* ── Acknowledging a latched AL error ───────────────────────────────────────
+ * A slave that has raised an AL error sets bit 4 of AL status and then refuses
+ * every state request until the error is acknowledged by a write to AL control
+ * with bit 4 set. Requesting a state without it is silently ineffective.
+ *
+ * This cost run 6 of SAGENTIA.md its whole measurement: recovery closed the
+ * port for 2.9 s, the three slaves behind it expired their SyncManager
+ * watchdogs (AL code 0x001B), and every re-init was then refused, so the chain
+ * ran 306 s with three of four slaves out of OP.
+ *
+ * The acknowledge keeps the slave's CURRENT state in bits 3:0 — it clears the
+ * error, it does not request a transition. The transition is requested
+ * separately once the error bit has gone. Pure; unit-tested in t_opseq. */
+static inline int op_alack_needed(uint16_t al_status)
+{ return (al_status & AL_ERR) != 0; }
+
+static inline uint16_t op_alack_request(uint16_t al_status)
+{ return (uint16_t)((al_status & 0x0F) | AL_ERR_ACK); }
 
 /* ESC registers this module touches. */
 #define REG_TYPE        0x0000
@@ -173,6 +193,12 @@ int op_bring_up(OpMaster *m, OpSlave *s);
  * all reach OP. */
 int op_go_operational(OpMaster *m, uint32_t log_addr, uint16_t pd_len,
                       int timeout_ms);
+
+/* Clear a latched AL error so state requests are accepted again. Returns 0 if
+ * there was nothing to clear or the error went away, -1 if it persisted (code
+ * left in s->al_code). Called automatically by op_set_state() and
+ * op_go_operational(); exposed because a caller may want it on its own. */
+int op_ack_error(OpMaster *m, OpSlave *s, int timeout_ms);
 
 /* Request a state and wait for the slave to report it. Returns 0 on success,
  * -1 if the slave signalled an AL error (code in s->al_code), or -2 if it

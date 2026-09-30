@@ -18,6 +18,7 @@
 #include "pace.h"
 #include "acyclic.h"
 #include "recovery.h"
+#include "atrisk.h"
 #include "nic.h"
 #include "everest_pdo.h"
 #include <getopt.h>
@@ -227,6 +228,9 @@ int main(int argc, char **argv)
     pace_init(&pace, rate, t0);
     faultcap_set_epoch(t0);          /* events.csv on the same clock as this log */
 
+    AtRisk risk; ar_init(&risk, t0);
+    uint64_t drop_events = 0;      /* physical drops, not counter increments */
+
     RecCtx rec; rec_init(&rec, 1000000000ULL,
                          (uint64_t)link_timeout * 1000000000ULL);
     uint8_t rec_loop_base = 0xF4;    /* 0x0101 as found, restored on reopen */
@@ -288,7 +292,7 @@ int main(int argc, char **argv)
         burst_hist[burst.n <= OP_BURST_MAX ? burst.n : OP_BURST_MAX]++;
         if (n < 0) { short_burst++; pace_on_sent(&pace, now_ns()); continue; }
 
-        int dropped = 0, drop_slave = -1, drop_port = -1;
+        int dropped = 0, drop_slave = -1, drop_port = -1, chain_ok = 0;
         uint64_t tn = now_ns();
         for (int i = 0; i < n; i++) {
             OpResult *o = &res[i];
@@ -300,6 +304,8 @@ int main(int argc, char **argv)
                     if (++wkc_bad < 20)
                         printf("  [%8.3f] process-data WKC %u (expected %u)\n",
                                (double)(tn - t0) / 1e9, o->wkc, wkc_expected);
+                } else if (wkc_expected != 0xFFFF) {
+                    chain_ok = 1;     /* every slave answered: at risk        */
                 }
             } else if (o->cmd == ECAT_CMD_FPRD_M && o->ado == REG_ERR_CNT) {
                 /* The counters are zeroed every ~104 ms, so a reading is the
@@ -345,6 +351,9 @@ int main(int argc, char **argv)
                 }
             }
         }
+        ar_cycle(&risk, tn, chain_ok);
+        if (dropped) drop_events++;
+
         if (dropped && faultdir) {
             faultcap_flush();
             int np = faultcap_probe(iface, now_ns());
@@ -461,14 +470,22 @@ int main(int argc, char **argv)
                    "(TwinCAT's was 3.00 s every time)\n",
                    (double)rec.outage_ns_total / rec.recoveries / 1e9,
                    (double)rec.outage_ns_max / 1e9);
-        /* The at-risk time is what a rate must be divided by: OP time minus
-         * the outages, which is how TWINCAT.md §6.4 derives 0.118/s. */
-        double at_risk = secs - (double)rec.outage_ns_total / 1e9;
-        if (at_risk > 0)
-            printf("  At-risk time:   %.1f s -> %.4f drops/s  "
-                   "(TwinCAT on this hardware: 0.118/s)\n",
-                   at_risk, lost_events / at_risk);
     }
+    /* At-risk time is cycles with every slave answering — NOT elapsed minus
+     * the recovery outage, which credited 306 s of severed chain in run 6 of
+     * SAGENTIA.md and understated that rate by ~140x. */
+    printf("  At-risk time:   %.3f s of %.1f s elapsed (%.1f%% of cycles)\n",
+           ar_seconds(&risk), secs,
+           cycles ? 100.0 * risk.cycles / cycles : 0.0);
+    if (risk.ns)
+        printf("  Drop rate:      %.4f drops/s over the at-risk time  "
+               "(TwinCAT on this hardware: 0.118/s)\n",
+               ar_rate(&risk, drop_events));
+    else
+        printf("  Drop rate:      no at-risk time — the chain never reached "
+               "a healthy WKC\n");
+    printf("  Physical drops: %lu  (counter increments: %lu)\n",
+           drop_events, lost_events);
     for (int s = 0; s < chain; s++)
         for (int p = 0; p < 4; p++)
             if (tot_invalid[s][p] || tot_rxerr[s][p] || tot_fwd[s][p] || tot_lost[s][p])

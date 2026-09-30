@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "recovery.h"
+#include "atrisk.h"
 
 static int fails = 0;
 #define CHECK(c, ...) do { if(!(c)) { printf("FAIL: "); printf(__VA_ARGS__); \
@@ -197,6 +198,55 @@ int main(void)
         if (fails == f0)
             printf("T8 PASS: outage totals track (max %.3f s, mean %.3f s)\n",
                    (double)r.outage_ns_max / 1e9, mean);
+    }
+
+    /* ── T9: at-risk time counts only cycles with the chain healthy ──────
+     *
+     * Regression for run 6 of SAGENTIA.md. It dropped at t=2.163 s, failed to
+     * re-initialise, then ran 306 s with three of four slaves out of OP, and
+     * ecat_op reported "At-risk time: 308.2 s" because it subtracted only the
+     * 2.9 s recovery outage from the elapsed time. The rate was understated by
+     * ~140x — a reproduction made to look like a near-negative. */
+    {
+        int f0 = fails;
+        AtRisk a; ar_init(&a, 0);
+        for (uint64_t t = MS; t <= 10 * SEC; t += MS) ar_cycle(&a, t, 1);
+        CHECK(ar_seconds(&a) > 9.998 && ar_seconds(&a) < 10.001,
+              "T9: a wholly healthy run should credit ~10 s, got %.4f",
+              ar_seconds(&a));
+
+        /* The run-6 shape: healthy to 2.163 s, then broken for 306 s. */
+        AtRisk b; ar_init(&b, 0);
+        for (uint64_t t = MS; t <= 2163 * MS; t += MS) ar_cycle(&b, t, 1);
+        for (uint64_t t = 2164 * MS; t <= 308 * SEC; t += MS) ar_cycle(&b, t, 0);
+        CHECK(ar_seconds(&b) > 2.160 && ar_seconds(&b) < 2.166,
+              "T9: run-6 shape should credit ~2.163 s, got %.4f — 308 s means "
+              "the severed chain is still being counted", ar_seconds(&b));
+        double rate = ar_rate(&b, 1);
+        CHECK(rate > 0.46 && rate < 0.47,
+              "T9: one drop in 2.163 s is %.4f /s, want ~0.462 (the broken "
+              "accounting gave 0.0065)", rate);
+
+        /* Nothing is credited before the first healthy cycle, so bring-up
+         * does not leak in. */
+        AtRisk c; ar_init(&c, 0);
+        for (uint64_t t = MS; t <= 5 * SEC; t += MS) ar_cycle(&c, t, 0);
+        CHECK(ar_seconds(&c) == 0.0, "T9: %.4f s credited with no healthy "
+              "cycle at all", ar_seconds(&c));
+        CHECK(ar_rate(&c, 3) == 0.0, "T9: a rate was reported with no at-risk "
+              "time — that is a divide by zero, not an infinite rate");
+
+        /* A chain that recovers resumes accumulating, and the gap is excluded. */
+        AtRisk d; ar_init(&d, 0);
+        for (uint64_t t = MS; t <= 1 * SEC; t += MS) ar_cycle(&d, t, 1);
+        for (uint64_t t = 1001 * MS; t <= 4 * SEC; t += MS) ar_cycle(&d, t, 0);
+        for (uint64_t t = 4001 * MS; t <= 5 * SEC; t += MS) ar_cycle(&d, t, 1);
+        CHECK(ar_seconds(&d) > 1.995 && ar_seconds(&d) < 2.002,
+              "T9: 1 s healthy + 3 s broken + 1 s healthy should credit ~2 s, "
+              "got %.4f", ar_seconds(&d));
+        if (fails == f0)
+            printf("T9 PASS: at-risk credits only healthy cycles "
+                   "(run-6 shape %.3f s, not 308)\n", ar_seconds(&b));
     }
 
     if (fails) { printf("\n*** RECOVERY FAILURES ***\n"); return 1; }
