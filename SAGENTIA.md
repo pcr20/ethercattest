@@ -20,11 +20,17 @@ Every earlier negative in this investigation came from our lab chain. Moving
 the same master and the same binary onto the field hardware produced the fault
 within seconds.
 
-**Four slaves in the chain → drops within 2 to 21 s. Two slaves → nothing in
-912 s. Six slaves → nothing in 435 s.** The dependence on device count is
-non-monotonic, which refutes the chain-length explanation this note carried
-until run 12 (§4.5). The same link behaves both ways depending on what else is
-in the chain (§4.2).
+**Four slaves containing the `#nolabel ↔ #17` link → drops within 2 to 21 s.
+Two slaves → nothing in 912 s. Six slaves → nothing in 435 s. Four slaves
+without that link → nothing in 172 s.** Device count is therefore not the
+variable — the dependence is non-monotonic (§4.5) — and the link is necessary
+but not sufficient (§4.6).
+
+**Two confounds could account for all of it**, and neither is yet excluded:
+which physical cable sat on which link was never recorded (§8), and every drop
+in this document happened before 14:45 while nothing has dropped since, which
+is inseparable from the six-slave result because they are the same two runs
+(§5.4). One five-minute rerun settles both (§7 item 1).
 
 | configuration | units | time in OP | first drop | total drops |
 |---|---|---|---|---|
@@ -40,6 +46,7 @@ in the chain (§4.2).
 | 4-slave, reordered (repeat) | `#5 → #0 → #nolabel → #17` | 131.7 s | **23.801 s** | 4 (**2 recovered**) |
 | **6-slave, all units** | `#5 → #0 → #14 → #16 → #nolabel → #17` | 248.6 s | — | **0** |
 | 6-slave (repeat) | `#5 → #0 → #14 → #16 → #nolabel → #17` | 186.2 s | — | **0** |
+| 4-slave, **no `#nolabel`/`#17`** | `#5 → #0 → #14 → #16` | 172.5 s | — | **0** |
 
 On one drop the PHY latched **which mechanism fired**, and it is Fast Link
 Drop on the RX-error criterion (§3), now latched on three separate drops.
@@ -550,7 +557,42 @@ In rough order of how cheaply each can be tested:
    four-chain also had `#16` upstream of `#nolabel` and *did* drop, so this
    does not explain it on its own.
 
-### 4.6 Relation to the corruption fault's condition 2
+### 4.6 Four devices without the fragile link also drop nothing
+
+Run 13 is a four-device chain built from the *other* four units —
+`#5 → #0 → #14 → #16`, with `#nolabel` and `#17` removed entirely. **172.4 s,
+zero drops**, zero WKC mismatches, 1000 Hz held.
+
+At the four-device rate of 0.0413/s that expected **7.1** drops: P = 8×10⁻⁴.
+
+So among four-device chains, the ones that drop are exactly the ones that
+contain `#nolabel ↔ #17`:
+
+| 4-device chain | contains `#nolabel ↔ #17`? | at-risk | drops |
+|---|---|---|---|
+| `#14→#16→#nolabel→#17` | yes | 29.77 s | 2 |
+| `#nolabel→#17→#5→#0` | yes | 6.33 s | 2 |
+| `#5→#0→#nolabel→#17` | yes | 375.54 s | 13 |
+| **`#5→#0→#14→#16`** | **no** | **172.43 s** | **0** |
+
+**Every configuration that has ever dropped contains that link** — though not
+every drop is *on* it: run 1's two drops were on `#16 ↔ #nolabel` and
+`#14 ↔ #16` (§4.4).
+
+Put together with §4.5, the full picture for configurations containing the
+link is:
+
+| configuration | at-risk | drops | rate |
+|---|---|---|---|
+| the pair alone | 517.7 s | 0 | ≤0.0058/s |
+| **four-device chains** | **411.6 s** | **17** | **0.0413/s** |
+| the six-device chain | 434.7 s | 0 | ≤0.0085/s |
+
+The link drops **only** in four-device chains. Two devices, no. Six devices,
+no. That is the whole of what the topology data says, and §5.4 explains why
+even this much is not yet safe to believe.
+
+### 4.7 Relation to the corruption fault's condition 2
 
 `FINDINGS.md` §1 condition 2 for the *frame-corruption* fault reads: "at least
 one device must lie beyond the EVE-NET's port-1 partner."
@@ -755,6 +797,75 @@ without any wait — but it means the fix has not yet faced the condition that
 motivated it, which was run 7's chain of three slaves behind the break rather
 than one. It did no harm and cost nothing; it is not yet proven.
 
+### 5.4 Is it the tool? The build is confounded with time
+
+`ecat_op` changed four times during this session, always between runs, and
+the drops stopped at about the same moment the last change landed. That has to
+be addressed before any of §4 is believed.
+
+**The build each run used**, from markers in its own log (`Port loop control`
+line ⇒ `b6fc00c`+; the `X s of Y s elapsed` at-risk format ⇒ `ba1881d`+;
+heartbeat ⇒ `d385a57`+):
+
+| run | ended | build | configuration | at-risk | drops |
+|---|---|---|---|---|---|
+| 1 | 13:33 | pre-recovery | field-4 | 8.69 s | 1 |
+| 2 | 13:44 | pre-recovery | pair `#14-#16` | 394.70 s | 0 |
+| 3 | 13:46 | pre-recovery | field-4 | 21.08 s | 1 |
+| 4 | 13:51 | pre-recovery | pair `#nl-#17` | 145.40 s | 0 |
+| 5 | 14:00 | `d385a57` | pair `#nl-#17` | 372.30 s | 0 |
+| 6 | 14:10 | `d385a57` | mixed A | 2.16 s | 1 |
+| 7 | 14:15 | `d385a57` | mixed A | 4.16 s | 1 |
+| 8 | 14:26 | `ba1881d` | mixed B | 30.65 s | 3 |
+| 9 | 14:37 | `ba1881d` | mixed B | 219.30 s | 8 |
+| 10 | 14:43 | **`b6fc00c`** | mixed B | 125.59 s | **2** |
+| 11 | 14:58 | **`b6fc00c`** | 6-slave | 248.59 s | 0 |
+| 12 | 15:01 | **`b6fc00c`** | 6-slave | 186.13 s | 0 |
+| 13 | 15:06 | `ca26eb1` | 4 without the link | 172.43 s | 0 |
+
+**Three things answer the concern, and one does not.**
+
+**1. The wire traffic has not changed at all.** Diffing `ecat_master.c` and
+`op_main.c` from the pre-recovery build to now: the cyclic frame builder, the
+acyclic job periods, their jitter, the burst construction and the diagnostic
+reads are untouched. `ecat_master.c`'s only changes are three hunks, all in
+the *bring-up* path (the AL error acknowledge). What the slaves see once
+cycling starts is byte-identical across all thirteen runs.
+
+```
+git diff 8e6ed0d HEAD -- op_main.c | grep -E "acy_init|op_build_cyc_frame|op_build_multi|op_burst_add"
+```
+
+returns nothing.
+
+**2. Runs 10, 11 and 12 used the same binary.** `b6fc00c` was built at 14:36
+and `ca26eb1` at 15:00; all three runs fall between. **Run 10 dropped twice on
+that binary. Runs 11 and 12 dropped nothing on it.** The only difference
+between them is the chain: four devices against six. So the build cannot
+explain the six-slave silence — the same executable produced both outcomes.
+
+**3. The one change that touches the running process is logging.** `ca26eb1`
+made stdout line-buffered, which adds a `write()` per printed line. In steady
+state that is one heartbeat a minute. It affected only run 13, whose
+configuration has never contained the fragile link.
+
+**4. What is NOT answered: the wall clock.** Every drop in this document
+happened before 14:45 and nothing has dropped since. Restricted to chains
+containing `#nolabel ↔ #17`, that split is 17 drops in 411.6 s before, zero in
+434.7 s after — P = 2×10⁻⁸. But **that is the same two runs as the six-slave
+comparison**, so "six devices" and "after 14:45" are not separable by any data
+here. Something that drifts — a connector working loose or seating better
+after repeated recabling, or a thermal effect — would look exactly like this.
+
+**The experiment that separates them costs five minutes**: rebuild mixed B
+(`#5 → #0 → #nolabel → #17`) and run it now. It dropped 13 times in 375 s
+across three earlier runs. If it drops again, time and build are both
+excluded and §4's topology result stands. If it does not, then nothing in §4
+is about topology and the entire configuration series has been measuring
+drift. This is §7 item 1.
+
+---
+
 ## 6. The contradiction with the capture
 
 `TWINCAT.md` §3 is unambiguous about TwinCAT's own arrangement:
@@ -798,14 +909,23 @@ Run 6 changed the ordering. The recovery defect (§5) now blocks everything
 else, because until it is fixed each run yields exactly one drop and then
 stops being an experiment.
 
-1. **Record which cable is on which link, then repeat one configuration.**
-   This is now the most important thing in the document and it costs nothing
-   but labelling. Every reconfiguration so far has been a recabling, and the
-   cables have never been tracked, so the whole device-count series (§4.5) may
-   be measuring cables rather than topology. Label every cable, rebuild the
-   four-slave mixed-B chain exactly, and confirm it still drops. If it does
-   not, the cable is the variable and the note's §4 needs rewriting around
-   that. If it does, swap only the `#nolabel ↔ #17` cable and run again.
+1. **Rebuild mixed B and run it again, now.** One experiment settles both
+   open confounds and it takes five minutes.
+
+   ```
+   ./ecat_op -i enp2s0 -s 4 --op 0,1,2,3 --random 5 -d 900 -F mixedB_recheck
+   ```
+
+   `#5 → #0 → #nolabel → #17` dropped 13 times in 375 s across runs 8, 9 and
+   10. If it drops again, wall-clock drift and the build are both excluded
+   (§5.4) and §4's topology result stands. If it does not, nothing in §4 is
+   about topology and the whole configuration series has been measuring drift.
+
+   **Label the cables while rebuilding it.** Every reconfiguration so far has
+   been a recabling and cable identity has never been recorded, so it is
+   confounded with topology, unit order and device count throughout (§8). Once
+   labelled, the follow-up is to swap only the `#nolabel ↔ #17` cable and run
+   again — which distinguishes a fragile link from a faulty cable.
 
 2. **Then re-run the six-slave chain longer.** 434.7 s bounds it at 0.0085/s,
    which is already 4× below the four-slave rate with P = 3×10⁻⁷, but a
@@ -944,6 +1064,7 @@ Times from the console log. "At-risk" is OP with an intact chain.
 | 10 | `opdropsagentia4_7` | `#5→#0→#nolabel→#17` | **125.590 s** | 4 (2 recovered) | slave 2 p1 ×2 | `0x0080` ×2 |
 | 11 | `opdropsagentia6` | `#5→#0→#14→#16→#nolabel→#17` | **248.594 s** | **0** | — | not triggered |
 | 12 | `opdropsagentia6_1` | `#5→#0→#14→#16→#nolabel→#17` | **186.134 s** | **0** | — | not triggered |
+| 13 | `opdropsagentia4_8` | `#5→#0→#14→#16` (no `#nolabel`/`#17`) | **172.431 s** | **0** | — | not triggered |
 
 Logs are the matching `.log` files; run 3's log is `opdropsagentia4_2og`.
 Each capture directory holds `events.csv`, `frames.pcap` and `probes.txt`.
@@ -954,9 +1075,10 @@ the chain that ran 6,144.7 s in OP without a drop (`FINDINGS.md` §10.2). Runs
 and 9 the `ba1881d` build** — the first with working recovery, and so the
 first whose at-risk time and drop rate can be quoted directly from their own
 summaries. **Run 10 is the first on `b6fc00c`**, which adds the settle wait
-and the `0x0101` snapshot; runs 11–12 use it too. Runs 11 and 12 are the
-cleanest in the set — 1000 Hz held, zero WKC mismatches, 100% of cycles
-at-risk.
+and the `0x0101` snapshot; runs 11–12 use it too, and run 13 uses `ca26eb1`.
+The full build-by-run audit, and what it does and does not rule out, is §5.4.
+Runs 11–13 are the cleanest in the set — 1000 Hz held, zero WKC mismatches,
+100% of cycles at-risk.
 
 ### Reproducing the analysis
 
