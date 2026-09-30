@@ -32,11 +32,17 @@ within seconds.
 | 2-slave pair | `#nolabel → #17` | 145.4 s | — | **0** |
 | 2-slave pair (repeat) | `#nolabel → #17` | 372.3 s | — | **0** |
 | 4-slave, **2 lab units appended** | `#nolabel → #17 → #5 → #0` | 311.1 s | **2.163 s** | 2 |
+| 4-slave, 2 lab units (repeat) | `#nolabel → #17 → #5 → #0` | 64.6 s | **4.162 s** | 2 |
 
 On one drop the PHY latched **which mechanism fired**, and it is Fast Link
-Drop on the RX-error criterion (§3). That is the first direct evidence of a
-cause anywhere in this investigation, and it connects the two faults that
-`FINDINGS.md` has so far treated as independent.
+Drop on the RX-error criterion (§3), now latched on three separate drops.
+That is the first direct evidence of a cause anywhere in this investigation,
+and it connects the two faults that `FINDINGS.md` has so far treated as
+independent.
+
+Across four four-slave runs the rate is **0.1108 drops/s** against TwinCAT's
+**0.1182/s** on this same hardware — a factor of **1.07**. The rig is now
+reproducing the field fault at the field rate.
 
 The result does **not** reduce to a bad cable or a bad unit, and it is not a
 property of the field units. The link `#nolabel ↔ #17` was silent for 517.7 s
@@ -75,10 +81,10 @@ drop severs the chain and ends the useful part of the run.
 
 ---
 
-## 3. The mechanism, caught twice
+## 3. The mechanism, caught three times
 
-Two drops have now been probed with the failing PHY still reachable, and both
-latched the same reason. Run `opdropsagentia4_2` is the more informative
+Three drops have now been probed with the failing PHY still reachable, and
+all three latched the same reason. Run `opdropsagentia4_2` is the more informative
 because it also has an ESC-layer precursor.
 
 ### 3.1 The sequence
@@ -162,6 +168,11 @@ of frame, whereas FLD's criterion is 32 RX_ER assertions in any 10 µs window,
 including the inter-packet idle stream. **RX_ER asserted during idle would
 trip FLD and leave `RECR` at zero.**
 
+Run `opdropsagentia4_4` repeated it exactly — `FLDS = 0x0080`,
+`PHYSTS = 0x0912`, `RECR = 0x0000`, `MISR1 = 0xE400`, byte for byte the same
+probe as run 6 on the same link. Three firings, one criterion, no
+counter-example among the probes that reached a failing PHY.
+
 That reading is *inferred from the two registers' definitions*, not
 established. It is worth stating because it would explain the standing puzzle
 of `FINDINGS.md` §7.3, where `RECR` read zero on both EVE-NET PHYs across 723
@@ -217,26 +228,31 @@ the same accounting `TWINCAT.md` §6.4 uses to derive 0.118/s.
 
 | configuration | at-risk time | drops | rate |
 |---|---|---|---|
-| 4-slave chains (three runs pooled) | 31.93 s | 3 | **0.0940/s**, one per 10.6 s |
+| 4-slave chains (four runs pooled) | 36.09 s | 4 | **0.1108/s**, one per 9.0 s |
+|  — field-only `#14→#16→#nolabel→#17` | 29.77 s | 2 | 0.0672/s |
+|  — mixed `#nolabel→#17→#5→#0` | 6.33 s | 2 | 0.3162/s |
 | pair `#14 ↔ #16` | 394.7 s | 0 | 95% upper bound 0.0076/s |
 | pair `#nolabel ↔ #17` | 517.7 s | 0 | 95% upper bound 0.0058/s |
 | **both pairs pooled** | **912.4 s** | **0** | 95% upper bound **0.0033/s** |
 
 At-risk time per run is OP with an intact chain — i.e. up to the first drop —
 and each four-slave run therefore contributes exactly one drop: 8.689 s,
-21.079 s and 2.163 s.
+21.079 s, 2.163 s and 4.162 s.
 
-If the pairs dropped at the four-slave rate they would have produced **85.7**
-drops. They produced zero: **P = 1×10⁻³⁷**, a separation of **28.6×** with
+If the pairs dropped at the four-slave rate they would have produced **101.1**
+drops. They produced zero: **P = 1×10⁻⁴⁴**, a separation of **33.8×** with
 disjoint intervals.
+
+The mixed chain looks 4.7× faster than the field-only one, but with two drops
+each that is not significant: under a common rate the observed split has
+P = 0.14. Do not read it as an effect yet.
 
 Each pair is independently significant, so this is not one long quiet run
 carrying a short one: `#14 ↔ #16` alone bounds at 0.0076/s and
 `#nolabel ↔ #17` at 0.0058/s, both below the four-slave rate with no overlap.
 
-The four-slave rate of **0.0940/s** is now within a **factor of 1.26** of
-TwinCAT's 0.118/s. Our rig is reproducing the field fault at essentially the
-field rate.
+The four-slave rate of **0.1108/s** is within a **factor of 1.07** of
+TwinCAT's 0.1182/s. Our rig is reproducing the field fault at the field rate.
 
 ### 4.2 The same link, both ways — the controlled case
 
@@ -253,6 +269,8 @@ master ── #nolabel ── #17 ── #5 ── #0        drop on #nolabel↔
 
 **The link dropped in 2.163 s**, the fastest of any run, and it dropped at
 `slave 0 port 1` — the very link that had just been silent for 517.7 s.
+Run 7 repeated the configuration and reproduced it: another drop on
+`slave 0 port 1`, at 4.162 s, with a byte-identical PHY probe.
 
 Two things follow:
 
@@ -321,23 +339,58 @@ that the ~2 s is the PHY re-negotiating and not a master-side timer — the
 design decision in `recovery.h` to *wait* rather than sleep 2 s. Total outage
 **2.921 s** against TwinCAT's 3.00 s.
 
-**What failed.** All three slaves behind the closed port refused re-init with
-AL code `0x001B`, SyncManager watchdog. They had received no process data for
-2.9 s, so their watchdogs expired and they are sitting in a state with the AL
-error bit latched. `op_bring_up` requests new states without setting
-`AL_ERR_ACK` (`0x10`), so the error is never acknowledged and every request is
-refused.
+**What failed, in run 6.** All three slaves behind the closed port refused
+re-init with AL code `0x001B`, SyncManager watchdog. They had received no
+process data for 2.9 s, so their watchdogs expired and they sat with the AL
+error bit latched. `op_bring_up` requested new states without setting
+`AL_ERR_ACK` (`0x10`), so the error was never acknowledged and every request
+was ignored.
 
-This is a defect in the recovery code, not in the experiment: the drop itself,
-its probe and its timings are all valid. But it means run 6 measured one drop
-and then ran 306 s with three of four slaves out of OP.
+**What failed, in run 7 — differently.** The same three slaves failed with AL
+code `0x0000`, "no error", each after only ~150 ms:
 
-**Consequence for the summary line.** `ecat_op` computed "At-risk time: 308.2 s
--> 0.0065 drops/s" by subtracting only the 2.921 s outage from the elapsed
-time. That is wrong here: the chain never returned to OP, so the true at-risk
-time is **2.163 s**, and the printed rate understates by ~140×. §4.1 uses the
-correct figure. The tool should stop counting at-risk time whenever the chain
-is not fully in OP.
+```
+[   7.228] link back after 1.899 s, debounce done, port reopened 0xF7 (wkc 1)
+[   7.380] re-init of position 1 FAILED (AL code 0x0000 no error)
+[   7.530] re-init of position 2 FAILED (AL code 0x0000 no error)
+[   7.681] re-init of position 3 FAILED (AL code 0x0000 no error)
+```
+
+No error code and no 2 s state timeout means the slaves never answered at all
+— the very first addressed write returned a working counter of zero. Re-init
+began **152 ms after the port reopened**, and the link behind it had not
+finished coming up. TwinCAT's own ~40 ms figure (`TWINCAT.md` §6.6) is
+measured from a different moment: it had already watched the physical link
+return *while the port was still forced closed*.
+
+So there are two distinct defects, and run 6's fix does not cover run 7's.
+Recovery must **wait until the slaves are addressable again** before
+attempting re-init, rather than assuming the reopen is instantaneous.
+
+**A third problem: the port byte was read back inconsistently.** Run 6 read
+`0x0101 = 0x00` on this slave; run 7 read `0xFF` on the same slave in the same
+chain. Neither matches TwinCAT's `0xF4`. Worse, in run 7 the close was a
+**no-op** — `0xFF` already has port 1 forced closed, so `0xFF → 0xFF` wrote
+nothing — and the link still returned and the reopen to `0xF7` still worked,
+which suggests the close may not be doing what the sequence assumes. Reading
+the base *after* the drop, when the slave is mid-disruption, is the likely
+cause. It should be captured at bring-up while the chain is healthy.
+
+**A fourth: cycle timing collapses after a failed recovery.** Run 7 achieved
+525 Hz, mean interval 1399 µs, max **453 ms**, with 13,972 missed cycles out
+of 33,906. With three slaves unreachable, the per-cycle acyclic polls wait out
+the full 50 ms transaction timeout every time. A run that has lost its chain
+should stop polling the slaves it cannot reach.
+
+**Consequence for the summary lines.** `ecat_op` computed at-risk time as
+elapsed minus the recovery outage — "308.2 s -> 0.0065 drops/s" in run 6,
+"61.7 s -> 0.0324" in run 7 — which credits every second the chain spent
+severed. The true figures are **2.163 s** and **4.162 s**. §4.1 uses those.
+
+**Neither run tested the fixes.** Commit `ba1881d` addresses the AL
+acknowledge and the at-risk accounting, but it was built at 14:20 and run 7's
+log is timestamped 14:15. Both runs used the older binary. The remaining two
+defects above are not fixed at all yet.
 
 ---
 
@@ -378,12 +431,19 @@ Run 6 changed the ordering. The recovery defect (§5) now blocks everything
 else, because until it is fixed each run yields exactly one drop and then
 stops being an experiment.
 
-1. **Fix the re-init after recovery.** `op_bring_up` must acknowledge the
-   latched AL error (`AL_ERR_ACK`, `0x10`) before requesting a state, or every
-   slave whose SyncManager watchdog expired during the outage refuses to come
-   back. Also stop counting at-risk time while the chain is not fully in OP,
-   which made run 6's own summary understate its rate by ~140×. Both are
-   code-only and unit-testable.
+1. **Finish the recovery fixes.** Two of four are done in `ba1881d` and
+   untested on hardware — the AL error acknowledge, and at-risk time counted
+   from healthy cycles rather than elapsed-minus-outage. Two remain (§5):
+
+   - **Wait for the slaves to answer** after reopening the port, instead of
+     re-initialising 152 ms later into a link that has not come up. Poll until
+     the expected slave count responds, with a timeout.
+   - **Capture `0x0101` at bring-up**, while the chain is healthy, rather than
+     reading it mid-disruption. It read `0x00` in run 6 and `0xFF` in run 7 on
+     the same slave, and in run 7 the close wrote nothing at all.
+
+   Worth doing at the same time: stop polling slaves known to be unreachable,
+   which cost run 7 41% of its cycles to 50 ms timeouts.
 
 2. **Then re-run the four-slave chain long.** With recovery working this is
    the run that turns three single observations into a measured rate against
@@ -450,10 +510,16 @@ recalled.
   — the event logged at 2.308161 s against the console's 2.308285 s, where
   the old build would have written ~1669 s. **The re-init step is broken**
   (AL `0x001B`, §5) and is the one part still not working.
-- **Run 6's own summary line is wrong.** "At-risk time: 308.2 s -> 0.0065
-  drops/s" subtracts only the outage, not the 306 s the chain spent out of OP
-  after the failed re-init. The correct figure is 2.163 s. §4.1 uses the
-  correct one; the printed one should not be quoted.
+- **The at-risk lines printed by runs 6 and 7 are both wrong.** They subtract
+  only the recovery outage, not the time the chain spent out of OP after the
+  failed re-init: "308.2 s -> 0.0065 drops/s" and "61.7 s -> 0.0324". The
+  correct figures are 2.163 s and 4.162 s. §4.1 uses those; the printed lines
+  should not be quoted.
+- **Every four-slave run so far ends at its first drop**, because recovery has
+  never completed. So each contributes one drop to §4.1 and the rate rests on
+  four independent first-drop times, not on a long continuous observation.
+  That is a weaker design than TwinCAT's own 25.39 s of continuous running,
+  and it is what item 1 of §7 exists to fix.
 - **No run reached its requested 7200 s.** All were stopped by hand once the
   chain had severed.
 
@@ -471,13 +537,16 @@ Times from the console log. "At-risk" is OP with an intact chain.
 | 4 | `opdropsagentia2_2` | `#nolabel→#17` | 145.4 s | 0 | — | not triggered |
 | 5 | `opdropsagentia2_2#2` | `#nolabel→#17` | 372.3 s | 0 | — | not triggered |
 | 6 | `opdropsagentia4_3` | `#nolabel→#17→#5→#0` | **2.163 s** | 2 | slave 0 p1 | **`0x0080` RX Errors** |
+| 7 | `opdropsagentia4_4` | `#nolabel→#17→#5→#0` | **4.162 s** | 2 | slave 0 p1 | **`0x0080` RX Errors** |
 
 Logs are the matching `.log` files; run 3's log is `opdropsagentia4_2og`.
 Each capture directory holds `events.csv`, `frames.pcap` and `probes.txt`.
 
 `#5` and `#0` are M400+EVE-NET drives taken from our own 11-slave lab chain —
 the chain that ran 6,144.7 s in OP without a drop (`FINDINGS.md` §10.2). Runs
-1–5 used the pre-recovery build; runs 5–6 the post-`d385a57` build.
+1–4 used the pre-recovery build; runs 5–7 the `d385a57` build. **No run yet
+uses `ba1881d`**, so neither the AL-error acknowledge nor the corrected
+at-risk accounting has been exercised on hardware.
 
 ### Reproducing the analysis
 
