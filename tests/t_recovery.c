@@ -35,12 +35,14 @@ static void run(RecCtx *r, Trace *tr, uint64_t link_at, uint64_t until)
     memset(tr, 0, sizeof *tr);
     for (uint64_t t = 0; t <= until; t += MS) {          /* 1 ms cycles */
         int link_up = link_at && t >= link_at;
-        RecAction a = rec_step(r, t, link_up);
+        /* Default: the chain answers as soon as it is asked. T10 varies it. */
+        RecAction a = rec_step(r, t, link_up, 1);
         switch (a) {
         case REC_ACT_CLOSE_PORT: if (!tr->closes++)  tr->close_at  = t; break;
         case REC_ACT_OPEN_PORT:  if (!tr->opens++)   tr->open_at   = t; break;
         case REC_ACT_REINIT:     if (!tr->reinits++) tr->reinit_at = t; break;
-        case REC_ACT_GIVE_UP:    if (!tr->giveups++) tr->giveup_at = t; break;
+        case REC_ACT_GIVE_UP:
+        case REC_ACT_GIVE_UP_SETTLE: if (!tr->giveups++) tr->giveup_at = t; break;
         case REC_ACT_NONE: break;
         }
     }
@@ -51,7 +53,7 @@ int main(void)
     /* ── T1: the whole TwinCAT sequence, with the link back at 2.000 s ───── */
     {
         int f0 = fails;
-        RecCtx r; rec_init(&r, 1 * SEC, 30 * SEC);
+        RecCtx r; rec_init(&r, 1 * SEC, 30 * SEC, 30 * SEC);
         Trace tr;
         CHECK(!rec_busy(&r), "T1: machine busy before any drop");
         rec_on_drop(&r, 0, 1, 1);
@@ -77,7 +79,7 @@ int main(void)
     /* ── T2: the 2 s is the PHY's, not ours — a faster link recovers sooner ─ */
     {
         int f0 = fails;
-        RecCtx r; rec_init(&r, 1 * SEC, 30 * SEC);
+        RecCtx r; rec_init(&r, 1 * SEC, 30 * SEC, 30 * SEC);
         Trace tr;
         rec_on_drop(&r, 0, 1, 1);
         run(&r, &tr, 200 * MS, 5 * SEC);
@@ -93,7 +95,7 @@ int main(void)
     /* ── T3: ...and a slower one waits ───────────────────────────────────── */
     {
         int f0 = fails;
-        RecCtx r; rec_init(&r, 1 * SEC, 30 * SEC);
+        RecCtx r; rec_init(&r, 1 * SEC, 30 * SEC, 30 * SEC);
         Trace tr;
         rec_on_drop(&r, 0, 1, 1);
         run(&r, &tr, 6 * SEC, 10 * SEC);
@@ -108,7 +110,7 @@ int main(void)
     /* ── T4: a link that never returns is abandoned, not waited on forever ─ */
     {
         int f0 = fails;
-        RecCtx r; rec_init(&r, 1 * SEC, 5 * SEC);
+        RecCtx r; rec_init(&r, 1 * SEC, 5 * SEC, 30 * SEC);
         Trace tr;
         rec_on_drop(&r, 0, 1, 1);
         run(&r, &tr, 0, 20 * SEC);
@@ -129,7 +131,7 @@ int main(void)
     /* ── T5: repeat reports of one drop do not restart the sequence ──────── */
     {
         int f0 = fails;
-        RecCtx r; rec_init(&r, 1 * SEC, 30 * SEC);
+        RecCtx r; rec_init(&r, 1 * SEC, 30 * SEC, 30 * SEC);
         CHECK(rec_on_drop(&r, 0, 1, 1) == 1, "T5: first drop refused");
         /* 0x0310 is polled every ~203 ms and one physical drop bumped it by 2
          * on the 2026-09-30 run, so the same event gets reported again. */
@@ -181,16 +183,18 @@ int main(void)
     /* ── T8: outage accounting, which is what the summary reports ────────── */
     {
         int f0 = fails;
-        RecCtx r; rec_init(&r, 1 * SEC, 30 * SEC);
+        RecCtx r; rec_init(&r, 1 * SEC, 30 * SEC, 30 * SEC);
         Trace tr;
         rec_on_drop(&r, 0, 1, 1);      run(&r, &tr, 2 * SEC, 5 * SEC);
         RecCtx s = r;                  /* keep the first outage for comparison */
         rec_on_drop(&r, 10 * SEC, 1, 1);
         for (uint64_t t = 10 * SEC; t <= 20 * SEC; t += MS)
-            rec_step(&r, t, t >= 10500 * MS);
+            rec_step(&r, t, t >= 10500 * MS, 1);
         CHECK(r.recoveries == 2, "T8: %lu recoveries, want 2", r.recoveries);
-        CHECK(s.outage_ns_max == 3001 * MS || s.outage_ns_max == 3 * SEC,
-              "T8: first outage recorded as %.3f s, want ~3.000",
+        /* 3.000 s plus the cycles the machine spends stepping through
+         * reopen -> settle -> reinit; a few ms of slack, not an exact value. */
+        CHECK(s.outage_ns_max >= 3 * SEC && s.outage_ns_max <= 3010 * MS,
+              "T8: first outage recorded as %.3f s, want 3.000-3.010",
               (double)s.outage_ns_max / 1e9);
         double mean = (double)r.outage_ns_total / r.recoveries / 1e9;
         CHECK(mean > 2.2 && mean < 2.8, "T8: mean outage %.3f s over 3.00 and "
@@ -247,6 +251,94 @@ int main(void)
         if (fails == f0)
             printf("T9 PASS: at-risk credits only healthy cycles "
                    "(run-6 shape %.3f s, not 308)\n", ar_seconds(&b));
+    }
+
+    /* ── T10: re-init waits for the chain to answer after the reopen ─────
+     *
+     * Regression for run 7 of SAGENTIA.md. Recovery reopened the port and
+     * re-initialised 152 ms later; the link behind it had not come up, so
+     * every slave failed with AL code 0x0000 — no error signalled, no state
+     * timeout, simply no answer — and the chain stayed out of OP for the rest
+     * of the run. The reopen is not instantaneous and must not be treated
+     * as if it were. */
+    {
+        int f0 = fails;
+        RecCtx r; rec_init(&r, 1 * SEC, 30 * SEC, 10 * SEC);
+        rec_on_drop(&r, 0, 1, 1);
+
+        uint64_t open_at = 0, reinit_at = 0;
+        const uint64_t LINK_AT = 2 * SEC, CHAIN_AT = 3500 * MS;  /* 500 ms after reopen */
+        for (uint64_t t = 0; t <= 8 * SEC; t += MS) {
+            RecAction a2 = rec_step(&r, t, t >= LINK_AT, t >= CHAIN_AT);
+            if (a2 == REC_ACT_OPEN_PORT) open_at = t;
+            if (a2 == REC_ACT_REINIT)  { reinit_at = t; break; }
+        }
+        CHECK(open_at == 3 * SEC, "T10: reopened at %.3f s, want 3.000",
+              (double)open_at / 1e9);
+        CHECK(reinit_at >= CHAIN_AT,
+              "T10: re-initialised at %.3f s, before the chain answered at "
+              "%.3f — this is exactly the run-7 failure",
+              (double)reinit_at / 1e9, (double)CHAIN_AT / 1e9);
+        CHECK(reinit_at <= CHAIN_AT + 2 * MS,
+              "T10: re-init lagged the chain answering by %.3f s",
+              (double)(reinit_at - CHAIN_AT) / 1e9);
+        CHECK(r.settle_ns_max >= 499 * MS && r.settle_ns_max <= 502 * MS,
+              "T10: reopen->answer recorded as %.3f s, want 0.500",
+              (double)r.settle_ns_max / 1e9);
+        CHECK(r.recoveries == 1, "T10: %lu recoveries", r.recoveries);
+        if (fails == f0)
+            printf("T10 PASS: re-init waits for the chain (%.3f s after reopen), "
+                   "never fires blind\n", (double)r.settle_ns_max / 1e9);
+    }
+
+    /* ── T11: a chain that never answers is abandoned, distinguishably ──── */
+    {
+        int f0 = fails;
+        RecCtx r; rec_init(&r, 1 * SEC, 30 * SEC, 5 * SEC);
+        rec_on_drop(&r, 0, 1, 1);
+        int reinits = 0, gave_up_settle = 0, gave_up_link = 0;
+        uint64_t gave_at = 0;
+        for (uint64_t t = 0; t <= 20 * SEC; t += MS) {
+            RecAction a2 = rec_step(&r, t, t >= 2 * SEC, 0);   /* chain never answers */
+            if (a2 == REC_ACT_REINIT) reinits++;
+            if (a2 == REC_ACT_GIVE_UP) gave_up_link++;
+            if (a2 == REC_ACT_GIVE_UP_SETTLE) { gave_up_settle++; gave_at = t; }
+        }
+        CHECK(reinits == 0, "T11: re-initialised %d times against a chain that "
+              "never answered — the run-7 failure again", reinits);
+        CHECK(gave_up_settle == 1, "T11: gave up on settle %d times, want 1",
+              gave_up_settle);
+        CHECK(gave_up_link == 0, "T11: reported a LINK timeout when the link "
+              "came back fine and it was the chain that did not");
+        CHECK(gave_at == 8 * SEC, "T11: gave up at %.3f s, want 8.000 "
+              "(reopen at 3.000 + 5 s settle timeout)", (double)gave_at / 1e9);
+        CHECK(!rec_busy(&r), "T11: still busy after giving up");
+        CHECK(r.timeouts == 1 && r.recoveries == 0,
+              "T11: timeouts %lu recoveries %lu", r.timeouts, r.recoveries);
+        if (fails == f0)
+            printf("T11 PASS: a chain that never answers is abandoned at %.3f s, "
+                   "and is not confused with a dead link\n", (double)gave_at / 1e9);
+    }
+
+    /* ── T12: the caller is told which input each state actually needs ───── */
+    {
+        int f0 = fails;
+        RecCtx r; rec_init(&r, 1 * SEC, 30 * SEC, 10 * SEC);
+        CHECK(!rec_needs_link(&r) && !rec_needs_chain(&r),
+              "T12: idle machine asked for a wire transaction");
+        rec_on_drop(&r, 0, 1, 1);
+        rec_step(&r, 0, 0, 0);                       /* issues the close     */
+        CHECK(rec_needs_link(&r) && !rec_needs_chain(&r),
+              "T12: while closed it must poll the LINK, not the chain");
+        rec_step(&r, 2 * SEC, 1, 0);                 /* link back -> debounce */
+        CHECK(!rec_needs_link(&r) && !rec_needs_chain(&r),
+              "T12: during the debounce nothing needs polling");
+        rec_step(&r, 3 * SEC, 1, 0);                 /* reopen -> settle     */
+        CHECK(!rec_needs_link(&r) && rec_needs_chain(&r),
+              "T12: after the reopen it must poll the CHAIN, not the link");
+        if (fails == f0)
+            printf("T12 PASS: each state asks for exactly one input, so the "
+                   "cycle polls nothing it does not need\n");
     }
 
     if (fails) { printf("\n*** RECOVERY FAILURES ***\n"); return 1; }

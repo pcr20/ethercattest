@@ -40,7 +40,8 @@ typedef enum {
     REC_IDLE = 0,     /* nothing wrong                                      */
     REC_CLOSED,       /* port forced closed; waiting for the physical link  */
     REC_DEBOUNCE,     /* link back; waiting out the 1.000 s timer           */
-    REC_REINIT        /* port reopened; slave needs bringing back to OP     */
+    REC_SETTLE,       /* port reopened; waiting for the slaves to answer    */
+    REC_REINIT        /* chain reachable; slaves need bringing back to OP   */
 } RecState;
 
 typedef enum {
@@ -48,7 +49,8 @@ typedef enum {
     REC_ACT_CLOSE_PORT,   /* write 0x0101 with this port forced closed      */
     REC_ACT_OPEN_PORT,    /* write 0x0101 back to auto-close                */
     REC_ACT_REINIT,       /* re-run bring-up for the slaves beyond the gap  */
-    REC_ACT_GIVE_UP       /* the link never came back; stop waiting         */
+    REC_ACT_GIVE_UP,      /* the link never came back; stop waiting         */
+    REC_ACT_GIVE_UP_SETTLE/* reopened, but the slaves never answered        */
 } RecAction;
 
 typedef struct {
@@ -57,29 +59,40 @@ typedef struct {
     int      port;               /* its port that lost the link              */
     uint64_t t_drop;             /* ns, when recovery started                */
     uint64_t t_link_back;        /* ns, when the physical link returned      */
+    uint64_t t_reopened;         /* ns, when the port was reopened           */
     int      closed_issued;      /* the 0x0101 close has been written        */
     uint64_t debounce_ns;        /* TwinCAT's 1.000 s                        */
     uint64_t link_timeout_ns;    /* give up if the link never returns        */
+    uint64_t settle_timeout_ns;  /* give up if the chain never comes back    */
     uint64_t recoveries;         /* completed                                */
     uint64_t timeouts;           /* abandoned                                */
     uint64_t outage_ns_total;    /* summed drop -> reinit, for the summary   */
     uint64_t outage_ns_max;
+    uint64_t settle_ns_total;    /* reopen -> slaves answering again         */
+    uint64_t settle_ns_max;
 } RecCtx;
 
 static inline void rec_init(RecCtx *r, uint64_t debounce_ns,
-                            uint64_t link_timeout_ns)
+                            uint64_t link_timeout_ns, uint64_t settle_timeout_ns)
 {
     r->state = REC_IDLE;
     r->slave = r->port = -1;
-    r->t_drop = r->t_link_back = 0;
+    r->t_drop = r->t_link_back = r->t_reopened = 0;
     r->closed_issued = 0;
-    r->debounce_ns     = debounce_ns;
-    r->link_timeout_ns = link_timeout_ns;
+    r->debounce_ns       = debounce_ns;
+    r->link_timeout_ns   = link_timeout_ns;
+    r->settle_timeout_ns = settle_timeout_ns;
     r->recoveries = r->timeouts = 0;
     r->outage_ns_total = r->outage_ns_max = 0;
+    r->settle_ns_total = r->settle_ns_max = 0;
 }
 
 static inline int rec_busy(const RecCtx *r) { return r->state != REC_IDLE; }
+
+/* Which input rec_step() will actually consult, so a caller can skip the
+ * transaction for the other one instead of polling the wire pointlessly. */
+static inline int rec_needs_link(const RecCtx *r)  { return r->state == REC_CLOSED; }
+static inline int rec_needs_chain(const RecCtx *r) { return r->state == REC_SETTLE; }
 
 /* A lost-link counter moved on (slave, port). Ignored while a recovery is
  * already in flight: the counter is polled every ~203 ms and one physical
@@ -92,15 +105,22 @@ static inline int rec_on_drop(RecCtx *r, uint64_t now, int slave, int port)
     r->slave = slave;
     r->port  = port;
     r->t_drop = now;
-    r->t_link_back = 0;
+    r->t_link_back = r->t_reopened = 0;
     r->closed_issued = 0;
     return 1;
 }
 
-/* Advance the machine. `link_up` is the physical-link bit for (slave, port)
- * from the DL status just polled; it is only consulted in REC_CLOSED. Returns
- * the action the caller must now perform. */
-static inline RecAction rec_step(RecCtx *r, uint64_t now, int link_up)
+/* Advance the machine.
+ *
+ *   link_up   physical-link bit for (slave, port) from the DL status just
+ *             polled. Consulted only in REC_CLOSED.
+ *   chain_ok  non-zero when the slaves beyond the gap answer again.
+ *             Consulted only in REC_SETTLE.
+ *
+ * rec_needs_link() / rec_needs_chain() say which one this cycle needs.
+ * Returns the action the caller must now perform. */
+static inline RecAction rec_step(RecCtx *r, uint64_t now, int link_up,
+                                 int chain_ok)
 {
     switch (r->state) {
     case REC_IDLE:
@@ -122,10 +142,34 @@ static inline RecAction rec_step(RecCtx *r, uint64_t now, int link_up)
 
     case REC_DEBOUNCE:
         if (now - r->t_link_back >= r->debounce_ns) {
-            r->state = REC_REINIT;
+            r->state = REC_SETTLE;
+            r->t_reopened = now;
             return REC_ACT_OPEN_PORT;
         }
         return REC_ACT_NONE;
+
+    case REC_SETTLE: {
+        /* Reopening the port is not instantaneous: the link behind it has to
+         * come up before the slaves are addressable. Run 7 of SAGENTIA.md
+         * re-initialised 152 ms after the reopen and every slave failed with
+         * AL code 0x0000 — no error signalled, no state timeout, simply no
+         * answer. TwinCAT's ~40 ms is measured from a different moment: it
+         * had already watched the link return while the port was still
+         * forced closed. */
+        if (chain_ok) {
+            uint64_t st = now - r->t_reopened;
+            r->settle_ns_total += st;
+            if (st > r->settle_ns_max) r->settle_ns_max = st;
+            r->state = REC_REINIT;
+            return REC_ACT_NONE;
+        }
+        if (now - r->t_reopened >= r->settle_timeout_ns) {
+            r->timeouts++;
+            r->state = REC_IDLE;
+            return REC_ACT_GIVE_UP_SETTLE;
+        }
+        return REC_ACT_NONE;
+    }
 
     case REC_REINIT: {
         uint64_t outage = now - r->t_drop;

@@ -52,6 +52,8 @@ static void usage(const char *p)
            "                    only behaviour before recovery existed.\n"
            "  --link-timeout <s> give up waiting for a dropped link to come back\n"
            "                    after this long, default 30\n"
+           "  --settle-timeout <s> after reopening the port, give up if the chain\n"
+           "                    does not answer within this long, default 10\n"
            "  -t <ms>           transaction timeout, default 50\n"
            "  -v                verbose\n"
            "\n"
@@ -78,6 +80,7 @@ int main(int argc, char **argv)
     int chain = 0, rate = 1000, dur = 3600, observe = 0, verbose = 0, tmo = 50;
     int jitter = 0, no_clear = 0;   /* --random N, --no-clear */
     int link_timeout = 30;          /* --link-timeout, seconds */
+    int settle_timeout = 10;        /* --settle-timeout, seconds */
     int min_burst = 0;   /* --burst: pad every cycle to this many frames */
     int op_pos[OP_MAX_SLAVES], n_op = 0;
 
@@ -88,6 +91,7 @@ int main(int argc, char **argv)
         {"random",  required_argument, 0, 4},
         {"no-clear",no_argument,       0, 5},
         {"link-timeout", required_argument, 0, 6},
+        {"settle-timeout", required_argument, 0, 7},
         {"help",    no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
@@ -112,6 +116,7 @@ int main(int argc, char **argv)
         case 4: jitter = atoi(optarg); break;
         case 5: no_clear = 1; break;
         case 6: link_timeout = atoi(optarg); break;
+        case 7: settle_timeout = atoi(optarg); break;
         default: usage(argv[0]); return c == 'h' ? 0 : 1;
         }
     }
@@ -158,9 +163,10 @@ int main(int argc, char **argv)
         printf("recover as TwinCAT does:\n"
                "            force the port closed (0x0101), wait for the physical\n"
                "            link to return (TwinCAT saw 2.00 s; we wait, we do not\n"
-               "            assume), hold 1.000 s, reopen, re-init to OP.\n"
-               "            Give up on a link that stays down for %d s.\n",
-               link_timeout);
+               "            assume), hold 1.000 s, reopen, wait for the chain to\n"
+               "            answer, then re-init to OP.\n"
+               "            Give up after %d s waiting for the link, %d s for\n"
+               "            the chain.\n", link_timeout, settle_timeout);
     op_print_write_warning(&m);
 
     if (esc_open(&m.ctx, iface, 0, tmo) != 0) return 1;
@@ -193,6 +199,27 @@ int main(int argc, char **argv)
     }
     for (int i = 0; i < n_op; i++)
         printf("  position %d is in OP\n", m.sl[i].position);
+
+    /* Snapshot 0x0101 now, while every slave is in OP and answering. Reading
+     * it during a recovery reads it mid-disruption: run 6 of SAGENTIA.md got
+     * 0x00 and run 7 got 0xFF from the same slave, neither matching the 0xF4
+     * that run 8 saw here, and in run 7 the resulting "close" wrote a byte
+     * the port already had and did nothing at all. */
+    uint8_t loop_base[OP_MAX_SLAVES];
+    int     loop_have[OP_MAX_SLAVES];
+    memset(loop_base, 0, sizeof loop_base);
+    memset(loop_have, 0, sizeof loop_have);
+    for (int i = 0; i < chain; i++) {
+        uint8_t v = 0;
+        if (op_aprd(&m, i, REG_DL_CTRL_P, &v, 1) >= 1) {
+            loop_base[i] = v; loop_have[i] = 1;
+        }
+    }
+    printf("Port loop control 0x0101 as found:");
+    for (int i = 0; i < chain; i++)
+        if (loop_have[i]) printf("  %d:0x%02X", i, loop_base[i]);
+        else              printf("  %d:??", i);
+    printf("\n");
 
     printf("\nCyclic exchange running. Ctrl-C to stop.\n\n");
 
@@ -232,8 +259,8 @@ int main(int argc, char **argv)
     uint64_t drop_events = 0;      /* physical drops, not counter increments */
 
     RecCtx rec; rec_init(&rec, 1000000000ULL,
-                         (uint64_t)link_timeout * 1000000000ULL);
-    uint8_t rec_loop_base = 0xF4;    /* 0x0101 as found, restored on reopen */
+                         (uint64_t)link_timeout * 1000000000ULL,
+                         (uint64_t)settle_timeout * 1000000000ULL);
     uint64_t next_beat = t0 + 60000000000ULL;   /* heartbeat every 60 s */
     uint64_t end = t0 + (uint64_t)dur * 1000000000ULL;
     uint64_t cycles = 0, short_burst = 0, wkc_bad = 0;
@@ -370,26 +397,32 @@ int main(int argc, char **argv)
                 printf("  -> recovering slave %d port %d\n", drop_slave, drop_port);
 
         if (!observe && rec_busy(&rec)) {
-            int link_up = 0;
-            if (rec.state == REC_CLOSED) {
+            int link_up = 0, chain_back = 0;
+            if (rec_needs_link(&rec)) {
                 uint8_t dl[2] = {0, 0};
                 if (op_aprd(&m, rec.slave, 0x0110, dl, 2) >= 1) {
                     uint16_t v = (uint16_t)(dl[0] | (dl[1] << 8));
                     link_up = rec_link_up(v, rec.port);
                 }
             }
-            switch (rec_step(&rec, now_ns(), link_up)) {
+            if (rec_needs_chain(&rec)) {
+                /* The furthest slave in the chain answers only once every hop
+                 * between here and it is forwarding again. */
+                uint8_t t = 0;
+                chain_back = (op_aprd(&m, chain - 1, REG_TYPE, &t, 1) >= 1);
+            }
+            switch (rec_step(&rec, now_ns(), link_up, chain_back)) {
             case REC_ACT_CLOSE_PORT: {
-                uint8_t base = 0;
-                if (op_aprd(&m, rec.slave, REG_DL_CTRL_P, &base, 1) >= 1)
-                    rec_loop_base = base;        /* restore exactly what was there */
-                uint8_t shut = rec_loop_closed(rec_loop_base, rec.port);
+                uint8_t base = loop_have[rec.slave] ? loop_base[rec.slave] : 0xF4;
+                uint8_t shut = rec_loop_closed(base, rec.port);
                 int w = op_apwr(&m, rec.slave, REG_DL_CTRL_P, &shut, 1);
-                printf("  [%8.3f] port closed: 0x0101 0x%02X -> 0x%02X (wkc %d)\n",
-                       (double)(now_ns() - t0) / 1e9, rec_loop_base, shut, w);
+                printf("  [%8.3f] port closed: 0x0101 0x%02X -> 0x%02X (wkc %d)%s\n",
+                       (double)(now_ns() - t0) / 1e9, base, shut, w,
+                       loop_have[rec.slave] ? "" : "  [base not read at start]");
                 break; }
             case REC_ACT_OPEN_PORT: {
-                uint8_t open_b = rec_loop_auto(rec_loop_base, rec.port);
+                uint8_t base = loop_have[rec.slave] ? loop_base[rec.slave] : 0xF4;
+                uint8_t open_b = rec_loop_auto(base, rec.port);
                 int w = op_apwr(&m, rec.slave, REG_DL_CTRL_P, &open_b, 1);
                 printf("  [%8.3f] link back after %.3f s, debounce done, "
                        "port reopened 0x%02X (wkc %d)\n",
@@ -411,9 +444,11 @@ int main(int argc, char **argv)
                 if (!bad && op_go_operational(&m, m.sl[0].log_addr, pd_len,
                                               5000) != 0)
                     bad = 1;
-                printf("  [%8.3f] *** RECOVERED in %.3f s%s ***\n",
+                printf("  [%8.3f] *** RECOVERED in %.3f s (chain answered "
+                       "%.3f s after reopen)%s ***\n",
                        (double)(now_ns() - t0) / 1e9,
                        (double)rec.outage_ns_max / 1e9,
+                       (double)rec.settle_ns_max / 1e9,
                        bad ? " — but the chain is NOT back in OP" : "");
                 /* The counters just re-read across a re-init would look like
                  * fresh deltas; drop the baselines so the next poll re-seeds. */
@@ -424,6 +459,11 @@ int main(int argc, char **argv)
                        "in %d s — giving up, chain stays severed ***\n",
                        (double)(now_ns() - t0) / 1e9, rec.slave, rec.port,
                        link_timeout);
+                break;
+            case REC_ACT_GIVE_UP_SETTLE:
+                printf("  [%8.3f] *** port reopened but the chain never "
+                       "answered within %d s — giving up without re-init ***\n",
+                       (double)(now_ns() - t0) / 1e9, settle_timeout);
                 break;
             case REC_ACT_NONE: break;
             }
@@ -465,11 +505,15 @@ int main(int argc, char **argv)
     } else {
         printf("  Recoveries:     %lu completed, %lu abandoned\n",
                rec.recoveries, rec.timeouts);
-        if (rec.recoveries)
+        if (rec.recoveries) {
             printf("  Outage:         mean %.3f s, max %.3f s  "
                    "(TwinCAT's was 3.00 s every time)\n",
                    (double)rec.outage_ns_total / rec.recoveries / 1e9,
                    (double)rec.outage_ns_max / 1e9);
+            printf("  Reopen->answer: mean %.3f s, max %.3f s\n",
+                   (double)rec.settle_ns_total / rec.recoveries / 1e9,
+                   (double)rec.settle_ns_max / 1e9);
+        }
     }
     /* At-risk time is cycles with every slave answering — NOT elapsed minus
      * the recovery outage, which credited 306 s of severed chain in run 6 of
