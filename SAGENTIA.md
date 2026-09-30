@@ -20,8 +20,9 @@ Every earlier negative in this investigation came from our lab chain. Moving
 the same master and the same binary onto the field hardware produced the fault
 within seconds.
 
-**Four slaves in the chain → drops within 9 to 21 s. Either tested half of
-that chain run as a pair → nothing in 912 s.**
+**Four slaves in the chain → drops within 2 to 21 s. Two slaves → nothing in
+912 s.** The same link behaves both ways depending only on what sits beyond it
+(§4.2).
 
 | configuration | units | time in OP | first drop | total drops |
 |---|---|---|---|---|
@@ -30,15 +31,18 @@ that chain run as a pair → nothing in 912 s.**
 | 2-slave pair | `#14 → #16` | 394.7 s | — | **0** |
 | 2-slave pair | `#nolabel → #17` | 145.4 s | — | **0** |
 | 2-slave pair (repeat) | `#nolabel → #17` | 372.3 s | — | **0** |
+| 4-slave, **2 lab units appended** | `#nolabel → #17 → #5 → #0` | 311.1 s | **2.163 s** | 2 |
 
 On one drop the PHY latched **which mechanism fired**, and it is Fast Link
 Drop on the RX-error criterion (§3). That is the first direct evidence of a
 cause anywhere in this investigation, and it connects the two faults that
 `FINDINGS.md` has so far treated as independent.
 
-The result does **not** reduce to a bad cable or a bad unit. Both links that
-dropped in the 4-slave chain were subsequently run as isolated pairs and
-neither dropped (§4).
+The result does **not** reduce to a bad cable or a bad unit, and it is not a
+property of the field units. The link `#nolabel ↔ #17` was silent for 517.7 s
+as an isolated pair and then dropped in **2.163 s** when two spare drives from
+our own lab chain were appended behind it — same link, same cable, same two
+units, opposite outcome (§4.2).
 
 ---
 
@@ -71,11 +75,11 @@ drop severs the chain and ends the useful part of the run.
 
 ---
 
-## 3. The mechanism, caught once
+## 3. The mechanism, caught twice
 
-Run `opdropsagentia4_2` is the important one. It is the only drop so far where
-the PHY that dropped the link was still reachable when probed, and it latched
-the reason.
+Two drops have now been probed with the failing PHY still reachable, and both
+latched the same reason. Run `opdropsagentia4_2` is the more informative
+because it also has an ESC-layer precursor.
 
 ### 3.1 The sequence
 
@@ -131,10 +135,41 @@ fired.** The corruption fault and the link-drop fault are plausibly the same
 underlying event at two different intensities: a few RX_ER corrupt a frame, 32
 in 10 µs drop the link.
 
-That is a hypothesis with one supporting observation, not an established
-result. It does not yet explain §3.4.
+That is a hypothesis with two supporting observations, not an established
+result. It does not yet explain §3.5.
 
-### 3.4 The drops that were NOT Fast Link Drop
+### 3.4 The second firing, and what it separates
+
+Run `opdropsagentia4_3` (§4.2) probed its failing PHY within 145 ms:
+
+```
+pos 0 phy  3: PHYSTS=0x0912 FLDS=0x0080 MISR1=0xE400 MISR2=0x2800
+              BMSR=0x7849 ANER=0x0006 FCSCR=0x0000 RECR=0x0000 CR3=0x1009
+```
+
+`FLDS = 0x0080` again — the same `01000`, RX Errors. `MISR1` bit 15 (link
+quality changed while the link was ON) set again. `BMSR`/`ANER` identical to
+§3.2: link down, auto-negotiation incomplete, partner no longer negotiating.
+
+But **`RECR = 0x0000`** this time, and the `PHYSTS` receive-error latch (bit
+13) is clear — where run 3 had `RECR = 2` and the latch set. No ESC counter
+moved either: `invalid 0 rxerr 0 fwderr 0`.
+
+So FLD fired on its RX-error criterion while the *receive-error counter
+recorded nothing*. That is not a contradiction if the two count different
+things — `RECR` counts errors during packet reception, between start and end
+of frame, whereas FLD's criterion is 32 RX_ER assertions in any 10 µs window,
+including the inter-packet idle stream. **RX_ER asserted during idle would
+trip FLD and leave `RECR` at zero.**
+
+That reading is *inferred from the two registers' definitions*, not
+established. It is worth stating because it would explain the standing puzzle
+of `FINDINGS.md` §7.3, where `RECR` read zero on both EVE-NET PHYs across 723
+probes while the fault was demonstrably active, and because it predicts that
+drops with zero error counters everywhere — the TwinCAT signature — are still
+FLD firings.
+
+### 3.5 The drops that were NOT Fast Link Drop
 
 Run `opdropsagentia4` produced four lost-link events and **`FLDS = 0x0000` on
 every PHY in both probes**, with `RECR = 0x0000` and `FCSCR = 0x0000`
@@ -168,7 +203,7 @@ two-slave pairs, and neither dropped:
 | link | behaviour in the 4-chain | behaviour as an isolated pair |
 |---|---|---|
 | `#14 ↔ #16` | dropped (run 1, t=32.7 s) | **0 drops in 394.7 s** |
-| `#16 ↔ #nolabel` | dropped (run 1, t=8.7 s) | **not yet tested** — see §6 |
+| `#16 ↔ #nolabel` | dropped (run 1, t=8.7 s) | **not yet tested** — see §7 |
 | `#nolabel ↔ #17` | dropped (run 2, t=21.1 s) | **0 drops in 517.7 s** (two runs) |
 
 So it is not that one cable or one unit is bad. The same physical link that
@@ -182,26 +217,131 @@ the same accounting `TWINCAT.md` §6.4 uses to derive 0.118/s.
 
 | configuration | at-risk time | drops | rate |
 |---|---|---|---|
-| 4-slave chain (both runs pooled) | 29.77 s | 2 | **0.0672/s**, one per 14.9 s |
+| 4-slave chains (three runs pooled) | 31.93 s | 3 | **0.0940/s**, one per 10.6 s |
 | pair `#14 ↔ #16` | 394.7 s | 0 | 95% upper bound 0.0076/s |
 | pair `#nolabel ↔ #17` | 517.7 s | 0 | 95% upper bound 0.0058/s |
 | **both pairs pooled** | **912.4 s** | **0** | 95% upper bound **0.0033/s** |
 
-If the pairs dropped at the four-slave rate they would have produced **61.3**
-drops. They produced zero: **P = 1×10⁻²⁷**, a separation of **20.5×** with
-disjoint intervals. Against TwinCAT's own 0.118/s on this hardware the
-separation is **36×**.
+At-risk time per run is OP with an intact chain — i.e. up to the first drop —
+and each four-slave run therefore contributes exactly one drop: 8.689 s,
+21.079 s and 2.163 s.
 
-Each pair is now independently significant, so this is not one long quiet run
+If the pairs dropped at the four-slave rate they would have produced **85.7**
+drops. They produced zero: **P = 1×10⁻³⁷**, a separation of **28.6×** with
+disjoint intervals.
+
+Each pair is independently significant, so this is not one long quiet run
 carrying a short one: `#14 ↔ #16` alone bounds at 0.0076/s and
 `#nolabel ↔ #17` at 0.0058/s, both below the four-slave rate with no overlap.
+
+The four-slave rate of **0.0940/s** is now within a **factor of 1.26** of
+TwinCAT's 0.118/s. Our rig is reproducing the field fault at essentially the
+field rate.
+
+### 4.2 The same link, both ways — the controlled case
+
+Run 6 is the strongest form of the result, because the link is its own
+control. `#nolabel ↔ #17` was run as an isolated pair for 517.7 s across two
+runs and never dropped. Two spare M400+EVE-NET drives from our **own 11-slave
+lab chain** (`#5`, `#0`) were then cabled on behind `#17` — nothing else
+changed, same two field units, same cable between them:
+
+```
+master ── #nolabel ── #17 ── #5 ── #0        drop on #nolabel↔#17 at t = 2.163 s
+          pos0        pos1   pos2  pos3      (slave 0 port 1)
+```
+
+**The link dropped in 2.163 s**, the fastest of any run, and it dropped at
+`slave 0 port 1` — the very link that had just been silent for 517.7 s.
+
+Two things follow:
+
+1. **It is not the field units.** The devices that made the difference are
+   ours, from the chain that ran 6,144.7 s in OP without a single drop
+   (`FINDINGS.md` §10.2). Ordinary EVE-NETs appended behind a quiet link are
+   enough to make it fail.
+2. **It is not the failing link's own cable or endpoints.** Those were held
+   fixed across the two outcomes. Whatever the mechanism is, it is provoked by
+   devices that are not party to the link that breaks.
+
+This is a within-link control rather than a comparison across configurations,
+which is what raises §4 from "chain length correlates" to "something beyond
+the partner causes it".
 
 For scale, our four-slave rate of 0.0672/s sits within a factor of 1.8 of
 TwinCAT's 0.118/s on this same hardware.
 
 ---
 
-## 5. The contradiction with the capture
+### 4.3 Relation to the corruption fault's condition 2
+
+`FINDINGS.md` §1 condition 2 for the *frame-corruption* fault reads: "at least
+one device must lie beyond the EVE-NET's port-1 partner." The drop locations
+mostly fit it:
+
+| run | link that dropped | devices beyond the partner | fits? |
+|---|---|---|---|
+| 1 | `#16 ↔ #nolabel` | `#17` | yes |
+| 1 | `#14 ↔ #16` | `#nolabel`, `#17` | yes |
+| 3 | `#nolabel ↔ #17` | none | **no** |
+| 6 | `#nolabel ↔ #17` | `#5`, `#0` | yes |
+
+Three of four fit; run 3's drop was on the last link in its chain, with
+nothing beyond it. So the two faults share a condition that is *nearly* the
+same, and the exception is real rather than explained away. It may be that
+total device count is the true variable and "beyond the partner" is a
+correlate of it — the data cannot yet separate those.
+
+---
+
+## 5. Recovery, exercised for the first time
+
+Run 6 is also the first hardware execution of the recovery path added in
+`d385a57`. Most of it worked and one step did not.
+
+```
+[   2.308] slave  0 port 1  *** LOST LINK +2 (now 3) ***
+[   2.471] port closed: 0x0101 0x00 -> 0x0C (wkc 1)
+[   5.228] link back after 1.919 s, debounce done, port reopened 0x04 (wkc 1)
+[   5.231] re-init of position 1 FAILED (AL code 0x001B SyncManager watchdog)
+[   5.232] re-init of position 2 FAILED (AL code 0x001B SyncManager watchdog)
+[   5.233] re-init of position 3 FAILED (AL code 0x001B SyncManager watchdog)
+[   5.233] *** RECOVERED in 2.921 s — but the chain is NOT back in OP ***
+```
+
+**What worked, and corroborates the capture.** The port loop control was read
+as `0x00` on this unit rather than the `0xF4` TwinCAT's chain sat at, and the
+computed bytes were right for it: `0x0C` to force port 1 closed, `0x04` to
+restore it to auto-close. Writing the byte from what was actually there, which
+`t_recovery` T6 pins, is why an unexpected base value cost nothing.
+
+The physical link came back after **1.919 s**, against the 2.0012 / 2.0008 /
+1.9842 s TwinCAT recorded on its three drops. That is independent confirmation
+that the ~2 s is the PHY re-negotiating and not a master-side timer — the
+design decision in `recovery.h` to *wait* rather than sleep 2 s. Total outage
+**2.921 s** against TwinCAT's 3.00 s.
+
+**What failed.** All three slaves behind the closed port refused re-init with
+AL code `0x001B`, SyncManager watchdog. They had received no process data for
+2.9 s, so their watchdogs expired and they are sitting in a state with the AL
+error bit latched. `op_bring_up` requests new states without setting
+`AL_ERR_ACK` (`0x10`), so the error is never acknowledged and every request is
+refused.
+
+This is a defect in the recovery code, not in the experiment: the drop itself,
+its probe and its timings are all valid. But it means run 6 measured one drop
+and then ran 306 s with three of four slaves out of OP.
+
+**Consequence for the summary line.** `ecat_op` computed "At-risk time: 308.2 s
+-> 0.0065 drops/s" by subtracting only the 2.921 s outage from the elapsed
+time. That is wrong here: the chain never returned to OP, so the true at-risk
+time is **2.163 s**, and the printed rate understates by ~140×. §4.1 uses the
+correct figure. The tool should stop counting at-risk time whenever the chain
+is not fully in OP.
+
+---
+
+## 6. The contradiction with the capture
 
 `TWINCAT.md` §3 is unambiguous about TwinCAT's own arrangement:
 
@@ -222,7 +362,7 @@ The candidates, in order of how cheaply they can be tested:
    by the master and say nothing about the physical unit.
 2. **Exposure scales with the number of inter-drive links.** Three links
    instead of one is 3× the exposure, which is the right sign but far short of
-   the 12× separation in §4.1.
+   the 28.6× separation in §4.1.
 3. **Something about the longer chain provokes it** — return-path latency,
    accumulated jitter, or the larger cyclic frame (44 B of process data
    against 22 B). Link utilisation is under 1% in both cases, so the
@@ -232,38 +372,51 @@ The candidates, in order of how cheaply they can be tested:
 
 ---
 
-## 6. Next experiments
+## 7. Next experiments
 
-In priority order. The first is decisive and takes minutes.
+Run 6 changed the ordering. The recovery defect (§5) now blocks everything
+else, because until it is fixed each run yields exactly one drop and then
+stops being an experiment.
 
-1. **Run `#16 ↔ #nolabel` as an isolated pair.** It is the one untested link,
-   it dropped fastest in the chain, and it is the leading candidate for
-   TwinCAT's own pair. A drop here collapses §4 and §5 together: the fault
-   would be a property of that pair, and chain length would be irrelevant.
-   Silence here makes chain length real and sharpens §5 to items 2–4.
+1. **Fix the re-init after recovery.** `op_bring_up` must acknowledge the
+   latched AL error (`AL_ERR_ACK`, `0x10`) before requesting a state, or every
+   slave whose SyncManager watchdog expired during the outage refuses to come
+   back. Also stop counting at-risk time while the chain is not fully in OP,
+   which made run 6's own summary understate its rate by ~140×. Both are
+   code-only and unit-testable.
+
+2. **Then re-run the four-slave chain long.** With recovery working this is
+   the run that turns three single observations into a measured rate against
+   TwinCAT's 0.118/s — and, for §3.5, it brings the far side of a dropped link
+   back so its `FLDS` can be probed. If the far PHY latches `FLDS = 0x0080` on
+   the drops where the near PHY latched nothing, one mechanism explains every
+   drop recorded so far.
+
+3. **A three-slave chain.** This is the sharpest remaining question and it did
+   not exist before run 6: two devices never drop, four always do, and nothing
+   has been measured in between. Take run 6's chain and remove the last unit:
 
    ```
-   ./ecat_op -i enp2s0 -s 2 --op 0,1 --random 5 -d 1800 -F pair_16_nolabel
+   ./ecat_op -i enp2s0 -s 3 --op 0,1,2 --random 5 -d 1800 -F chain3
    ```
 
-2. **Re-run the 4-slave chain with recovery enabled** (commit `d385a57`,
-   untested on hardware). This is what turns single observations into a rate,
-   and — the reason it matters for §3.4 — it brings the far side of a dropped
-   link back so its `FLDS` can be probed.
+   A drop means **one** device beyond the partner suffices, which matches
+   `FINDINGS.md` condition 2 exactly and makes the two faults one. Silence
+   means there is a threshold above one, which no current hypothesis predicts
+   and which would be the most interesting result available.
 
-3. **Probe the partner after recovery.** If the far PHY latches
-   `FLDS = 0x0080` on the drops where the near PHY latched nothing, §3.4
-   reading 1 is confirmed and a single mechanism explains everything.
+4. **Run `#16 ↔ #nolabel` as an isolated pair.** Still the one inter-drive
+   link never run alone, and still the direct test of whether TwinCAT's own
+   two-drive rig was a special pair (§6). Demoted only because §4.2 showed the
+   pair/chain difference is not a property of any particular pair.
 
-4. **Extend the pair runs.** Now 912.4 s pooled, bounding the pair rate at
-   0.0033/s — 36× below TwinCAT's 0.118/s and 20× below the four-slave rate,
-   with each pair independently significant. This is no longer the weak link
-   in the argument; further pair time has low marginal value next to items
-   1–3.
+5. **Extend the pair runs.** 912.4 s pooled bounds them at 0.0033/s, 28.6×
+   below the four-slave rate, each pair independently significant. Low
+   marginal value next to items 1–4.
 
 ---
 
-## 7. Instrument state and caveats
+## 8. Instrument state and caveats
 
 **What is trustworthy.** The ESC lost-link counters at `0x0310` are never
 cleared by anything either master does, so they are running totals and the
@@ -291,19 +444,22 @@ recalled.
 - **Runs 1–4 used the pre-recovery build**, whose `events.csv` timestamps
   carry a constant offset from the console log (fixed in `d385a57`). Times in
   this note are taken from the **console log**, which was always correct.
-- **Run 5 used the new build, and it is only partly exercised.** 372.3 s at
-  1000 Hz with no WKC mismatch and no unreturned frame, so nothing regressed;
-  the 60 s heartbeat, the line-buffered log and the new summary lines all
-  work on hardware. But the run saw no drop, so **the recovery path has still
-  never executed** — not the port close, not the link wait, not the re-init —
-  and neither has the `events.csv` epoch, since no event was written. Both
-  remain unit-tested only.
+- **Runs 5 and 6 used the post-`d385a57` build.** Run 6 exercised the
+  recovery path for the first time (§5): port close, link wait, debounce and
+  reopen all behaved, and the `events.csv` epoch is now confirmed on hardware
+  — the event logged at 2.308161 s against the console's 2.308285 s, where
+  the old build would have written ~1669 s. **The re-init step is broken**
+  (AL `0x001B`, §5) and is the one part still not working.
+- **Run 6's own summary line is wrong.** "At-risk time: 308.2 s -> 0.0065
+  drops/s" subtracts only the outage, not the 306 s the chain spent out of OP
+  after the failed re-init. The correct figure is 2.163 s. §4.1 uses the
+  correct one; the printed one should not be quoted.
 - **No run reached its requested 7200 s.** All were stopped by hand once the
   chain had severed.
 
 ---
 
-## 8. Run index
+## 9. Run index
 
 Times from the console log. "At-risk" is OP with an intact chain.
 
@@ -314,9 +470,14 @@ Times from the console log. "At-risk" is OP with an intact chain.
 | 3 | `opdropsagentia4_2` | `#14→#16→#nolabel→#17` | 21.079 s | 2 | slave 2 p1 | **`0x0080` RX Errors** |
 | 4 | `opdropsagentia2_2` | `#nolabel→#17` | 145.4 s | 0 | — | not triggered |
 | 5 | `opdropsagentia2_2#2` | `#nolabel→#17` | 372.3 s | 0 | — | not triggered |
+| 6 | `opdropsagentia4_3` | `#nolabel→#17→#5→#0` | **2.163 s** | 2 | slave 0 p1 | **`0x0080` RX Errors** |
 
 Logs are the matching `.log` files; run 3's log is `opdropsagentia4_2og`.
 Each capture directory holds `events.csv`, `frames.pcap` and `probes.txt`.
+
+`#5` and `#0` are M400+EVE-NET drives taken from our own 11-slave lab chain —
+the chain that ran 6,144.7 s in OP without a drop (`FINDINGS.md` §10.2). Runs
+1–5 used the pre-recovery build; runs 5–6 the post-`d385a57` build.
 
 ### Reproducing the analysis
 
