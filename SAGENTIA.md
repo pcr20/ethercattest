@@ -21,8 +21,10 @@ the same master and the same binary onto the field hardware produced the fault
 within seconds.
 
 **Four slaves in the chain → drops within 2 to 21 s. Two slaves → nothing in
-912 s.** The same link behaves both ways depending only on what sits beyond it
-(§4.2).
+912 s. Six slaves → nothing in 435 s.** The dependence on device count is
+non-monotonic, which refutes the chain-length explanation this note carried
+until run 12 (§4.5). The same link behaves both ways depending on what else is
+in the chain (§4.2).
 
 | configuration | units | time in OP | first drop | total drops |
 |---|---|---|---|---|
@@ -36,6 +38,8 @@ within seconds.
 | 4-slave, **reordered** | `#5 → #0 → #nolabel → #17` | 39.7 s | **6.963 s** | 6 (**3 recovered**) |
 | 4-slave, reordered (long) | `#5 → #0 → #nolabel → #17` | 243.6 s | **64.861 s** | 16 (**8 recovered**) |
 | 4-slave, reordered (repeat) | `#5 → #0 → #nolabel → #17` | 131.7 s | **23.801 s** | 4 (**2 recovered**) |
+| **6-slave, all units** | `#5 → #0 → #14 → #16 → #nolabel → #17` | 248.6 s | — | **0** |
+| 6-slave (repeat) | `#5 → #0 → #14 → #16 → #nolabel → #17` | 186.2 s | — | **0** |
 
 On one drop the PHY latched **which mechanism fired**, and it is Fast Link
 Drop on the RX-error criterion (§3), now latched on three separate drops.
@@ -56,8 +60,8 @@ TwinCAT's, and it has fallen with every run that added data (§4.1). The
 Drop reason are all on `#nolabel`'s port 1 facing `#17`, at three different
 chain positions, and the two on other devices latched nothing (§4.4).
 
-The result does **not** reduce to a bad cable or a bad unit, and it is not a
-property of the field units. The link `#nolabel ↔ #17` was silent for 517.7 s
+The result is not a property of the field units, and within the four-slave
+chains it is not a property of the failing link's own cable or endpoints. The link `#nolabel ↔ #17` was silent for 517.7 s
 as an isolated pair and then dropped in **2.163 s** when two spare drives from
 our own lab chain were appended behind it — same link, same cable, same two
 units, opposite outcome (§4.2).
@@ -252,9 +256,10 @@ been run on hardware.
 
 ---
 
-## 4. The controlling variable is chain length, not the cable or the pair
+## 4. What makes it drop — and it is not device count
 
-This is the result that was not anticipated.
+Four devices drop links. Two do not. **Six do not either.** No monotonic
+model of chain length survives that, and §4.5 sets out what it leaves.
 
 Both links that dropped in the 4-slave chain were afterwards run as isolated
 two-slave pairs, and neither dropped:
@@ -276,11 +281,13 @@ the same accounting `TWINCAT.md` §6.4 uses to derive 0.118/s.
 
 | configuration | at-risk time | drops | rate |
 |---|---|---|---|
-| 4-slave chains (seven runs pooled) | 411.63 s | 17 | **0.0413/s**, 95% CI [0.024, 0.066] |
+| **2 devices** — both pairs pooled | 912.40 s | **0** | 95% upper bound **0.0040/s** |
+| **4 devices** — seven runs pooled | 411.63 s | 17 | **0.0413/s**, 95% CI [0.024, 0.066] |
 |  — field-only `#14→#16→#nolabel→#17` | 29.77 s | 2 | 0.0672/s |
 |  — mixed A `#nolabel→#17→#5→#0` | 6.33 s | 2 | 0.3162/s |
 |  — mixed B `#5→#0→#nolabel→#17` | 375.54 s | 13 | 0.0346/s |
-| **continuous runs only (8, 9, 10)** | **375.54 s** | **13** | **0.0346/s**, 95% CI [0.018, 0.059] |
+|  — continuous runs only (8, 9, 10) | 375.54 s | 13 | 0.0346/s, 95% CI [0.018, 0.059] |
+| **6 devices** — `#5→#0→#14→#16→#nolabel→#17` | 434.73 s | **0** | 95% upper bound **0.0085/s** |
 | **TwinCAT, this hardware** | 25.39 s | 3 | **0.1182/s**, 95% CI [0.024, 0.345] |
 | pair `#14 ↔ #16` | 394.7 s | 0 | 95% upper bound 0.0076/s |
 | pair `#nolabel ↔ #17` | 517.7 s | 0 | 95% upper bound 0.0058/s |
@@ -457,7 +464,9 @@ The most the data supports:
 > The `#nolabel ↔ #17` link is much the most fragile — 16 of 18 drops — and is
 > the only one whose failures have a latched cause. But `#14 ↔ #16` and
 > `#16 ↔ #nolabel` have failed too, so fragility is not confined to one link
-> or one unit.
+> or one unit. And in the six-device chain that same link did not fail at all
+> (§4.5), so its fragility is conditional on the rest of the chain — or on
+> which cable was on it at the time.
 
 The pair control remains the counterweight: `#nolabel ↔ #17`, the same two
 units and the same cable, ran 517.7 s in isolation without a single drop
@@ -472,7 +481,76 @@ under conditions no other run reproduces, and it is excluded from every rate
 in §4.1. It is recorded here because it bears on *which devices can drop a
 link* — which is the question this section answers — not on how often.
 
-### 4.5 Relation to the corruption fault's condition 2
+### 4.5 Six devices do not drop — the count model is refuted
+
+Runs 11 and 12 put **all six units in one chain**, the two lab drives in front
+of the four field ones:
+
+```
+master ── #5 ── #0 ── #14 ── #16 ── #nolabel ── #17
+```
+
+Both ran clean. **248.6 s and 186.1 s, 434.7 s pooled, zero drops** — and
+zero of anything else: no WKC mismatch in either run, 1000 Hz held, 100% of
+cycles at-risk, no ESC counter moved on any slave.
+
+At the four-slave mixed-B rate of 0.0346/s that window expected **15.0** drops.
+At the four-slave field rate of 0.0672/s it expected **29.2**.
+
+| comparison | expected | observed | P |
+|---|---|---|---|
+| vs mixed B `#5→#0→#nolabel→#17` | 15.0 | 0 | **3×10⁻⁷** |
+| vs field `#14→#16→#nolabel→#17` | 29.2 | 0 | **2×10⁻¹³** |
+
+So the six-slave chain is not a quiet stretch of the same behaviour; it is
+different behaviour.
+
+**The dependence on device count is non-monotonic:**
+
+| devices | at-risk | drops | rate |
+|---|---|---|---|
+| 2 | 912.4 s | 0 | ≤ 0.0040/s |
+| **4** | **411.6 s** | **17** | **0.0413/s** |
+| 6 | 434.7 s | 0 | ≤ 0.0085/s |
+
+**This withdraws the claim that device count is the controlling variable.**
+§4 previously read "chain length is the controlling variable" and §4.4 stated
+"total device count matters, position does not". Neither survives. Adding two
+devices to a chain that drops stops it dropping.
+
+The `#nolabel ↔ #17` link is present, terminal and untouched in all three
+configurations that contain it — and drops in one of them.
+
+**A parallel worth noting.** `FINDINGS.md` §8 records the same shape for the
+frame-corruption fault: "Emission scales with downstream device count — Run F:
+four devices downstream, predicted 0.3–0.5/s, measured 0.011/s. Non-monotonic
+against runs D and E." Both faults depend on what else is in the chain, and
+neither depends on it monotonically. That is either a shared mechanism or a
+shared confound, and §8 now names the most likely confound.
+
+#### What could produce a non-monotonic dependence
+
+In rough order of how cheaply each can be tested:
+
+1. **The cabling changed.** Every reconfiguration is a recabling, and which
+   physical cable sits on which link has never been recorded. If the
+   `#nolabel ↔ #17` cable was swapped when the chain was rebuilt to six, then
+   "the fragile link" may have been a fragile *cable* all along, and the
+   count series measures nothing. This is the first thing to rule out and the
+   cheapest — see §7.
+2. **Frame length.** Six slaves carry 66 B of process data against four
+   slaves' 44 B, so the cyclic frame grows by ~22 B. Link utilisation is far
+   below 1% either way, so the saturation mechanism of `FINDINGS.md` §5.5 does
+   not transfer, but frame length itself has not been varied independently.
+3. **Round-trip time and return-path timing.** Two more hops of store-and-
+   forward. `FINDINGS.md` §11 question 1 raises the same candidate for the
+   corruption fault and it is still untested there too.
+4. **Something about the specific neighbours.** In mixed B, `#nolabel`'s
+   upstream partner is `#0`; in the six-chain it is `#16`. But the field-only
+   four-chain also had `#16` upstream of `#nolabel` and *did* drop, so this
+   does not explain it on its own.
+
+### 4.6 Relation to the corruption fault's condition 2
 
 `FINDINGS.md` §1 condition 2 for the *frame-corruption* fault reads: "at least
 one device must lie beyond the EVE-NET's port-1 partner."
@@ -491,12 +569,13 @@ link in the chain, with nothing at all beyond `#17`, and the two devices that
 made the difference sat *in front of* the failing link rather than behind it.
 Four of eight drops now have no device beyond the partner.
 
-What survives is the weaker and more robust statement of §4.4: **total device
-count matters, position does not.** "Beyond the partner" was a correlate in
-the lab chain, where the EVE-NET happened to sit near the front. The two
-faults may still share a mechanism, but they do not share this condition, and
-`FINDINGS.md` condition 2 should be re-examined against a chain with the
-EVE-NET at the end.
+What survived at the time was the weaker statement "total device count
+matters, position does not" — and **run 12 has since refuted that too**
+(§4.5): six devices drop nothing. Position does still appear not to matter
+among the four-slave chains (§4.3), but count is not the variable either.
+`FINDINGS.md` condition 2 should still be re-examined against a chain with the
+EVE-NET at the end, and it should be checked for the same cabling confound
+(§4.5, §8).
 
 ---
 
@@ -719,19 +798,31 @@ Run 6 changed the ordering. The recovery defect (§5) now blocks everything
 else, because until it is fixed each run yields exactly one drop and then
 stops being an experiment.
 
-1. **Finish the recovery fixes.** Two of four are now *proven* on hardware by
-   run 8 (§5.1): the AL error acknowledge, and at-risk time from healthy
-   cycles. Two remain (§5):
+1. **Record which cable is on which link, then repeat one configuration.**
+   This is now the most important thing in the document and it costs nothing
+   but labelling. Every reconfiguration so far has been a recabling, and the
+   cables have never been tracked, so the whole device-count series (§4.5) may
+   be measuring cables rather than topology. Label every cable, rebuild the
+   four-slave mixed-B chain exactly, and confirm it still drops. If it does
+   not, the cable is the variable and the note's §4 needs rewriting around
+   that. If it does, swap only the `#nolabel ↔ #17` cable and run again.
 
-   - **Wait for the slaves to answer** after reopening the port, instead of
-     re-initialising 152 ms later into a link that has not come up. Poll until
-     the expected slave count responds, with a timeout.
-   - **Capture `0x0101` at bring-up**, while the chain is healthy, rather than
-     reading it mid-disruption. It read `0x00` in run 6 and `0xFF` in run 7 on
-     the same slave, and in run 7 the close wrote nothing at all.
+2. **Then re-run the six-slave chain longer.** 434.7 s bounds it at 0.0085/s,
+   which is already 4× below the four-slave rate with P = 3×10⁻⁷, but a
+   configuration that produces *nothing* deserves the same exposure the
+   four-slave ones have had before it is called a negative.
 
-   Worth doing at the same time: stop polling slaves known to be unreachable.
-   That cost run 7 41% of its cycles and run 8 still 2.9%.
+3. **A three- and a five-slave chain.** With 2 and 6 both silent and 4 loud,
+   the shape between them is the whole question. Three is one device beyond
+   the pair; five brackets the peak from the other side.
+
+4. **Finish the recovery fixes.** Two of four are proven on hardware by run 8
+   (§5.1) and one more by run 10 (§5.3). One remains (§5):
+
+   - **Stop polling slaves known to be unreachable.** That cost run 7 41% of
+     its cycles and run 8 2.9%. The settle wait (`b6fc00c`) is in but has
+     never been stressed (§5.3), and `0x0101` is now snapshotted at bring-up
+     and confirmed correct (§5.3).
 
 2. **Then re-run the four-slave chain long.** With recovery working this is
    the run that turns three single observations into a measured rate against
@@ -753,14 +844,12 @@ stops being an experiment.
    means there is a threshold above one, which no current hypothesis predicts
    and which would be the most interesting result available.
 
-4. **Run `#16 ↔ #nolabel` as an isolated pair.** Still the one inter-drive
+5. **Run `#16 ↔ #nolabel` as an isolated pair.** Still the one inter-drive
    link never run alone, and still the direct test of whether TwinCAT's own
-   two-drive rig was a special pair (§6). Demoted only because §4.2 showed the
-   pair/chain difference is not a property of any particular pair.
+   two-drive rig was a special pair (§6).
 
-5. **Extend the pair runs.** 912.4 s pooled bounds them at 0.0033/s, 28.6×
-   below the four-slave rate, each pair independently significant. Low
-   marginal value next to items 1–4.
+6. **Extend the pair runs.** 912.4 s pooled bounds them at 0.0040/s. Low
+   marginal value next to items 1–5.
 
 ---
 
@@ -821,6 +910,13 @@ recalled.
   the chain answering in 1 ms both times, so re-init never had to wait. The
   condition it was written for — run 7's three slaves behind the break, rather
   than one — has not recurred (§5.3).
+- **Which cable sits on which link has never been recorded.** Every
+  configuration change in this document is also a recabling, so cable
+  identity is confounded with topology, unit order and device count
+  throughout. This is the largest uncontrolled variable in the whole note and
+  it could account for §4.5 on its own — and possibly for §4.2's pair control
+  as well. Nothing here distinguishes "this link is fragile" from "this cable
+  is faulty". §7 item 1 is the fix and it is now the first priority.
 - **The rate estimate has fallen at every revision**: 0.1049 → 0.0524 →
   0.0413/s pooled. Part is the selection effect, which is understood and
   quantified. Whether any of it is a real decline is open and tested at
@@ -846,6 +942,8 @@ Times from the console log. "At-risk" is OP with an intact chain.
 | 8 | `opdropsagentia4_5` | `#5→#0→#nolabel→#17` | **30.650 s** | 6 (3 recovered) | slave 2 p1 ×3 | **`0x0080` RX Errors** ×3 |
 | 9 | `opdropsagentia4_6` | `#5→#0→#nolabel→#17` | **219.298 s** | 16 (8 recovered) | slave 2 p1 ×8 | `0x0080` ×7, **`0x0010` Signal/Energy Lost** ×1 |
 | 10 | `opdropsagentia4_7` | `#5→#0→#nolabel→#17` | **125.590 s** | 4 (2 recovered) | slave 2 p1 ×2 | `0x0080` ×2 |
+| 11 | `opdropsagentia6` | `#5→#0→#14→#16→#nolabel→#17` | **248.594 s** | **0** | — | not triggered |
+| 12 | `opdropsagentia6_1` | `#5→#0→#14→#16→#nolabel→#17` | **186.134 s** | **0** | — | not triggered |
 
 Logs are the matching `.log` files; run 3's log is `opdropsagentia4_2og`.
 Each capture directory holds `events.csv`, `frames.pcap` and `probes.txt`.
@@ -856,7 +954,9 @@ the chain that ran 6,144.7 s in OP without a drop (`FINDINGS.md` §10.2). Runs
 and 9 the `ba1881d` build** — the first with working recovery, and so the
 first whose at-risk time and drop rate can be quoted directly from their own
 summaries. **Run 10 is the first on `b6fc00c`**, which adds the settle wait
-and the `0x0101` snapshot.
+and the `0x0101` snapshot; runs 11–12 use it too. Runs 11 and 12 are the
+cleanest in the set — 1000 Hz held, zero WKC mismatches, 100% of cycles
+at-risk.
 
 ### Reproducing the analysis
 
