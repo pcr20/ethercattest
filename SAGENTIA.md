@@ -20,8 +20,8 @@ Every earlier negative in this investigation came from our lab chain. Moving
 the same master and the same binary onto the field hardware produced the fault
 within seconds.
 
-**Four slaves in the chain → drops within 9 to 21 s. Either half of that chain
-run as a pair → nothing in 540 s.**
+**Four slaves in the chain → drops within 9 to 21 s. Either tested half of
+that chain run as a pair → nothing in 912 s.**
 
 | configuration | units | time in OP | first drop | total drops |
 |---|---|---|---|---|
@@ -29,6 +29,7 @@ run as a pair → nothing in 540 s.**
 | 4-slave chain (repeat) | `#14 → #16 → #nolabel → #17` | 47.3 s | **21.079 s** | 2 |
 | 2-slave pair | `#14 → #16` | 394.7 s | — | **0** |
 | 2-slave pair | `#nolabel → #17` | 145.4 s | — | **0** |
+| 2-slave pair (repeat) | `#nolabel → #17` | 372.3 s | — | **0** |
 
 On one drop the PHY latched **which mechanism fired**, and it is Fast Link
 Drop on the RX-error criterion (§3). That is the first direct evidence of a
@@ -168,7 +169,7 @@ two-slave pairs, and neither dropped:
 |---|---|---|
 | `#14 ↔ #16` | dropped (run 1, t=32.7 s) | **0 drops in 394.7 s** |
 | `#16 ↔ #nolabel` | dropped (run 1, t=8.7 s) | **not yet tested** — see §6 |
-| `#nolabel ↔ #17` | dropped (run 2, t=21.1 s) | **0 drops in 145.4 s** |
+| `#nolabel ↔ #17` | dropped (run 2, t=21.1 s) | **0 drops in 517.7 s** (two runs) |
 
 So it is not that one cable or one unit is bad. The same physical link that
 fails inside the four-slave chain is quiet on its own.
@@ -182,11 +183,18 @@ the same accounting `TWINCAT.md` §6.4 uses to derive 0.118/s.
 | configuration | at-risk time | drops | rate |
 |---|---|---|---|
 | 4-slave chain (both runs pooled) | 29.77 s | 2 | **0.0672/s**, one per 14.9 s |
-| 2-slave pairs (both pooled) | 540.1 s | 0 | 95% upper bound **0.0055/s** |
+| pair `#14 ↔ #16` | 394.7 s | 0 | 95% upper bound 0.0076/s |
+| pair `#nolabel ↔ #17` | 517.7 s | 0 | 95% upper bound 0.0058/s |
+| **both pairs pooled** | **912.4 s** | **0** | 95% upper bound **0.0033/s** |
 
-If the pairs dropped at the four-slave rate they would have produced **36.3**
-drops. They produced zero: **P = 1.7×10⁻¹⁶**, a separation of **12.1×** with
-disjoint intervals.
+If the pairs dropped at the four-slave rate they would have produced **61.3**
+drops. They produced zero: **P = 1×10⁻²⁷**, a separation of **20.5×** with
+disjoint intervals. Against TwinCAT's own 0.118/s on this hardware the
+separation is **36×**.
+
+Each pair is now independently significant, so this is not one long quiet run
+carrying a short one: `#14 ↔ #16` alone bounds at 0.0076/s and
+`#nolabel ↔ #17` at 0.0058/s, both below the four-slave rate with no overlap.
 
 For scale, our four-slave rate of 0.0672/s sits within a factor of 1.8 of
 TwinCAT's 0.118/s on this same hardware.
@@ -247,10 +255,11 @@ In priority order. The first is decisive and takes minutes.
    `FLDS = 0x0080` on the drops where the near PHY latched nothing, §3.4
    reading 1 is confirmed and a single mechanism explains everything.
 
-4. **Extend the pair runs.** 394.7 s and 145.4 s bound the pair rate at
-   0.0055/s, which is 21× below TwinCAT's 0.118/s but only 12× below the
-   4-slave rate. An hour on each pair would tighten that by an order of
-   magnitude.
+4. **Extend the pair runs.** Now 912.4 s pooled, bounding the pair rate at
+   0.0033/s — 36× below TwinCAT's 0.118/s and 20× below the four-slave rate,
+   with each pair independently significant. This is no longer the weak link
+   in the argument; further pair time has low marginal value next to items
+   1–3.
 
 ---
 
@@ -282,6 +291,13 @@ recalled.
 - **Runs 1–4 used the pre-recovery build**, whose `events.csv` timestamps
   carry a constant offset from the console log (fixed in `d385a57`). Times in
   this note are taken from the **console log**, which was always correct.
+- **Run 5 used the new build, and it is only partly exercised.** 372.3 s at
+  1000 Hz with no WKC mismatch and no unreturned frame, so nothing regressed;
+  the 60 s heartbeat, the line-buffered log and the new summary lines all
+  work on hardware. But the run saw no drop, so **the recovery path has still
+  never executed** — not the port close, not the link wait, not the re-init —
+  and neither has the `events.csv` epoch, since no event was written. Both
+  remain unit-tested only.
 - **No run reached its requested 7200 s.** All were stopped by hand once the
   chain had severed.
 
@@ -297,7 +313,7 @@ Times from the console log. "At-risk" is OP with an intact chain.
 | 2 | `opdropsagentia2` | `#14→#16` | 394.7 s | 0 | — | not triggered |
 | 3 | `opdropsagentia4_2` | `#14→#16→#nolabel→#17` | 21.079 s | 2 | slave 2 p1 | **`0x0080` RX Errors** |
 | 4 | `opdropsagentia2_2` | `#nolabel→#17` | 145.4 s | 0 | — | not triggered |
-| 5 | `opdropsagentia2_2#2` | 2-slave | *in progress* | | | |
+| 5 | `opdropsagentia2_2#2` | `#nolabel→#17` | 372.3 s | 0 | — | not triggered |
 
 Logs are the matching `.log` files; run 3's log is `opdropsagentia4_2og`.
 Each capture directory holds `events.csv`, `frames.pcap` and `probes.txt`.
