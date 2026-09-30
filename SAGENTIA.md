@@ -26,11 +26,19 @@ without that link → nothing in 172 s.** Device count is therefore not the
 variable — the dependence is non-monotonic (§4.5) — and the link is necessary
 but not sufficient (§4.6).
 
-**Two confounds could account for all of it**, and neither is yet excluded:
-which physical cable sat on which link was never recorded (§8), and every drop
+**The other fault is present on this hardware too, and does not cause this
+one.** Saturating the six-slave chain produced 46 prefix-truncated frames at
+3.5×10⁻⁵ per frame — the `FINDINGS.md` signature, at 3.2× the highest rate
+recorded there — while Fast Link Drop never fired on any of the twelve PHYs
+and no link dropped (§6). That is evidence against the §3.3 reading that the
+two faults are one mechanism at two intensities.
+
+**Two confounds could account for the topology results**, and neither is yet
+excluded:
+which physical cable sat on which link was never recorded (§9), and every drop
 in this document happened before 14:45 while nothing has dropped since, which
 is inseparable from the six-slave result because they are the same two runs
-(§5.4). One five-minute rerun settles both (§7 item 1).
+(§5.4). One five-minute rerun settles both (§8 item 1).
 
 | configuration | units | time in OP | first drop | total drops |
 |---|---|---|---|---|
@@ -47,6 +55,7 @@ is inseparable from the six-slave result because they are the same two runs
 | **6-slave, all units** | `#5 → #0 → #14 → #16 → #nolabel → #17` | 248.6 s | — | **0** |
 | 6-slave (repeat) | `#5 → #0 → #14 → #16 → #nolabel → #17` | 186.2 s | — | **0** |
 | 4-slave, **no `#nolabel`/`#17`** | `#5 → #0 → #14 → #16` | 172.5 s | — | **0** |
+| 6-slave, **saturated** (`ecat_ber`) | `#5 → #0 → #14 → #16 → #nolabel → #17` | 166.6 s | — | **0** (but 46 corrupt frames) |
 
 On one drop the PHY latched **which mechanism fired**, and it is Fast Link
 Drop on the RX-error criterion (§3), now latched on three separate drops.
@@ -166,7 +175,10 @@ underlying event at two different intensities: a few RX_ER corrupt a frame, 32
 in 10 µs drop the link.
 
 That is a hypothesis with two supporting observations, not an established
-result. It does not yet explain §3.6.
+result. It does not yet explain §3.6 — and **run 14 is direct evidence
+against it** (§6.2): saturating this chain produced 46 corrupt frames and
+`FLDS = 0x0000` on all twelve PHYs across 144 reads. If corruption drove FLD,
+that is the condition where it should have fired hardest.
 
 ### 3.4 The second firing, and what it separates
 
@@ -274,7 +286,7 @@ two-slave pairs, and neither dropped:
 | link | behaviour in the 4-chain | behaviour as an isolated pair |
 |---|---|---|
 | `#14 ↔ #16` | dropped (run 1, t=32.7 s) | **0 drops in 394.7 s** |
-| `#16 ↔ #nolabel` | dropped (run 1, t=8.7 s) | **not yet tested** — see §7 |
+| `#16 ↔ #nolabel` | dropped (run 1, t=8.7 s) | **not yet tested** — see §8 |
 | `#nolabel ↔ #17` | dropped (run 2, t=21.1 s) | **0 drops in 517.7 s** (two runs) |
 
 So it is not that one cable or one unit is bad. The same physical link that
@@ -533,7 +545,7 @@ frame-corruption fault: "Emission scales with downstream device count — Run F:
 four devices downstream, predicted 0.3–0.5/s, measured 0.011/s. Non-monotonic
 against runs D and E." Both faults depend on what else is in the chain, and
 neither depends on it monotonically. That is either a shared mechanism or a
-shared confound, and §8 now names the most likely confound.
+shared confound, and §9 now names the most likely confound.
 
 #### What could produce a non-monotonic dependence
 
@@ -544,7 +556,7 @@ In rough order of how cheaply each can be tested:
    `#nolabel ↔ #17` cable was swapped when the chain was rebuilt to six, then
    "the fragile link" may have been a fragile *cable* all along, and the
    count series measures nothing. This is the first thing to rule out and the
-   cheapest — see §7.
+   cheapest — see §8.
 2. **Frame length.** Six slaves carry 66 B of process data against four
    slaves' 44 B, so the cyclic frame grows by ~22 B. Link utilisation is far
    below 1% either way, so the saturation mechanism of `FINDINGS.md` §5.5 does
@@ -862,11 +874,98 @@ after repeated recabling, or a thermal effect — would look exactly like this.
 across three earlier runs. If it drops again, time and build are both
 excluded and §4's topology result stands. If it does not, then nothing in §4
 is about topology and the entire configuration series has been measuring
-drift. This is §7 item 1.
+drift. This is §8 item 1.
 
 ---
 
-## 6. The contradiction with the capture
+## 6. The other fault, on the same hardware — and it does not cause this one
+
+Run 14 is a different instrument. `ecat_ber` does not drive anything to OP; it
+saturates the link with 1518-byte frames and measures **frame corruption**,
+the fault `FINDINGS.md` documents. Run on the same six-slave chain:
+
+```
+./ecat_ber -i enp2s0 -s 6 -d 500 -F satM400 -o satM400.csv
+```
+
+### 6.1 The corruption fault reproduces here, and hard
+
+166.6 s, 1,311,946 frames on the wire at **94.3 Mbit/s** — near saturation,
+which is the condition `FINDINGS.md` §5.5 establishes as necessary.
+
+| | |
+|---|---|
+| corrupt frames received | **46** |
+| payload CRC errors | **0** — the data is never damaged |
+| EtherType destroyed | **46 of 46** — leading bytes lost on the wire |
+| bytes lost (K) | 62, 62, 185, 185, 530, 578, 595, 612, 657, 679, 752 … |
+| rate | **3.51×10⁻⁵ per frame** |
+
+That is the `FINDINGS.md` signature exactly: prefix loss, variable K, payload
+byte-for-byte correct. The rate is **3.2× higher than the highest figure in
+`FINDINGS.md`** (~1.1×10⁻⁵), which is consistent with this chain being six
+EVE-NETs — every device an emitter — rather than one or two among EVS-XCRs.
+
+New invalid frames appear at three devices' downstream ports, so damage is
+entering at more than one point:
+
+| pos | unit | invalid-frame P1 | forwarded-error P1 |
+|---|---|---|---|
+| 0 | `#5` | 0 | 12 |
+| 1 | `#0` | **2** | 8 |
+| 2 | `#14` | **3** | 5 |
+| 3 | `#16` | **3** | 1 |
+| 4 | `#nolabel` | 0 | 1 |
+| 5 | `#17` | 0 | 0 |
+
+The forwarded counts accumulate toward the master as each ESC passes on a
+frame already marked bad, which is the expected shape. Attributing origins
+properly needs `FINDINGS.md`'s gradient method over more than one run; what
+this shows is that `#0`, `#14` and `#16` are all introducing damage.
+
+**Every RX-error counter (`0x0301+2y`) read zero** while 46 frames were being
+invalidated — so the ESC is marking frames invalid without recording an RX
+error, which is worth carrying back to `FINDINGS.md` §7.
+
+### 6.2 Corruption does not trigger Fast Link Drop
+
+This is the result that matters for §3.
+
+`ecat_ber` probed every PHY on every slave 12 times during the run — **144
+register reads, all six slaves, both PHYs each**, the first time the whole
+chain has been read during an event rather than just the reachable prefix.
+
+```
+144 reads:  FLDS = 0x0000      RECR = 0x0000
+```
+
+Every one. Plus: zero lost-link counters on all six slaves, and the host
+carrier log (`satM400_linkevents.csv`) holds nothing but its header — **zero
+link transitions**.
+
+So: maximum corruption, a near-saturated link, 46 damaged frames, and **Fast
+Link Drop never fired and the PHY receive-error counter never moved.**
+
+**This is evidence against the hypothesis in §3.3.** That section proposed
+the two faults were one event at two intensities —
+
+> RX errors on the link → 32 RX_ER inside 10 µs → FLD drops the link
+
+— with corruption as the low-intensity case. If that were the mechanism,
+saturating the link and producing 46 corrupt frames should be the most
+favourable condition possible for FLD, and it produced none. The `FLDS =
+0x0080` firings of §3 are not being driven by the corruption fault.
+
+**The caveat that keeps this from being decisive.** This is the *six-slave*
+chain, which also produced zero link drops under `ecat_op` (§4.5) — so it may
+simply not be in the drop-prone state, and the test would then be confounded
+with whatever makes that configuration quiet. The same saturation run on a
+four-slave mixed-B chain, which does drop, would settle it. That is worth
+doing immediately after §8 item 1, and with the same cable labelling.
+
+---
+
+## 7. The contradiction with the capture
 
 `TWINCAT.md` §3 is unambiguous about TwinCAT's own arrangement:
 
@@ -903,11 +1002,12 @@ The candidates, in order of how cheaply they can be tested:
 
 ---
 
-## 7. Next experiments
+## 8. Next experiments
 
-Run 6 changed the ordering. The recovery defect (§5) now blocks everything
-else, because until it is fixed each run yields exactly one drop and then
-stops being an experiment.
+Runs 11–14 changed the ordering completely. Two confounds — the cabling and
+the wall clock (§5.4, §9) — now sit under every topology result in §4, and
+until they are cleared nothing in that section is worth building on. The first
+two items are both short.
 
 1. **Rebuild mixed B and run it again, now.** One experiment settles both
    open confounds and it takes five minutes.
@@ -923,20 +1023,29 @@ stops being an experiment.
 
    **Label the cables while rebuilding it.** Every reconfiguration so far has
    been a recabling and cable identity has never been recorded, so it is
-   confounded with topology, unit order and device count throughout (§8). Once
+   confounded with topology, unit order and device count throughout (§9). Once
    labelled, the follow-up is to swap only the `#nolabel ↔ #17` cable and run
    again — which distinguishes a fragile link from a faulty cable.
 
-2. **Then re-run the six-slave chain longer.** 434.7 s bounds it at 0.0085/s,
+2. **Saturate a four-slave mixed-B chain.** Run 14 showed corruption without
+   any link drop, but on the six-slave chain, which never drops anyway (§6.2).
+   The same `ecat_ber` run on a configuration that *does* drop is what turns
+   that into a real separation of the two faults:
+
+   ```
+   ./ecat_ber -i enp2s0 -s 4 -F satMixedB -o satMixedB.csv -d 500
+   ```
+
+3. **Then re-run the six-slave chain longer.** 434.7 s bounds it at 0.0085/s,
    which is already 4× below the four-slave rate with P = 3×10⁻⁷, but a
    configuration that produces *nothing* deserves the same exposure the
    four-slave ones have had before it is called a negative.
 
-3. **A three- and a five-slave chain.** With 2 and 6 both silent and 4 loud,
+4. **A three- and a five-slave chain.** With 2 and 6 both silent and 4 loud,
    the shape between them is the whole question. Three is one device beyond
    the pair; five brackets the peak from the other side.
 
-4. **Finish the recovery fixes.** Two of four are proven on hardware by run 8
+5. **Finish the recovery fixes.** Two of four are proven on hardware by run 8
    (§5.1) and one more by run 10 (§5.3). One remains (§5):
 
    - **Stop polling slaves known to be unreachable.** That cost run 7 41% of
@@ -944,36 +1053,16 @@ stops being an experiment.
      never been stressed (§5.3), and `0x0101` is now snapshotted at bring-up
      and confirmed correct (§5.3).
 
-2. **Then re-run the four-slave chain long.** With recovery working this is
-   the run that turns three single observations into a measured rate against
-   TwinCAT's 0.118/s — and, for §3.5, it brings the far side of a dropped link
-   back so its `FLDS` can be probed. If the far PHY latches `FLDS = 0x0080` on
-   the drops where the near PHY latched nothing, one mechanism explains every
-   drop recorded so far.
-
-3. **A three-slave chain.** This is the sharpest remaining question and it did
-   not exist before run 6: two devices never drop, four always do, and nothing
-   has been measured in between. Take run 6's chain and remove the last unit:
-
-   ```
-   ./ecat_op -i enp2s0 -s 3 --op 0,1,2 --random 5 -d 1800 -F chain3
-   ```
-
-   A drop means **one** device beyond the partner suffices, which matches
-   `FINDINGS.md` condition 2 exactly and makes the two faults one. Silence
-   means there is a threshold above one, which no current hypothesis predicts
-   and which would be the most interesting result available.
-
-5. **Run `#16 ↔ #nolabel` as an isolated pair.** Still the one inter-drive
+6. **Run `#16 ↔ #nolabel` as an isolated pair.** Still the one inter-drive
    link never run alone, and still the direct test of whether TwinCAT's own
-   two-drive rig was a special pair (§6).
+   two-drive rig was a special pair (§7).
 
-6. **Extend the pair runs.** 912.4 s pooled bounds them at 0.0040/s. Low
-   marginal value next to items 1–5.
+7. **Extend the pair runs.** 912.4 s pooled bounds them at 0.0040/s. Low
+   marginal value next to items 1–6.
 
 ---
 
-## 8. Instrument state and caveats
+## 9. Instrument state and caveats
 
 **What is trustworthy.** The ESC lost-link counters at `0x0310` are never
 cleared by anything either master does, so they are running totals and the
@@ -1036,7 +1125,7 @@ recalled.
   throughout. This is the largest uncontrolled variable in the whole note and
   it could account for §4.5 on its own — and possibly for §4.2's pair control
   as well. Nothing here distinguishes "this link is fragile" from "this cable
-  is faulty". §7 item 1 is the fix and it is now the first priority.
+  is faulty". §8 item 1 is the fix and it is now the first priority.
 - **The rate estimate has fallen at every revision**: 0.1049 → 0.0524 →
   0.0413/s pooled. Part is the selection effect, which is understood and
   quantified. Whether any of it is a real decline is open and tested at
@@ -1046,7 +1135,7 @@ recalled.
 
 ---
 
-## 9. Run index
+## 10. Run index
 
 Times from the console log. "At-risk" is OP with an intact chain.
 
@@ -1065,6 +1154,7 @@ Times from the console log. "At-risk" is OP with an intact chain.
 | 11 | `opdropsagentia6` | `#5→#0→#14→#16→#nolabel→#17` | **248.594 s** | **0** | — | not triggered |
 | 12 | `opdropsagentia6_1` | `#5→#0→#14→#16→#nolabel→#17` | **186.134 s** | **0** | — | not triggered |
 | 13 | `opdropsagentia4_8` | `#5→#0→#14→#16` (no `#nolabel`/`#17`) | **172.431 s** | **0** | — | not triggered |
+| 14 | `satM400` (`ecat_ber`) | `#5→#0→#14→#16→#nolabel→#17`, saturated | 166.6 s | **0** | — | `0x0000` ×144 (§6.2) |
 
 Logs are the matching `.log` files; run 3's log is `opdropsagentia4_2og`.
 Each capture directory holds `events.csv`, `frames.pcap` and `probes.txt`.
