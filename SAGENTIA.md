@@ -35,6 +35,7 @@ within seconds.
 | 4-slave, 2 lab units (repeat) | `#nolabel → #17 → #5 → #0` | 64.6 s | **4.162 s** | 2 |
 | 4-slave, **reordered** | `#5 → #0 → #nolabel → #17` | 39.7 s | **6.963 s** | 6 (**3 recovered**) |
 | 4-slave, reordered (long) | `#5 → #0 → #nolabel → #17` | 243.6 s | **64.861 s** | 16 (**8 recovered**) |
+| 4-slave, reordered (repeat) | `#5 → #0 → #nolabel → #17` | 131.7 s | **23.801 s** | 4 (**2 recovered**) |
 
 On one drop the PHY latched **which mechanism fired**, and it is Fast Link
 Drop on the RX-error criterion (§3), now latched on three separate drops.
@@ -42,12 +43,13 @@ That is the first direct evidence of a cause anywhere in this investigation,
 and it connects the two faults that `FINDINGS.md` has so far treated as
 independent.
 
-Across six four-slave runs the rate is **0.0524 drops/s**, 95% CI
-[0.0294, 0.0865], against TwinCAT's **0.1182/s** (95% CI [0.0244, 0.3453]).
-The two are statistically compatible — a conditional test of equal rates gives
-P = 0.35 — but our point estimate is now **2.3× below** TwinCAT's, not the
-1.07× reported after run 8. That earlier figure was inflated by a selection
-effect and is withdrawn (§4.1).
+Across seven four-slave runs the rate is **0.0413 drops/s**, 95% CI
+[0.0241, 0.0661]; on the unbiased continuous runs alone it is **0.0346/s**,
+95% CI [0.0184, 0.0592]. TwinCAT's is **0.1182/s** (95% CI [0.0244, 0.3453]).
+The intervals still overlap and a test of equal rates gives P = 0.15, so the
+difference is not significant — but our point estimate is now **3.4× below**
+TwinCAT's, and it has fallen with every run that added data (§4.1). The
+"factor of 1.07" reported after run 8 is withdrawn.
 
 **Three different devices have dropped a link** — `#14`, `#16` and `#nolabel`
 — so this is not one faulty unit. But the six drops that latched a Fast Link
@@ -91,10 +93,10 @@ drop severs the chain and ends the useful part of the run.
 
 ---
 
-## 3. The mechanism, caught fourteen times
+## 3. The mechanism, caught sixteen times
 
-Fourteen drops have now been probed with the failing PHY still reachable.
-Thirteen latched Fast Link Drop on the RX-error criterion and one on
+Sixteen drops have now been probed with the failing PHY still reachable.
+Fifteen latched Fast Link Drop on the RX-error criterion and one on
 signal/energy loss (§3.5). Run `opdropsagentia4_2` is the more informative
 because it also has an ESC-layer precursor.
 
@@ -196,11 +198,11 @@ t = 164.702 s read **`FLDS = 0x0010`**, which is bits 8:4 = `00001` —
 typical reaction 10 µs).
 
 So the earlier statement that every firing was the RX-error criterion is
-**withdrawn**. Across 14 probes that reached a failing PHY:
+**withdrawn**. Across 16 probes that reached a failing PHY:
 
 | criterion | `FLDS` | firings |
 |---|---|---|
-| RX Errors (CR3 bit 3) | `0x0080` | 13 |
+| RX Errors (CR3 bit 3) | `0x0080` | 15 |
 | Signal/Energy Lost (CR3 bit 0) | `0x0010` | 1 |
 
 Both of the enabled criteria have now fired on `#nolabel`'s port-1 PHY. RX
@@ -274,11 +276,11 @@ the same accounting `TWINCAT.md` §6.4 uses to derive 0.118/s.
 
 | configuration | at-risk time | drops | rate |
 |---|---|---|---|
-| 4-slave chains (six runs pooled) | 286.04 s | 15 | **0.0524/s**, 95% CI [0.029, 0.087] |
+| 4-slave chains (seven runs pooled) | 411.63 s | 17 | **0.0413/s**, 95% CI [0.024, 0.066] |
 |  — field-only `#14→#16→#nolabel→#17` | 29.77 s | 2 | 0.0672/s |
 |  — mixed A `#nolabel→#17→#5→#0` | 6.33 s | 2 | 0.3162/s |
-|  — mixed B `#5→#0→#nolabel→#17` | 249.95 s | 11 | 0.0440/s |
-| **continuous runs only (8, 9)** | **249.95 s** | **11** | **0.0440/s**, 95% CI [0.022, 0.079] |
+|  — mixed B `#5→#0→#nolabel→#17` | 375.54 s | 13 | 0.0346/s |
+| **continuous runs only (8, 9, 10)** | **375.54 s** | **13** | **0.0346/s**, 95% CI [0.018, 0.059] |
 | **TwinCAT, this hardware** | 25.39 s | 3 | **0.1182/s**, 95% CI [0.024, 0.345] |
 | pair `#14 ↔ #16` | 394.7 s | 0 | 95% upper bound 0.0076/s |
 | pair `#nolabel ↔ #17` | 517.7 s | 0 | 95% upper bound 0.0058/s |
@@ -296,30 +298,48 @@ possibility after run 8; run 9 measures it:
 | estimate | at-risk | drops | rate |
 |---|---|---|---|
 | after run 8 (4 of 7 events from stopped runs) | 66.74 s | 7 | 0.1049/s |
-| after run 9 | 286.04 s | 15 | **0.0524/s** |
-| **continuous runs only — the unbiased estimate** | 249.95 s | 11 | **0.0440/s** |
+| after run 9 | 286.04 s | 15 | 0.0524/s |
+| after run 10 | 411.63 s | 17 | **0.0413/s** |
+| **continuous runs only — the unbiased estimate** | 375.54 s | 13 | **0.0346/s** |
 
 **The "factor of 1.07 against TwinCAT" claimed after run 8 is withdrawn.** On
-the unbiased estimate TwinCAT's rate is **2.7× higher** than ours. A
-conditional binomial test of equal rates gives P = 0.27 — so the difference is
+the unbiased estimate TwinCAT's rate is **3.4× higher** than ours. A
+conditional binomial test of equal rates gives P = 0.15 — so the difference is
 *not* statistically significant, and with 3 events TwinCAT's own interval
 [0.024, 0.345] is far too wide to resolve a factor of three. The honest
 statement is that the rates are compatible and the point estimates differ by
-about 2.7×, not that they match.
+about 3.4×, not that they match.
 
-If the pairs dropped at the four-slave rate they would have produced **47.8**
-drops. They produced zero: **P = 2×10⁻²¹**, a separation of **15.9×**. That
+If the pairs dropped at the four-slave rate they would have produced **31.6**
+drops. They produced zero: **P = 1×10⁻¹⁴**, a separation of **10.5×**. That
 conclusion is unchanged and does not depend on the rate estimate.
 
-The three chains differ by up to 7× but the counts outside mixed B are small
-and the intervals overlap; there is still no evidence that configuration
-affects the rate, only whether it drops at all.
+#### The estimate keeps falling, and it may not be only the selection effect
 
-**Run 9's drops are clustered, not evenly spread.** Nothing for the first
-64.9 s, then eight in the remaining 154 s, with gaps of 21.5, 4.0, 7.1, 53.3,
-13.7, 27.8 and 7.3 s. At its own mean rate a 64.9 s opening gap has P = 0.09
-— unremarkable alone, but worth watching, because a Poisson assumption
-underlies every interval quoted here.
+Three runs of *the same chain with the same binary*:
+
+| run | at-risk | drops | rate | 95% CI |
+|---|---|---|---|---|
+| 8 | 30.65 s | 3 | 0.0979/s | [0.020, 0.286] |
+| 9 | 219.30 s | 8 | 0.0365/s | [0.016, 0.072] |
+| 10 | 125.59 s | 2 | **0.0159/s** | [0.002, 0.058] |
+
+A chi-square test of homogeneity across the three gives **χ² = 4.83, df = 2,
+P = 0.089**. Not significant, and run 8's three drops in 30 s carry most of
+it — runs 9 and 10 compared directly give P = 0.46. So there is **no
+established trend**, and the fall is consistent with chance plus the
+selection effect already identified.
+
+It is recorded because it is the third successive revision downward and
+because a genuine decline would matter: a fault that eases as a rig runs
+would point at something thermal or at connector seating, and would change
+how every earlier short run should be read. The discriminating measurement is
+one long run rather than more short ones.
+
+**Run 9's drops were clustered.** Nothing for the first 64.9 s, then eight in
+the remaining 154 s. At its own mean rate a 64.9 s opening gap has P = 0.09 —
+unremarkable alone, but a Poisson assumption underlies every interval quoted
+here and has not been tested.
 
 Each pair is independently significant, so this is not one long quiet run
 carrying a short one: `#14 ↔ #16` alone bounds at 0.0076/s and
@@ -400,6 +420,7 @@ still reachable once the link is down.
 | 7 | mixed A | **`#nolabel ↔ #17`** | `#nolabel` p1 | yes | **`0x0080`** |
 | 8 | mixed B | **`#nolabel ↔ #17`** ×3 | `#nolabel` p1 | yes ×3 | **`0x0080`** ×3 |
 | 9 | mixed B | **`#nolabel ↔ #17`** ×8 | `#nolabel` p1 | yes ×8 | **`0x0080`** ×7, **`0x0010`** ×1 |
+| 10 | mixed B | **`#nolabel ↔ #17`** ×2 | `#nolabel` p1 | yes ×2 | **`0x0080`** ×2 |
 
 † this one happened 24 s *after* the chain had already severed, so it is not an
 independent at-risk observation — see below.
@@ -407,7 +428,7 @@ independent at-risk observation — see below.
 **Three devices have dropped a link: `#14`, `#16` and `#nolabel`.** This is not
 one faulty unit, and none of the four is exonerated.
 
-What *is* specific to `#nolabel` is the latched reason. Fourteen of fourteen
+What *is* specific to `#nolabel` is the latched reason. Sixteen of sixteen
 drops on its port 1 recorded a Fast Link Drop cause; the two on `#14` and
 `#16` recorded nothing —
 and not because the register was unreachable. Both were probed, both showed
@@ -433,7 +454,7 @@ they are fine themselves.
 
 The most the data supports:
 
-> The `#nolabel ↔ #17` link is much the most fragile — 14 of 16 drops — and is
+> The `#nolabel ↔ #17` link is much the most fragile — 16 of 18 drops — and is
 > the only one whose failures have a latched cause. But `#14 ↔ #16` and
 > `#16 ↔ #nolabel` have failed too, so fragility is not confined to one link
 > or one unit.
@@ -628,6 +649,33 @@ drops, at very different leads.
 
 ---
 
+### 5.3 Run 10: the `0x0101` puzzle resolved
+
+Run 10 is the first on `b6fc00c`, which snapshots the port loop control at
+bring-up instead of reading it during a drop. The snapshot line settles it:
+
+```
+Port loop control 0x0101 as found:  0:0xF4  1:0xF4  2:0xF4  3:0xFC
+```
+
+Every non-terminal slave reads **`0xF4`** — TwinCAT's own value — and the last
+slave in the chain reads **`0xFC`**, which is `0xF4` with port 1 forced
+closed, exactly right for a device with nothing attached downstream. That is a
+correct, well-defined configuration.
+
+So the `0x00` and `0xFF` readings of runs 6, 7 and 9 were **artefacts of
+reading the register while the link was down**, not a register that changes
+by itself. The puzzle recorded in §5.2 is closed, and the defect with it: both
+of run 10's recoveries wrote `0xF4 → 0xFC` and back, byte-identical to the
+capture.
+
+**The settle wait ran but was never stressed.** It reported the chain
+answering **1 ms** after the reopen, both times, so re-init never had to wait.
+That is the right answer for this configuration — runs 8 and 9 succeeded
+without any wait — but it means the fix has not yet faced the condition that
+motivated it, which was run 7's chain of three slaves behind the break rather
+than one. It did no harm and cost nothing; it is not yet proven.
+
 ## 6. The contradiction with the capture
 
 `TWINCAT.md` §3 is unambiguous about TwinCAT's own arrangement:
@@ -766,9 +814,17 @@ recalled.
   under its own mean rate, so this is not yet evidence against Poisson, but
   every confidence interval in §4.1 rests on the assumption and a longer run
   should be checked against it rather than assumed to fit.
-- **One recovery in eight left the chain out of OP** (run 9, AL `0x0025`
+- **One recovery in ten left the chain out of OP** (run 9, AL `0x0025`
   invalid output mapping, §5.2). So at-risk time is not quite the whole story:
   a run can lose a slave and keep going.
+- **The settle wait is still unproven.** Run 10 exercised it and it reported
+  the chain answering in 1 ms both times, so re-init never had to wait. The
+  condition it was written for — run 7's three slaves behind the break, rather
+  than one — has not recurred (§5.3).
+- **The rate estimate has fallen at every revision**: 0.1049 → 0.0524 →
+  0.0413/s pooled. Part is the selection effect, which is understood and
+  quantified. Whether any of it is a real decline is open and tested at
+  P = 0.089 (§4.1). Treat any single short run's rate as provisional.
 - **No run reached its requested 7200 s.** All were stopped by hand once the
   chain had severed.
 
@@ -789,6 +845,7 @@ Times from the console log. "At-risk" is OP with an intact chain.
 | 7 | `opdropsagentia4_4` | `#nolabel→#17→#5→#0` | **4.162 s** | 2 | slave 0 p1 | **`0x0080` RX Errors** |
 | 8 | `opdropsagentia4_5` | `#5→#0→#nolabel→#17` | **30.650 s** | 6 (3 recovered) | slave 2 p1 ×3 | **`0x0080` RX Errors** ×3 |
 | 9 | `opdropsagentia4_6` | `#5→#0→#nolabel→#17` | **219.298 s** | 16 (8 recovered) | slave 2 p1 ×8 | `0x0080` ×7, **`0x0010` Signal/Energy Lost** ×1 |
+| 10 | `opdropsagentia4_7` | `#5→#0→#nolabel→#17` | **125.590 s** | 4 (2 recovered) | slave 2 p1 ×2 | `0x0080` ×2 |
 
 Logs are the matching `.log` files; run 3's log is `opdropsagentia4_2og`.
 Each capture directory holds `events.csv`, `frames.pcap` and `probes.txt`.
@@ -798,8 +855,8 @@ the chain that ran 6,144.7 s in OP without a drop (`FINDINGS.md` §10.2). Runs
 1–4 used the pre-recovery build, runs 5–7 the `d385a57` build, and **runs 8
 and 9 the `ba1881d` build** — the first with working recovery, and so the
 first whose at-risk time and drop rate can be quoted directly from their own
-summaries. **No run yet uses `b6fc00c`**, which adds the settle wait and the
-`0x0101` snapshot; run 9 started at ~14:33 and that binary was built at 14:35.
+summaries. **Run 10 is the first on `b6fc00c`**, which adds the settle wait
+and the `0x0101` snapshot.
 
 ### Reproducing the analysis
 
