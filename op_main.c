@@ -208,7 +208,7 @@ int main(int argc, char **argv)
         printf("  position %d is in OP\n", m.sl[i].position);
 
     /* Snapshot 0x0101 now, while every slave is in OP and answering. Reading
-     * it during a recovery reads it mid-disruption: run 6 of SAGENTIA.md got
+     * it during a recovery reads it mid-disruption: run 6 of LINKDROPS.md got
      * 0x00 and run 7 got 0xFF from the same slave, neither matching the 0xF4
      * that run 8 saw here, and in run 7 the resulting "close" wrote a byte
      * the port already had and did nothing at all. */
@@ -519,7 +519,7 @@ int main(int argc, char **argv)
     }
     /* At-risk time is cycles with every slave answering — NOT elapsed minus
      * the recovery outage, which credited 306 s of severed chain in run 6 of
-     * SAGENTIA.md and understated that rate by ~140x. */
+     * LINKDROPS.md and understated that rate by ~140x. */
     printf("  At-risk time:   %.3f s of %.1f s elapsed (%.1f%% of cycles)\n",
            ar_seconds(&risk), secs,
            cycles ? 100.0 * risk.cycles / cycles : 0.0);

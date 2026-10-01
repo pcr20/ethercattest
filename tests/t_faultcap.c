@@ -186,7 +186,7 @@ int main(void)
 
     /* ── T6: events.csv is written on the run's time base ────────────────
      *
-     * Regression for the 2026-09-30 opdropsagentia4 run: the console printed
+     * Regression for the 2026-09-30 opdrop_field4 run: the console printed
      * the two link drops at 8.788 s and 32.708 s while events.csv recorded
      * 855.799 and 879.718 — a constant 847.011 s offset, because the ESC
      * event path passed an absolute CLOCK_MONOTONIC reading while the probe

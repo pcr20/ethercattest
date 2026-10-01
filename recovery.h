@@ -150,7 +150,7 @@ static inline RecAction rec_step(RecCtx *r, uint64_t now, int link_up,
 
     case REC_SETTLE: {
         /* Reopening the port is not instantaneous: the link behind it has to
-         * come up before the slaves are addressable. Run 7 of SAGENTIA.md
+         * come up before the slaves are addressable. Run 7 of LINKDROPS.md
          * re-initialised 152 ms after the reopen and every slave failed with
          * AL code 0x0000 — no error signalled, no state timeout, simply no
          * answer. TwinCAT's ~40 ms is measured from a different moment: it

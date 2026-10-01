@@ -430,7 +430,7 @@ int main(void)
 
     /* ── T12: a latched AL error must be acknowledged, not re-requested ───
      *
-     * Regression for run 6 of SAGENTIA.md. Recovery closed a port for 2.9 s;
+     * Regression for run 6 of LINKDROPS.md. Recovery closed a port for 2.9 s;
      * the three slaves behind it expired their SyncManager watchdogs (AL code
      * 0x001B) and latched the error bit. op_set_state then wrote plain state
      * requests, which a slave holding an error ignores, so all three re-inits

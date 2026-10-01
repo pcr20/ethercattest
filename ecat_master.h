@@ -69,7 +69,7 @@
  * every state request until the error is acknowledged by a write to AL control
  * with bit 4 set. Requesting a state without it is silently ineffective.
  *
- * This cost run 6 of SAGENTIA.md its whole measurement: recovery closed the
+ * This cost run 6 of LINKDROPS.md its whole measurement: recovery closed the
  * port for 2.9 s, the three slaves behind it expired their SyncManager
  * watchdogs (AL code 0x001B), and every re-init was then refused, so the chain
  * ran 306 s with three of four slaves out of OP.

@@ -6,7 +6,7 @@
  * capable of dropping a link: every slave in OP, process data flowing. Time
  * spent with the chain severed is not evidence of anything.
  *
- * This existed implicitly and got it wrong. Run 6 of SAGENTIA.md dropped at
+ * This existed implicitly and got it wrong. Run 6 of LINKDROPS.md dropped at
  * t=2.163 s, failed to re-initialise, and then ran 306 s with three of four
  * slaves out of OP. ecat_op reported "At-risk time: 308.2 s -> 0.0065
  * drops/s" because it subtracted only the 2.9 s recovery outage from the

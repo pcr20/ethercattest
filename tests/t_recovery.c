@@ -206,7 +206,7 @@ int main(void)
 
     /* ── T9: at-risk time counts only cycles with the chain healthy ──────
      *
-     * Regression for run 6 of SAGENTIA.md. It dropped at t=2.163 s, failed to
+     * Regression for run 6 of LINKDROPS.md. It dropped at t=2.163 s, failed to
      * re-initialise, then ran 306 s with three of four slaves out of OP, and
      * ecat_op reported "At-risk time: 308.2 s" because it subtracted only the
      * 2.9 s recovery outage from the elapsed time. The rate was understated by
@@ -255,7 +255,7 @@ int main(void)
 
     /* ── T10: re-init waits for the chain to answer after the reopen ─────
      *
-     * Regression for run 7 of SAGENTIA.md. Recovery reopened the port and
+     * Regression for run 7 of LINKDROPS.md. Recovery reopened the port and
      * re-initialised 152 ms later; the link behind it had not come up, so
      * every slave failed with AL code 0x0000 — no error signalled, no state
      * timeout, simply no answer — and the chain stayed out of OP for the rest

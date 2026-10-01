@@ -1,13 +1,21 @@
 # Field hardware — link-drop reproduction
 
-Working note on the runs against the **actual four drives from which the
-TwinCAT capture of 2026-09-23 was taken**. Live document; the run index at the
-end is appended to as runs complete.
+Working note on the runs against the **actual drives from which the TwinCAT
+capture of 2026-09-23 was taken**, four of them, plus two spares from our own
+lab chain used as controls. Live document; the run index at the end is
+appended to as runs complete.
 
-Status: **the link drop is reproduced.** The mechanism is identified on one
-drop and unexplained on two others. The controlling variable is not yet the
-one anyone expected, and it contradicts the TwinCAT capture in a way that
-names the next experiment precisely.
+Status: **the link drop is reproduced, at a rate compatible with the field's,
+and its immediate mechanism is identified** — Fast Link Drop, on sixteen
+probed firings, fifteen on the RX-error criterion and one on signal/energy
+loss (§3).
+
+**What provokes it is not established.** Device count looked like the
+controlling variable until six devices produced nothing (§4.5), and two
+confounds now sit under every topology result in §4: which physical cable was
+on which link was never recorded, and every drop in this document happened
+before one particular moment on 2026-09-30 with nothing since (§5.4, §9).
+Neither is excluded. One short rerun clears both (§8 item 1).
 
 Companion documents: `TWINCAT.md` (what TwinCAT did and what it recorded),
 `FINDINGS.md` (the frame-corruption fault, §10 for the link drops).
@@ -117,7 +125,7 @@ drop severs the chain and ends the useful part of the run.
 
 Sixteen drops have now been probed with the failing PHY still reachable.
 Fifteen latched Fast Link Drop on the RX-error criterion and one on
-signal/energy loss (§3.5). Run `opdropsagentia4_2` is the more informative
+signal/energy loss (§3.5). Run `opdrop_field4_2` is the more informative
 because it also has an ESC-layer precursor.
 
 ### 3.1 The sequence
@@ -182,7 +190,7 @@ that is the condition where it should have fired hardest.
 
 ### 3.4 The second firing, and what it separates
 
-Run `opdropsagentia4_3` (§4.2) probed its failing PHY within 145 ms:
+Run `opdrop_field4_3` (§4.2) probed its failing PHY within 145 ms:
 
 ```
 pos 0 phy  3: PHYSTS=0x0912 FLDS=0x0080 MISR1=0xE400 MISR2=0x2800
@@ -204,7 +212,7 @@ of frame, whereas FLD's criterion is 32 RX_ER assertions in any 10 µs window,
 including the inter-packet idle stream. **RX_ER asserted during idle would
 trip FLD and leave `RECR` at zero.**
 
-Run `opdropsagentia4_4` repeated it exactly — `FLDS = 0x0080`,
+Run `opdrop_field4_4` repeated it exactly — `FLDS = 0x0080`,
 `PHYSTS = 0x0912`, `RECR = 0x0000`, `MISR1 = 0xE400`, byte for byte the same
 probe as run 6 on the same link. Run 8 then produced three more, identical
 again, from the same PHY at a different chain position (§4.3).
@@ -253,7 +261,7 @@ FLD firings.
 
 ### 3.6 The drops that were NOT Fast Link Drop
 
-Run `opdropsagentia4` produced four lost-link events and **`FLDS = 0x0000` on
+Run `opdrop_field4` produced four lost-link events and **`FLDS = 0x0000` on
 every PHY in both probes**, with `RECR = 0x0000` and `FCSCR = 0x0000`
 everywhere and no ESC error counter moving at all. By the same reasoning that
 makes §3.2 decisive, that says FLD did *not* cause those drops.
@@ -261,7 +269,7 @@ makes §3.2 decisive, that says FLD did *not* cause those drops.
 Two readings, not yet separated:
 
 1. **The drop was initiated by the partner at the far end.** FLDS latches on
-   the PHY whose own FLD logic fired. In `opdropsagentia4` the drops were
+   the PHY whose own FLD logic fired. In `opdrop_field4` the drops were
    reported by slave 1 port 1 and slave 0 port 1, and in both cases the
    downstream partner was unreachable by the time the probe ran — so if its
    FLD fired, we could not have read it. This is the more likely reading and
@@ -1141,22 +1149,22 @@ Times from the console log. "At-risk" is OP with an intact chain.
 
 | # | capture dir | chain | at-risk | drops | where | FLDS |
 |---|---|---|---|---|---|---|
-| 1 | `opdropsagentia4` | `#14→#16→#nolabel→#17` | 8.689 s | 4 | slave 1 p1, then slave 0 p1 | `0x0000` (both probes) |
-| 2 | `opdropsagentia2` | `#14→#16` | 394.7 s | 0 | — | not triggered |
-| 3 | `opdropsagentia4_2` | `#14→#16→#nolabel→#17` | 21.079 s | 2 | slave 2 p1 | **`0x0080` RX Errors** |
-| 4 | `opdropsagentia2_2` | `#nolabel→#17` | 145.4 s | 0 | — | not triggered |
-| 5 | `opdropsagentia2_2#2` | `#nolabel→#17` | 372.3 s | 0 | — | not triggered |
-| 6 | `opdropsagentia4_3` | `#nolabel→#17→#5→#0` | **2.163 s** | 2 | slave 0 p1 | **`0x0080` RX Errors** |
-| 7 | `opdropsagentia4_4` | `#nolabel→#17→#5→#0` | **4.162 s** | 2 | slave 0 p1 | **`0x0080` RX Errors** |
-| 8 | `opdropsagentia4_5` | `#5→#0→#nolabel→#17` | **30.650 s** | 6 (3 recovered) | slave 2 p1 ×3 | **`0x0080` RX Errors** ×3 |
-| 9 | `opdropsagentia4_6` | `#5→#0→#nolabel→#17` | **219.298 s** | 16 (8 recovered) | slave 2 p1 ×8 | `0x0080` ×7, **`0x0010` Signal/Energy Lost** ×1 |
-| 10 | `opdropsagentia4_7` | `#5→#0→#nolabel→#17` | **125.590 s** | 4 (2 recovered) | slave 2 p1 ×2 | `0x0080` ×2 |
-| 11 | `opdropsagentia6` | `#5→#0→#14→#16→#nolabel→#17` | **248.594 s** | **0** | — | not triggered |
-| 12 | `opdropsagentia6_1` | `#5→#0→#14→#16→#nolabel→#17` | **186.134 s** | **0** | — | not triggered |
-| 13 | `opdropsagentia4_8` | `#5→#0→#14→#16` (no `#nolabel`/`#17`) | **172.431 s** | **0** | — | not triggered |
+| 1 | `opdrop_field4` | `#14→#16→#nolabel→#17` | 8.689 s | 4 | slave 1 p1, then slave 0 p1 | `0x0000` (both probes) |
+| 2 | `opdrop_field2` | `#14→#16` | 394.7 s | 0 | — | not triggered |
+| 3 | `opdrop_field4_2` | `#14→#16→#nolabel→#17` | 21.079 s | 2 | slave 2 p1 | **`0x0080` RX Errors** |
+| 4 | `opdrop_field2_2` | `#nolabel→#17` | 145.4 s | 0 | — | not triggered |
+| 5 | `opdrop_field2_2#2` | `#nolabel→#17` | 372.3 s | 0 | — | not triggered |
+| 6 | `opdrop_field4_3` | `#nolabel→#17→#5→#0` | **2.163 s** | 2 | slave 0 p1 | **`0x0080` RX Errors** |
+| 7 | `opdrop_field4_4` | `#nolabel→#17→#5→#0` | **4.162 s** | 2 | slave 0 p1 | **`0x0080` RX Errors** |
+| 8 | `opdrop_field4_5` | `#5→#0→#nolabel→#17` | **30.650 s** | 6 (3 recovered) | slave 2 p1 ×3 | **`0x0080` RX Errors** ×3 |
+| 9 | `opdrop_field4_6` | `#5→#0→#nolabel→#17` | **219.298 s** | 16 (8 recovered) | slave 2 p1 ×8 | `0x0080` ×7, **`0x0010` Signal/Energy Lost** ×1 |
+| 10 | `opdrop_field4_7` | `#5→#0→#nolabel→#17` | **125.590 s** | 4 (2 recovered) | slave 2 p1 ×2 | `0x0080` ×2 |
+| 11 | `opdrop_field6` | `#5→#0→#14→#16→#nolabel→#17` | **248.594 s** | **0** | — | not triggered |
+| 12 | `opdrop_field6_1` | `#5→#0→#14→#16→#nolabel→#17` | **186.134 s** | **0** | — | not triggered |
+| 13 | `opdrop_field4_8` | `#5→#0→#14→#16` (no `#nolabel`/`#17`) | **172.431 s** | **0** | — | not triggered |
 | 14 | `satM400` (`ecat_ber`) | `#5→#0→#14→#16→#nolabel→#17`, saturated | 166.6 s | **0** | — | `0x0000` ×144 (§6.2) |
 
-Logs are the matching `.log` files; run 3's log is `opdropsagentia4_2og`.
+Logs are the matching `.log` files; run 3's log is `opdrop_field4_2og`.
 Each capture directory holds `events.csv`, `frames.pcap` and `probes.txt`.
 
 `#5` and `#0` are M400+EVE-NET drives taken from our own 11-slave lab chain —
@@ -1174,8 +1182,8 @@ Runs 11–13 are the cleanest in the set — 1000 Hz held, zero WKC mismatches,
 
 ```bash
 # the drops and their probe data
-cat opdropsagentia4_2og
-cat opdropsagentia4_2/probes.txt
+cat opdrop_field4_2og
+cat opdrop_field4_2/probes.txt
 
 # FLDS bits 8:4 against SNLS505H Table 8-15
 python3 -c "v=0x0080; print(format((v>>4)&0x1F,'05b'))"   # 01000 = RX Errors
